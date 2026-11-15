@@ -1,8 +1,9 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
@@ -22,7 +23,7 @@ struct Cli {
 enum Commands {
     /// Process an image through the film simulation pipeline.
     Process {
-        /// Input image (TIFF, EXR, or PNG).
+        /// Input image (TIFF, PNG, JPEG, or camera RAW).
         input: PathBuf,
         /// Output image path.
         #[arg(short, long)]
@@ -70,16 +71,38 @@ enum Commands {
         /// Paper stock name.
         #[arg(long)]
         paper: Option<String>,
-        /// LUT cube size (e.g. 33, 65).
-        #[arg(long, default_value = "33")]
+        /// LUT cube size, from 2 to 129 samples per axis.
+        #[arg(
+            long,
+            default_value = "33",
+            value_parser = clap::value_parser!(u32).range(2..=129)
+        )]
         size: u32,
-        /// Output .cube file path.
+        /// Transfer function and primaries for the [0, 1] input domain.
+        #[arg(long, value_enum, default_value = "linear-prophoto")]
+        input_encoding: LutInputEncoding,
+        /// Output .cube file path. Values are SDR sRGB.
         #[arg(short, long)]
         output: PathBuf,
         /// Path to the data directory.
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LutInputEncoding {
+    LinearProphoto,
+    Srgb,
+}
+
+impl LutInputEncoding {
+    fn color_space(self) -> &'static str {
+        match self {
+            Self::LinearProphoto => "ProPhoto RGB",
+            Self::Srgb => "sRGB",
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -125,10 +148,18 @@ fn main() -> Result<()> {
             film,
             paper,
             size,
+            input_encoding,
             output,
             data_dir,
         } => {
-            cmd_export_lut(&film, paper.as_deref(), size, &output, &data_dir)?;
+            cmd_export_lut(
+                &film,
+                paper.as_deref(),
+                size,
+                input_encoding,
+                &output,
+                &data_dir,
+            )?;
         }
     }
 
@@ -187,7 +218,7 @@ fn cmd_process(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if ext == "png"
+    if matches!(ext.as_str(), "png" | "jpg" | "jpeg")
         || matches!(
             ext.as_str(),
             "dng"
@@ -222,9 +253,7 @@ fn cmd_process(
                 | "ptx"
         )
     {
-        // PNG and RAW both deliver linear sRGB after our loader's
-        // sRGB-decode (PNG) or disabled-basecurve+gamma (RAW) step.
-        // Tell the pipeline so it doesn't decode gamma a second time.
+        // PNG, JPEG and RAW loaders already return linear sRGB.
         params.io.input_color_space = "sRGB".to_string();
         params.io.input_cctf_decoding = false;
     }
@@ -340,6 +369,7 @@ fn cmd_export_lut(
     film_name: &str,
     paper_name: Option<&str>,
     size: u32,
+    input_encoding: LutInputEncoding,
     output: &Path,
     data_dir: &Path,
 ) -> Result<()> {
@@ -356,48 +386,51 @@ fn cmd_export_lut(
     let print = profile::load_profile_by_name(data_dir, &print_stock)
         .with_context(|| format!("loading print profile: {print_stock}"))?;
 
-    let mut params = RuntimeParams::default();
-    params.film_render.grain.active = false;
-    params.film_render.halation.active = false;
-    params.film_render.dir_couplers.active = false;
-    params.camera.auto_exposure = false;
+    let params = lut_runtime_params(input_encoding);
+    let pipeline = Pipeline::new_with_spectral(film, print, params, data_dir)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!("initializing calibrated LUT pipeline for {film_name} / {print_stock}")
+        })?;
+    let backend = spektrafilm_gpu::cpu_backend::CpuBackend;
 
-    let backend = spektrafilm_gpu::select_backend();
-    let pipeline = Pipeline::new(film, print, params);
-
-    // Generate LUT: sample the pipeline on a uniform grid
-    let s = size as usize;
-    let mut cube_data = String::new();
-    cube_data.push_str(&format!("# Created by spektrafilm-rs\n"));
-    cube_data.push_str(&format!(
-        "TITLE \"spektrafilm {film_name} → {print_stock}\"\n"
-    ));
-    cube_data.push_str(&format!("LUT_3D_SIZE {size}\n"));
-    cube_data.push_str("\n");
-
-    eprintln!("Generating {s}x{s}x{s} CUBE LUT...");
-
-    for bi in 0..s {
-        for gi in 0..s {
-            for ri in 0..s {
-                let r = ri as f32 / (s - 1) as f32;
-                let g = gi as f32 / (s - 1) as f32;
-                let b = bi as f32 / (s - 1) as f32;
-
-                let img = ImageBuf::from_data(
-                    1,
-                    1,
-                    vec![
-                        spektrafilm_math::precision::from_f32(r),
-                        spektrafilm_math::precision::from_f32(g),
-                        spektrafilm_math::precision::from_f32(b),
-                    ],
-                );
-                let out = pipeline.process(img, backend.as_ref());
-                let px = out.get(0, 0);
-                cube_data.push_str(&format!("{:.6} {:.6} {:.6}\n", px[0], px[1], px[2]));
+    // Flatten the cube as a 2D image with red as the fastest-varying axis.
+    // The LUT mode disables spatial and image-dependent effects.
+    use spektrafilm_math::precision::from_f64;
+    let sample = |index| from_f64(f64::from(index) / f64::from(size - 1));
+    let mut grid = Vec::with_capacity(3 * (size as usize).pow(3));
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                grid.extend([sample(r), sample(g), sample(b)]);
             }
         }
+    }
+    eprintln!("Generating {size}x{size}x{size} CUBE LUT...");
+    let grid = ImageBuf::from_data(size, size * size, grid);
+    let rendered = pipeline.process(grid, &backend);
+    if rendered.data.iter().any(|value| !value.is_finite()) {
+        bail!("calibrated LUT render returned a non-finite sample");
+    }
+
+    let transfer = match input_encoding {
+        LutInputEncoding::LinearProphoto => "linear",
+        LutInputEncoding::Srgb => "sRGB",
+    };
+    let mut cube_data = String::new();
+    writeln!(&mut cube_data, "# Created by spektrafilm-rs")?;
+    writeln!(
+        &mut cube_data,
+        "# Input {} ({transfer}) -> output sRGB SDR",
+        input_encoding.color_space()
+    )?;
+    writeln!(&mut cube_data, "TITLE \"spektrafilm {film_name} -> {print_stock}\"")?;
+    writeln!(&mut cube_data, "LUT_3D_SIZE {size}")?;
+    writeln!(&mut cube_data, "DOMAIN_MIN 0.0 0.0 0.0")?;
+    writeln!(&mut cube_data, "DOMAIN_MAX 1.0 1.0 1.0")?;
+    for px in rendered.data.chunks_exact(3) {
+        let [r, g, b] = [px[0], px[1], px[2]].map(|value| value.clamp(0.0, 1.0));
+        writeln!(&mut cube_data, "{r:.9} {g:.9} {b:.9}")?;
     }
 
     std::fs::write(output, &cube_data)
@@ -406,7 +439,36 @@ fn cmd_export_lut(
     Ok(())
 }
 
-/// Load an image from TIFF or PNG into an ImageBuf (f32, linear, [0-1]).
+fn lut_runtime_params(input_encoding: LutInputEncoding) -> RuntimeParams {
+    let mut params = RuntimeParams::default();
+    params.io.input_color_space = input_encoding.color_space().into();
+    params.io.input_cctf_decoding = matches!(input_encoding, LutInputEncoding::Srgb);
+
+    // Match Python's per-pixel LUT mode. Optical, stochastic and image-wise
+    // operations are disabled, while pointwise DIR stays enabled.
+    params.camera.auto_exposure = false;
+    params.camera.exposure_compensation_ev = 0.0;
+    params.camera.lens_blur_um = 0.0;
+    params.camera.diffusion_filter.active = false;
+    params.enlarger.print_exposure = 1.0;
+    params.enlarger.print_exposure_compensation = false;
+    params.enlarger.lens_blur = 0.0;
+    params.enlarger.diffusion_filter.active = false;
+    params.film_render.halation.active = false;
+    params.film_render.halation.boost_ev = 0.0;
+    params.film_render.grain.active = false;
+    params.film_render.glare.active = false;
+    params.film_render.dir_couplers.diffusion_size_um = 0.0;
+    params.film_render.dir_couplers.diffusion_tail_um = 0.0;
+    params.print_render.glare.active = false;
+    params.scanner.white_correction = false;
+    params.scanner.black_correction = false;
+    params.scanner.lens_blur = 0.0;
+    params.scanner.unsharp_mask = [0.0, 0.0];
+    params
+}
+
+/// Load raster RGB without changing the transfer function of a TIFF.
 fn load_image(path: &Path) -> Result<ImageBuf> {
     let ext = path
         .extension()
@@ -416,12 +478,12 @@ fn load_image(path: &Path) -> Result<ImageBuf> {
 
     match ext.as_str() {
         "tif" | "tiff" => load_tiff(path),
-        "png" => load_png(path),
+        "png" | "jpg" | "jpeg" => load_srgb_raster(path),
         // Camera RAW formats — same set as the GUI's loader.
         "dng" | "cr2" | "cr3" | "nef" | "nrw" | "arw" | "srf" | "sr2" | "raf" | "orf" | "rw2"
         | "pef" | "srw" | "x3f" | "iiq" | "3fr" | "crw" | "rwl" | "mrw" | "mef" | "kdc" | "ari"
         | "bay" | "dcr" | "drf" | "erf" | "fff" | "k25" | "mos" | "ptx" => load_raw(path),
-        _ => bail!("unsupported image format: .{ext} (supported: tiff, png, raw)"),
+        _ => bail!("unsupported image format: .{ext} (supported: tiff, png, jpeg, raw)"),
     }
 }
 
@@ -525,12 +587,12 @@ fn load_tiff(path: &Path) -> Result<ImageBuf> {
     Ok(ImageBuf::from_data(w, h, scalars))
 }
 
-fn load_png(path: &Path) -> Result<ImageBuf> {
+fn load_srgb_raster(path: &Path) -> Result<ImageBuf> {
     let img = decode_no_limits(path)?;
     let rgb = img.to_rgb32f();
     let (w, h) = (rgb.width(), rgb.height());
     let data: Vec<f32> = rgb.into_raw();
-    // PNG is sRGB gamma-encoded — promote to Scalar then decode to linear
+    // PNG and JPEG use the standard sRGB transfer curve by default.
     let scalars: Vec<spektrafilm_math::precision::Scalar> = data
         .into_iter()
         .map(|v| spektrafilm_math::precision::srgb_decode(spektrafilm_math::precision::from_f32(v)))

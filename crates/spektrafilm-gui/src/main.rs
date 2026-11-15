@@ -20,7 +20,7 @@ use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{Scalar, from_f32, srgb_decode, to_f32};
+use spektrafilm_math::precision::{Scalar, from_f32, srgb_decode, srgb_encode, to_f32};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 const IN_FLIGHT_REPAINT: Duration = Duration::from_millis(16);
@@ -351,14 +351,16 @@ impl App {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                // PNG (post sRGB-decode) and RAW (linear sRGB after
-                // disabling imagepipe's gamma+basecurve) both deliver
-                // linear sRGB. Tell the pipeline accordingly so it
-                // doesn't double-decode the gamma.
-                if ext == "png" || is_raw_extension(&ext) {
-                    self.params.io.input_color_space = "sRGB".to_string();
-                    self.params.io.input_cctf_decoding = false;
-                }
+                // PNG, JPEG and RAW loaders return linear sRGB. Preserve
+                // the GUI's linear ProPhoto convention for untagged TIFF.
+                self.params.io.input_color_space =
+                    if matches!(ext.as_str(), "png" | "jpg" | "jpeg") || is_raw_extension(&ext) {
+                        "sRGB"
+                    } else {
+                        "ProPhoto RGB"
+                    }
+                    .into();
+                self.params.io.input_cctf_decoding = false;
                 self.status = format!(
                     "Loaded {} × {} ({:.1} MP) in {:.0} ms",
                     img.width,
@@ -455,7 +457,10 @@ impl App {
                     };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     let t_preview = Instant::now();
-                    let preview = make_preview_texture_data(&output);
+                    let preview = make_preview_texture_data(
+                        &output,
+                        pipeline.params.io.output_cctf_encoding,
+                    );
                     let preview_ms = t_preview.elapsed().as_secs_f32() * 1000.0;
                     let worker_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
                     Ok(RenderResult {
@@ -795,7 +800,7 @@ impl App {
                     .add_filter(
                         "Image",
                         &[
-                            "png", "tif", "tiff", // standard
+                            "png", "tif", "tiff", "jpg", "jpeg", // standard
                             "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
                             "rw2", "pef", "srw", "x3f", "iiq", "3fr", "crw", "rwl", "mrw", "mef",
                             "kdc",
@@ -1778,7 +1783,7 @@ fn load_image(path: &Path) -> Result<ImageBuf> {
     let (w, h) = (rgb.width(), rgb.height());
     let data: Vec<f32> = rgb.into_raw();
     let scalars: Vec<Scalar> = match ext.as_str() {
-        "png" => data
+        "png" | "jpg" | "jpeg" => data
             .into_par_iter()
             .map(|v| srgb_decode(from_f32(v)))
             .collect(),
@@ -1907,9 +1912,8 @@ fn rawler_intermediate_to_image_buf(
 
 /// Write the pipeline's RGB ImageBuf to disk. PNG is 8-bit (matches what
 /// the preview shows); TIFF is 16-bit (more headroom — recommended for
-/// further editing). The pipeline already emits sRGB-encoded values
-/// clamped to [0, 1] when `output_cctf_encoding` is on, which is the
-/// default for the GUI.
+/// further editing). The writer clips to the integer format's range. The
+/// GUI defaults to sRGB encoding and can also save linear values.
 fn save_image(out: &ImageBuf, path: &Path) -> Result<()> {
     let ext = path
         .extension()
@@ -1950,10 +1954,10 @@ fn save_image(out: &ImageBuf, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Convert the pipeline's post-sRGB-encoded RGB ImageBuf into an RGBA preview.
+/// Convert the pipeline's RGB output into a display-encoded RGBA preview.
 /// The full output remains available for saving, but the interactive texture is
 /// capped so a large RAW does not force a full-size upload into egui every pass.
-fn make_preview_texture_data(out: &ImageBuf) -> PreviewTextureData {
+fn make_preview_texture_data(out: &ImageBuf, output_encoded: bool) -> PreviewTextureData {
     let src_w = out.width as usize;
     let src_h = out.height as usize;
     let max_src_dim = src_w.max(src_h).max(1);
@@ -1995,7 +1999,11 @@ fn make_preview_texture_data(out: &ImageBuf) -> PreviewTextureData {
                     let v11 = to_f32(out.data[p11 + c]);
                     let top = v00 + (v10 - v00) * tx;
                     let bot = v01 + (v11 - v01) * tx;
-                    row[dst + c] = ((top + (bot - top) * ty).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let mut sample = top + (bot - top) * ty;
+                    if !output_encoded {
+                        sample = to_f32(srgb_encode(from_f32(sample)));
+                    }
+                    row[dst + c] = (sample.clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
                 row[dst + 3] = 255;
             }
@@ -2003,8 +2011,7 @@ fn make_preview_texture_data(out: &ImageBuf) -> PreviewTextureData {
     PreviewTextureData { size: [w, h], rgba }
 }
 
-/// Upload a prepared preview texture. The pipeline emits values already
-/// clamped to [0, 1] and sRGB-encoded when `output_cctf_encoding` is on.
+/// Upload the prepared sRGB preview texture.
 fn make_texture(ctx: &egui::Context, preview: PreviewTextureData) -> egui::TextureHandle {
     let color_image = egui::ColorImage::from_rgba_unmultiplied(preview.size, &preview.rgba);
     ctx.load_texture(
@@ -2330,7 +2337,7 @@ mod preview_tests {
 
     fn rendered_pixel(red: f32) -> RenderResult {
         let output = ImageBuf::from_data(1, 1, vec![from_f32(red), from_f32(0.0), from_f32(0.0)]);
-        let preview = make_preview_texture_data(&output);
+        let preview = make_preview_texture_data(&output, true);
         RenderResult {
             output,
             preview,

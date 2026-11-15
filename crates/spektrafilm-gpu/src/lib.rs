@@ -134,10 +134,8 @@ pub trait ComputeBackend: Send + Sync {
         None
     }
 
-    /// True when `try_run_film_chain` returns the same post-scan output that
-    /// `Pipeline::apply_post_scan` would produce (final clamp and optional
-    /// sRGB encoding). Backends default to returning linear RGB and letting
-    /// the pipeline apply the final CPU pass.
+    /// Whether the resident chain can apply the optional device sRGB
+    /// encoding. Backends default to returning linear RGB.
     fn resident_chain_applies_post_scan(&self) -> bool {
         false
     }
@@ -236,8 +234,8 @@ pub struct FilmChainParams<'a> {
     /// when `enlarger_diffusion` is active so it can preserve the CPU
     /// print-stage ordering around preflash.
     pub print_exposure_scale: f64,
-    /// Whether the final output should be sRGB-encoded after clamping. Mirrors
-    /// `RuntimeParams::io.output_cctf_encoding`.
+    /// Whether to apply sRGB encoding before the resident output is read back.
+    /// Leave false for linear results and for other transfer functions.
     pub output_cctf_encoding: bool,
 }
 

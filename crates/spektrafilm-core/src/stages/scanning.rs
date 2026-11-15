@@ -348,39 +348,25 @@ pub fn scan(
     }
     super::dump_if_env("SPEKTRAFILM_DUMP_SCAN_LINEAR_RGB", &rgb);
 
-    // CCTF encoding + clip.
-    //
-    // Python's `_apply_cctf_encoding_and_clip` calls
-    // `colour.RGB_to_RGB(rgb, output_cs, output_cs, apply_cctf_encoding=True)`,
-    // which — even when src == dst — runs `vecmul(M, rgb)` with
-    // `M = matrix_RGB_to_RGB(src, dst, 'CAT02')`. With same src/dst
-    // M should be identity but in f64 it has off-diagonals around 1e-5
-    // (because colour-science's sRGB matrix is 4-decimal-rounded so the
-    // inverse round-trip isn't exact). This nudges every RGB pixel by
-    // ~1e-5 before encoding. We replicate it so the scan-stage output
-    // matches Python bit-for-bit.
-    let zero = from_f64(0.0);
-    let one = from_f64(1.0);
-    if params.io.output_cctf_encoding {
-        let m = rgb_to_rgb_identity_matrix(&params.io.output_color_space);
-        rgb.data.par_chunks_exact_mut(3).for_each(|px| {
-            let r = px[0] as f64;
-            let g = px[1] as f64;
-            let b = px[2] as f64;
-            let r2 = m[0][0] * r + m[0][1] * g + m[0][2] * b;
-            let g2 = m[1][0] * r + m[1][1] * g + m[1][2] * b;
-            let b2 = m[2][0] * r + m[2][1] * g + m[2][2] * b;
-            px[0] = spektrafilm_math::precision::srgb_encode(from_f64(r2).clamp(zero, one));
-            px[1] = spektrafilm_math::precision::srgb_encode(from_f64(g2).clamp(zero, one));
-            px[2] = spektrafilm_math::precision::srgb_encode(from_f64(b2).clamp(zero, one));
-        });
-    } else {
-        rgb.data
-            .par_iter_mut()
-            .for_each(|v| *v = (*v).clamp(zero, one));
+    apply_output_cctf(&mut rgb, &params.io);
+    rgb
+}
+
+/// Apply the requested scanner encoding to the full floating-point range.
+/// Integer writers and displays clip to their own representable range.
+pub(crate) fn apply_output_cctf(rgb: &mut ImageBuf, io: &crate::params::IoParams) {
+    if !io.output_cctf_encoding {
+        return;
     }
 
-    rgb
+    let cctf = io.output_cctf();
+    let m = rgb_to_rgb_identity_matrix(&io.output_color_space);
+    rgb.data.par_chunks_exact_mut(3).for_each(|px| {
+        let [r, g, b] = [px[0] as f64, px[1] as f64, px[2] as f64];
+        for (out, row) in px.iter_mut().zip(m) {
+            *out = cctf.encode(from_f64(row[0] * r + row[1] * g + row[2] * b));
+        }
+    });
 }
 
 /// Replicate Python `colour.matrix_RGB_to_RGB(cs, cs, 'CAT02')` —
@@ -438,5 +424,30 @@ fn output_colorspace_from_xyz_f64(name: &str) -> [[f64; 3]; 3] {
         "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::XYZ_TO_REC2020_F64,
         "ACES2065-1" => colorspace::XYZ_TO_ACES_F64,
         _ => colorspace::XYZ_TO_SRGB_F64,
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use crate::params::IoParams;
+
+    #[test]
+    fn scan_encoding_uses_selected_space_and_leaves_linear_output_untouched() {
+        let mut io = IoParams {
+            output_color_space: "ITU-R BT.2020".into(),
+            output_cctf_encoding: false,
+            ..IoParams::default()
+        };
+        let input = [-0.1, 0.18, 1.5].map(from_f64);
+        let mut image = ImageBuf::from_data(1, 1, input.to_vec());
+        apply_output_cctf(&mut image, &io);
+        assert_eq!(image.data, input);
+        io.output_cctf_encoding = true;
+        apply_output_cctf(&mut image, &io);
+        let expected = [-0.45, 0.4090077288641504, 1.2199816664692549];
+        for (sample, reference) in image.data.iter().zip(expected) {
+            assert!((*sample as f64 - reference).abs() < 3e-7);
+        }
     }
 }

@@ -121,7 +121,6 @@ __device__ __forceinline__ float exp10_fast(float x) {
 }
 
 __device__ __forceinline__ float srgb_encode_fast(float x) {
-    x = fminf(fmaxf(x, 0.0f), 1.0f);
     return x <= 0.0031308f ? 12.92f * x : 1.055f * powf(x, 0.4166666666666667f) - 0.055f;
 }
 
@@ -480,21 +479,14 @@ extern "C" __global__ void scan_spectral_kernel(
 
 extern "C" __global__ void post_scan_kernel(
     float* __restrict__ rgb,
-    unsigned int n_pixels,
-    unsigned int output_cctf_encoding
+    unsigned int n_pixels
 ) {
     unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= n_pixels) return;
     unsigned int base = gid * 3u;
-    if (output_cctf_encoding != 0u) {
-        rgb[base] = srgb_encode_fast(rgb[base]);
-        rgb[base + 1u] = srgb_encode_fast(rgb[base + 1u]);
-        rgb[base + 2u] = srgb_encode_fast(rgb[base + 2u]);
-    } else {
-        rgb[base] = fminf(fmaxf(rgb[base], 0.0f), 1.0f);
-        rgb[base + 1u] = fminf(fmaxf(rgb[base + 1u], 0.0f), 1.0f);
-        rgb[base + 2u] = fminf(fmaxf(rgb[base + 2u], 0.0f), 1.0f);
-    }
+    rgb[base] = srgb_encode_fast(rgb[base]);
+    rgb[base + 1u] = srgb_encode_fast(rgb[base + 1u]);
+    rgb[base + 2u] = srgb_encode_fast(rgb[base + 2u]);
 }
 
 extern "C" __global__ void print_spectral_kernel(
@@ -1695,11 +1687,9 @@ impl CudaBackend {
         &self,
         img: &mut CudaSlice<f32>,
         n_pixels: u32,
-        output_cctf_encoding: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let encode = if output_cctf_encoding { 1u32 } else { 0u32 };
         let mut launch = self.stream.launch_builder(&self.post_scan_kernel);
-        launch.arg(img).arg(&n_pixels).arg(&encode);
+        launch.arg(img).arg(&n_pixels);
         unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
         Ok(())
     }
@@ -2124,7 +2114,7 @@ impl CudaBackend {
             Some((m, q)) => (m as f32, q as f32, 1u32),
             None => (1.0f32, 0.0f32, 0u32),
         };
-        let skip_clamp = 0u32;
+        let skip_clamp = 1u32;
         {
             let mut launch = self.stream.launch_builder(&self.scan_kernel);
             launch
@@ -2174,7 +2164,9 @@ impl CudaBackend {
             self.run_unsharp_device(&mut buf_b, &mut buf_a, image.width, image.height, up)?;
         }
 
-        self.run_post_scan_device(&mut buf_b, n_pixels, p.output_cctf_encoding)?;
+        if p.output_cctf_encoding {
+            self.run_post_scan_device(&mut buf_b, n_pixels)?;
+        }
 
         let out = self.stream.clone_dtoh(&buf_b)?;
         Ok(Some(ImageBuf::from_data(

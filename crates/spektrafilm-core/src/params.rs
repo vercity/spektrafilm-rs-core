@@ -546,6 +546,26 @@ pub struct IoParams {
     pub input_gamut_compress: InputGamutCompressParams,
 }
 
+impl IoParams {
+    pub(crate) fn input_cctf(&self) -> spektrafilm_math::colorspace::Cctf {
+        use spektrafilm_math::colorspace::Cctf;
+        if self.input_cctf_decoding {
+            Cctf::for_rgb_space(&self.input_color_space).unwrap_or(Cctf::ProPhoto)
+        } else {
+            Cctf::Linear
+        }
+    }
+
+    pub(crate) fn output_cctf(&self) -> spektrafilm_math::colorspace::Cctf {
+        use spektrafilm_math::colorspace::Cctf;
+        if self.output_cctf_encoding {
+            Cctf::for_rgb_space(&self.output_color_space).unwrap_or(Cctf::Srgb)
+        } else {
+            Cctf::Linear
+        }
+    }
+}
+
 impl Default for IoParams {
     fn default() -> Self {
         Self {

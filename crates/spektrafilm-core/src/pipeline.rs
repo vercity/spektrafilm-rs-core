@@ -469,14 +469,12 @@ impl Pipeline {
         // extended resident chain, including camera/scanner lens blur,
         // highlight boost, and enlarger diffusion. Backends that do not
         // implement the resident chain return `None` and fall through.
-        if self.tc_lut.is_some() || self.mallett_core.is_some() {
-            if let Some(out) = self.try_gpu_resident(&image, backend, &color_ref, pix_um, exposure_scale) {
-                tracing::info!("pipeline: gpu-resident fast path complete");
-                if backend.resident_chain_applies_post_scan() {
-                    return out;
-                }
-                return self.apply_post_scan(out);
-            }
+        if self.can_render_resident(backend)
+            && let Some(out) =
+                self.try_gpu_resident(&image, backend, &color_ref, pix_um, exposure_scale)
+        {
+            tracing::info!("pipeline: gpu-resident fast path complete");
+            return self.finish_resident_scan(out, backend);
         }
 
         let t = Instant::now();
@@ -553,10 +551,9 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        if !backend.is_gpu()
-            || self.params.io.crop
+        if self.params.io.crop
             || self.working_scale() != 1.0
-            || (self.tc_lut.is_none() && self.mallett_core.is_none())
+            || !self.can_render_resident(backend)
         {
             return None;
         }
@@ -576,11 +573,17 @@ impl Pipeline {
             self.pixel_size_um(image),
             stages::filming::autoexposure_scale(image, &self.params),
         )?;
-        if backend.resident_chain_applies_post_scan() {
-            Some(out)
-        } else {
-            Some(self.apply_post_scan(out))
-        }
+        Some(self.finish_resident_scan(out, backend))
+    }
+
+    fn can_render_resident(&self, backend: &dyn ComputeBackend) -> bool {
+        // The resident path consumes linear input and runs direct spectral
+        // integration. Staged rendering handles other requested modes.
+        backend.is_gpu()
+            && (self.tc_lut.is_some() || self.mallett_core.is_some())
+            && self.params.io.input_cctf() == spektrafilm_math::colorspace::Cctf::Linear
+            && !self.params.settings.use_scanner_lut
+            && (self.params.io.scan_film || !self.params.settings.use_enlarger_lut)
     }
 
     fn pixel_size_um(&self, image: &ImageBuf) -> f32 {
@@ -630,8 +633,8 @@ impl Pipeline {
     }
 
     /// Try the GPU-resident fast path. Builds all the per-stage data and
-    /// hands it to the backend's `try_run_film_chain`. The output is linear RGB
-    /// (clipped to [0,1]) — sRGB encoding is applied by `apply_post_scan`.
+    /// hands it to the backend's `try_run_film_chain`. Device sRGB
+    /// encoding is optional. Other output encodings run on the host.
     fn try_gpu_resident(
         &self,
         image: &ImageBuf,
@@ -1117,26 +1120,19 @@ impl Pipeline {
             diffusion,
             enlarger_diffusion,
             print_exposure_scale,
-            output_cctf_encoding: self.params.io.output_cctf_encoding,
+            output_cctf_encoding: self.device_encodes_srgb(backend),
         };
         backend.try_run_film_chain(&params)
     }
 
-    /// After the GPU fast path returns linear RGB, apply sRGB encoding + clip
-    /// (the only post-scan op when no scanner blur/unsharp/glare is active).
-    fn apply_post_scan(&self, mut rgb: ImageBuf) -> ImageBuf {
-        use rayon::prelude::*;
-        use spektrafilm_math::precision::from_f64;
-        let zero = from_f64(0.0);
-        let one = from_f64(1.0);
-        if self.params.io.output_cctf_encoding {
-            rgb.data.par_iter_mut().for_each(|v| {
-                *v = spektrafilm_math::precision::srgb_encode((*v).clamp(zero, one));
-            });
-        } else {
-            rgb.data
-                .par_iter_mut()
-                .for_each(|v| *v = (*v).clamp(zero, one));
+    fn device_encodes_srgb(&self, backend: &dyn ComputeBackend) -> bool {
+        self.params.io.output_cctf() == spektrafilm_math::colorspace::Cctf::Srgb
+            && backend.resident_chain_applies_post_scan()
+    }
+
+    fn finish_resident_scan(&self, mut rgb: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
+        if !self.device_encodes_srgb(backend) {
+            stages::scanning::apply_output_cctf(&mut rgb, &self.params.io);
         }
         rgb
     }

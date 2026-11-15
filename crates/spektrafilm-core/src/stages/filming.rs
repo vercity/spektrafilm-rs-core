@@ -44,6 +44,15 @@ pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
 /// `highlight_weighted`. Anything else meters a flat 1.0 (0 EV), matching
 /// the Python `else` branch.
 pub fn measure_autoexposure_ev(image: &ImageBuf, rgb_to_xyz: &[[f32; 3]; 3], method: &str) -> f32 {
+    measure_autoexposure_ev_with_cctf(image, rgb_to_xyz, method, colorspace::Cctf::Linear)
+}
+
+fn measure_autoexposure_ev_with_cctf(
+    image: &ImageBuf,
+    rgb_to_xyz: &[[f32; 3]; 3],
+    method: &str,
+    cctf: colorspace::Cctf,
+) -> f32 {
     const MAX_SIZE: usize = 256;
     let w = image.width as usize;
     let h = image.height as usize;
@@ -84,9 +93,9 @@ pub fn measure_autoexposure_ev(image: &ImageBuf, rgb_to_xyz: &[[f32; 3]; 3], met
             let row_off = iy[y] * w * 3;
             (0..sw).map(move |x| {
                 let idx = row_off + ix[x] * 3;
-                (rgb_to_xyz[1][0] * to_f32(image.data[idx])
-                    + rgb_to_xyz[1][1] * to_f32(image.data[idx + 1])
-                    + rgb_to_xyz[1][2] * to_f32(image.data[idx + 2])) as f64
+                (rgb_to_xyz[1][0] * to_f32(cctf.decode(image.data[idx]))
+                    + rgb_to_xyz[1][1] * to_f32(cctf.decode(image.data[idx + 1]))
+                    + rgb_to_xyz[1][2] * to_f32(cctf.decode(image.data[idx + 2]))) as f64
             })
         })
         .collect();
@@ -272,6 +281,16 @@ fn apply_mallett_matrix(image: &ImageBuf, m: &[[f64; 3]; 3]) -> ImageBuf {
     out
 }
 
+fn decode_input_in_place(image: &mut ImageBuf, io: &crate::params::IoParams) {
+    let cctf = io.input_cctf();
+    if cctf != colorspace::Cctf::Linear {
+        image
+            .data
+            .par_iter_mut()
+            .for_each(|value| *value = cctf.decode(*value));
+    }
+}
+
 /// Expose: convert RGB to film raw exposure.
 ///
 /// Dispatches on the configured upsampler: the Mallett2019 per-pixel matrix
@@ -307,7 +326,12 @@ pub(crate) fn autoexposure_scale(image: &ImageBuf, params: &RuntimeParams) -> f6
         return 1.0;
     }
     let rgb_to_xyz = input_colorspace_to_xyz(&params.io.input_color_space);
-    let ae_ev = measure_autoexposure_ev(image, &rgb_to_xyz, &params.camera.auto_exposure_method);
+    let ae_ev = measure_autoexposure_ev_with_cctf(
+        image,
+        &rgb_to_xyz,
+        &params.camera.auto_exposure_method,
+        params.io.input_cctf(),
+    );
     2.0f64.powf(ae_ev as f64)
 }
 
@@ -328,6 +352,9 @@ pub(crate) fn expose_working(
     if autoexposure_scale != 1.0 {
         rgb.data.par_iter_mut().for_each(|v| *v *= ae_scale);
     }
+    // Python meters decoded luminance and applies its scale before decoding
+    // the resulting working pixels for exposure.
+    decode_input_in_place(&mut rgb, &params.io);
     // Exposure compensation
     let exp_comp = from_f32(2.0f32.powf(params.camera.exposure_compensation_ev));
     rgb.data.par_iter_mut().for_each(|v| *v *= exp_comp);

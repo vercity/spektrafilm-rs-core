@@ -3,6 +3,52 @@
 /// All matrices are row-major: output[i] = dot(matrix[i], input).
 /// Source: IEC 61966-2-1 (sRGB), ICC profiles, CIE standards.
 
+use crate::precision::{Scalar, from_f64, srgb_decode, srgb_encode};
+
+/// Component transfer functions for the RGB spaces supported by the pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cctf {
+    Srgb,
+    ProPhoto,
+    Bt2020,
+    Linear,
+}
+
+impl Cctf {
+    pub fn for_rgb_space(name: &str) -> Option<Self> {
+        match name {
+            "sRGB" => Some(Self::Srgb),
+            "ProPhoto RGB" => Some(Self::ProPhoto),
+            "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => Some(Self::Bt2020),
+            "ACES2065-1" => Some(Self::Linear),
+            _ => None,
+        }
+    }
+
+    pub fn encode(self, x: Scalar) -> Scalar {
+        match self {
+            Self::Srgb => srgb_encode(x),
+            // ROMM RGB uses a 1/512 linear-to-power transition.
+            Self::ProPhoto if x < from_f64(1.0 / 512.0) => x * from_f64(16.0),
+            Self::ProPhoto => x.powf(from_f64(1.0 / 1.8)),
+            Self::Bt2020 if x < from_f64(0.018) => x * from_f64(4.5),
+            Self::Bt2020 => from_f64(1.099) * x.powf(from_f64(0.45)) - from_f64(0.099),
+            Self::Linear => x,
+        }
+    }
+
+    pub fn decode(self, x: Scalar) -> Scalar {
+        match self {
+            Self::Srgb => srgb_decode(x),
+            Self::ProPhoto if x < from_f64(1.0 / 32.0) => x / from_f64(16.0),
+            Self::ProPhoto => x.powf(from_f64(1.8)),
+            Self::Bt2020 if x < from_f64(0.08124794403514046) => x / from_f64(4.5),
+            Self::Bt2020 => ((x + from_f64(0.099)) / from_f64(1.099)).powf(from_f64(1.0 / 0.45)),
+            Self::Linear => x,
+        }
+    }
+}
+
 /// sRGB → CIE XYZ (D65), assuming linear input.
 /// Matches Python colour-science 4-digit precision for exact parity.
 pub const SRGB_TO_XYZ: [[f32; 3]; 3] = [
@@ -17,10 +63,11 @@ pub const SRGB_TO_XYZ_F64: [[f64; 3]; 3] = [
     [0.2126, 0.7152, 0.0722],
     [0.0193, 0.1192, 0.9505],
 ];
+/// ROMM RGB coefficients as provided by the Python reference.
 pub const PROPHOTO_TO_XYZ_F64: [[f64; 3]; 3] = [
-    [0.7976749, 0.1351917, 0.0313534],
-    [0.2880402, 0.7118741, 0.0000857],
-    [0.0000000, 0.0000000, 0.8252100],
+    [0.7977, 0.1352, 0.0313],
+    [0.2880, 0.7119, 0.0001],
+    [0.0, 0.0, 0.8249],
 ];
 pub const REC2020_TO_XYZ_F64: [[f64; 3]; 3] = [
     [
@@ -91,9 +138,9 @@ pub const XYZ_TO_SRGB: [[f32; 3]; 3] = [
 
 /// ProPhoto RGB → CIE XYZ (D50).
 pub const PROPHOTO_TO_XYZ: [[f32; 3]; 3] = [
-    [0.7976749, 0.1351917, 0.0313534],
-    [0.2880402, 0.7118741, 0.0000857],
-    [0.0000000, 0.0000000, 0.8252100],
+    [0.7977, 0.1352, 0.0313],
+    [0.2880, 0.7119, 0.0001],
+    [0.0, 0.0, 0.8249],
 ];
 
 /// CIE XYZ (D50) → ProPhoto RGB.
@@ -342,6 +389,23 @@ fn mat3_mul3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3], out: &mut [[f32; 3]; 3]) {
 mod tests {
     use super::*;
     use crate::precision::{from_f64, srgb_decode, srgb_encode};
+
+    #[test]
+    fn supported_transfer_functions_keep_extended_samples() {
+        // Reference values from colour-science for -0.1, 0.18 and 1.5.
+        let input = [-0.1, 0.18, 1.5];
+        for (cctf, expected) in [
+            (Cctf::Srgb, [-1.292, 0.46135612950044164, 1.194176534680845]),
+            (Cctf::ProPhoto, [-1.6, 0.3857114247511376, 1.2526463499187717]),
+            (Cctf::Bt2020, [-0.45, 0.4090077288641504, 1.2199816664692549]),
+            (Cctf::Linear, input),
+        ] {
+            for (linear, encoded) in input.into_iter().zip(expected) {
+                assert!((cctf.encode(from_f64(linear)) as f64 - encoded).abs() < 3e-7);
+                assert!((cctf.decode(from_f64(encoded)) as f64 - linear).abs() < 3e-7);
+            }
+        }
+    }
 
     /// CAT16 adaptation matches colour-science's
     /// `matrix_chromatic_adaptation_VonKries(transform="CAT16")` for the
