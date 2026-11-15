@@ -352,14 +352,16 @@ pub struct DirCouplersParams {
     pub inhibition_samelayer: f64,
     #[serde(default = "default_one_f64")]
     pub inhibition_interlayer: f64,
-    #[serde(default = "default_gamma_same_f64")]
-    pub gamma_samelayer_rgb: [f64; 3],
-    #[serde(default = "default_gamma_r_gb_f64")]
-    pub gamma_interlayer_r_to_gb: [f64; 2],
-    #[serde(default = "default_gamma_g_rb_f64")]
-    pub gamma_interlayer_g_to_rb: [f64; 2],
-    #[serde(default = "default_gamma_b_rg_f64")]
-    pub gamma_interlayer_b_to_rg: [f64; 2],
+    // Each omitted gamma uses the film stock's default. Keep explicit values
+    // through JSON round-trips, even if they equal a different stock's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamma_samelayer_rgb: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamma_interlayer_r_to_gb: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamma_interlayer_g_to_rb: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamma_interlayer_b_to_rg: Option<[f64; 2]>,
     #[serde(default = "default_20_f64")]
     pub diffusion_size_um: f64,
     #[serde(default = "default_200_f64")]
@@ -368,18 +370,6 @@ pub struct DirCouplersParams {
     pub diffusion_tail_weight: f64,
 }
 
-fn default_gamma_same_f64() -> [f64; 3] {
-    [0.341, 0.324, 0.273]
-}
-fn default_gamma_r_gb_f64() -> [f64; 2] {
-    [0.355, 0.305]
-}
-fn default_gamma_g_rb_f64() -> [f64; 2] {
-    [0.154, 0.358]
-}
-fn default_gamma_b_rg_f64() -> [f64; 2] {
-    [0.171, 0.225]
-}
 fn default_20_f64() -> f64 {
     20.0
 }
@@ -397,10 +387,10 @@ impl Default for DirCouplersParams {
             amount: 1.0,
             inhibition_samelayer: 1.0,
             inhibition_interlayer: 1.0,
-            gamma_samelayer_rgb: [0.341, 0.324, 0.273],
-            gamma_interlayer_r_to_gb: [0.355, 0.305],
-            gamma_interlayer_g_to_rb: [0.154, 0.358],
-            gamma_interlayer_b_to_rg: [0.171, 0.225],
+            gamma_samelayer_rgb: None,
+            gamma_interlayer_r_to_gb: None,
+            gamma_interlayer_g_to_rb: None,
+            gamma_interlayer_b_to_rg: None,
             diffusion_size_um: 20.0,
             diffusion_tail_um: 200.0,
             diffusion_tail_weight: 0.06,

@@ -54,33 +54,12 @@ use crate::spectral_service;
 use crate::stages::{self, dump_if_env, filming::select_illuminant};
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
-    if film.is_positive() {
-        params.film_render.dir_couplers.gamma_samelayer_rgb = [0.12, 0.08, 0.06];
-        params.film_render.dir_couplers.gamma_interlayer_r_to_gb = [0.12, 0.06];
-        params.film_render.dir_couplers.gamma_interlayer_g_to_rb = [0.08, 0.06];
-        params.film_render.dir_couplers.gamma_interlayer_b_to_rg = [0.06, 0.06];
-    } else if film.is_negative() {
-        params.film_render.dir_couplers.gamma_samelayer_rgb = [0.336, 0.319, 0.273];
-        params.film_render.dir_couplers.gamma_interlayer_r_to_gb = [0.353, 0.302];
-        params.film_render.dir_couplers.gamma_interlayer_g_to_rb = [0.154, 0.353];
-        params.film_render.dir_couplers.gamma_interlayer_b_to_rg = [0.168, 0.226];
-    }
-
     // Monochrome grain is derived from the film, never user-set — clear it
     // for colour so a stray params file can't correlate the colour channels'
     // noise.
     params.film_render.grain.monochrome = film.is_bw();
     if film.is_bw() {
-        // Upstream n_channels==1 semantics (`match_channels` keeps channel 0
-        // of every per-channel tuple; the DIR matrix is 1×1 self-inhibition
-        // with no interlayer terms). Forcing the arrays to channel-0 keeps the
-        // broadcast 3-channel engine numerically identical to the upstream
-        // single-channel run.
-        let dir = &mut params.film_render.dir_couplers;
-        dir.gamma_samelayer_rgb = [dir.gamma_samelayer_rgb[0]; 3];
-        dir.gamma_interlayer_r_to_gb = [0.0, 0.0];
-        dir.gamma_interlayer_g_to_rb = [0.0, 0.0];
-        dir.gamma_interlayer_b_to_rg = [0.0, 0.0];
+        // Match the grain and halation settings to the emulsion's single layer.
         let g = &mut params.film_render.grain;
         g.agx_particle_scale = [g.agx_particle_scale[0]; 3];
         g.density_min = [g.density_min[0]; 3];
@@ -198,12 +177,6 @@ impl Pipeline {
         let film = crate::profile::resolve_for_render(film, params.film_render.development_time);
         let print = crate::profile::resolve_for_render(print, params.print_render.development_time);
 
-        // Python parity: mirror `_apply_film_specifics` in
-        // `spektrafilm/runtime/params_builder.py`. Python applies these
-        // overrides inside `digest_params()` before the pipeline runs,
-        // so a fresh `RuntimeParams::default()` does NOT match what
-        // Python uses. The DIR-coupler gammas in particular differ
-        // between positive and negative films.
         apply_film_specific_params(&film, &mut params);
 
         // Python parity: look up per-(print, illuminant, film) neutral filter values from
@@ -894,15 +867,7 @@ impl Pipeline {
         // backend call.
         let dir_inputs = if self.params.film_render.dir_couplers.active {
             let dir = &self.params.film_render.dir_couplers;
-            let matrix = spektrafilm_model::couplers::compute_dir_couplers_matrix(
-                dir.gamma_samelayer_rgb,
-                dir.gamma_interlayer_r_to_gb,
-                dir.gamma_interlayer_g_to_rb,
-                dir.gamma_interlayer_b_to_rg,
-                dir.inhibition_samelayer,
-                dir.inhibition_interlayer,
-            );
-            let mut matrix_scaled = matrix;
+            let mut matrix_scaled = stages::filming::dir_couplers_matrix(&self.film, dir);
             for row in &mut matrix_scaled {
                 for v in row.iter_mut() {
                     *v *= dir.amount;

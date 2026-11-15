@@ -315,12 +315,12 @@ mod integration_tests {
         let pipeline = Pipeline::new_with_spectral(film, print, params.clone(), &dir)
             .unwrap()
             .with_params(params);
+        let dir_matrix = super::filming::dir_couplers_matrix(
+            &pipeline.film,
+            &pipeline.params.film_render.dir_couplers,
+        );
         assert_eq!(
-            pipeline
-                .params
-                .film_render
-                .dir_couplers
-                .gamma_samelayer_rgb,
+            [dir_matrix[0][0], dir_matrix[1][1], dir_matrix[2][2]],
             [0.12, 0.08, 0.06],
             "GUI-style with_params must preserve positive-film DIR parameters"
         );

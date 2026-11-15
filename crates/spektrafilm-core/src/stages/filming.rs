@@ -10,7 +10,7 @@ use spektrafilm_math::precision::{from_f32, from_f64, to_f32};
 use spektrafilm_math::spectral::{self, TcLut};
 use std::time::Instant;
 
-use crate::params::RuntimeParams;
+use crate::params::{DirCouplersParams, RuntimeParams};
 use crate::profile::Profile;
 
 fn stage_timings_enabled() -> bool {
@@ -476,14 +476,7 @@ pub(crate) fn develop_with_pixel_size(
     let dir = &params.film_render.dir_couplers;
     if dir.active {
         let t = Instant::now();
-        let matrix = spektrafilm_model::couplers::compute_dir_couplers_matrix(
-            dir.gamma_samelayer_rgb,
-            dir.gamma_interlayer_r_to_gb,
-            dir.gamma_interlayer_g_to_rb,
-            dir.gamma_interlayer_b_to_rg,
-            dir.inhibition_samelayer,
-            dir.inhibition_interlayer,
-        );
+        let matrix = dir_couplers_matrix(film, dir);
         density_cmy = spektrafilm_model::couplers::apply_density_correction(
             &density_cmy,
             log_raw,
@@ -533,6 +526,58 @@ pub(crate) fn develop_with_pixel_size(
     density_cmy
 }
 
+/// Resolve per-film DIR defaults before building the same matrix for CPU and GPU.
+pub(crate) fn dir_couplers_matrix(film: &Profile, dir: &DirCouplersParams) -> [[f64; 3]; 3] {
+    // Stock-specific defaults from Python 0.3.4 _apply_film_specifics().
+    let (same, r_to_gb, g_to_rb, b_to_rg) = match film.info.stock.as_deref() {
+        Some("fujifilm_velvia_100") => (
+            [0.108, 0.072, 0.054],
+            [0.108, 0.054],
+            [0.072, 0.054],
+            [0.054, 0.054],
+        ),
+        Some("fujifilm_provia_100f") => (
+            [0.156, 0.104, 0.078],
+            [0.156, 0.078],
+            [0.104, 0.078],
+            [0.078, 0.078],
+        ),
+        _ if film.is_positive() => ([0.12, 0.08, 0.06], [0.12, 0.06], [0.08, 0.06], [0.06, 0.06]),
+        _ if film.is_negative() => (
+            [0.336, 0.319, 0.273],
+            [0.353, 0.302],
+            [0.154, 0.353],
+            [0.168, 0.226],
+        ),
+        _ => (
+            [0.341, 0.324, 0.273],
+            [0.355, 0.305],
+            [0.154, 0.358],
+            [0.171, 0.225],
+        ),
+    };
+    let same = dir.gamma_samelayer_rgb.unwrap_or(same);
+    let (same, r_to_gb, g_to_rb, b_to_rg) = if film.is_bw() {
+        // Broadcast single-layer self-inhibition across the three-channel engine.
+        ([same[0]; 3], [0.0; 2], [0.0; 2], [0.0; 2])
+    } else {
+        (
+            same,
+            dir.gamma_interlayer_r_to_gb.unwrap_or(r_to_gb),
+            dir.gamma_interlayer_g_to_rb.unwrap_or(g_to_rb),
+            dir.gamma_interlayer_b_to_rg.unwrap_or(b_to_rg),
+        )
+    };
+    spektrafilm_model::couplers::compute_dir_couplers_matrix(
+        same,
+        r_to_gb,
+        g_to_rb,
+        b_to_rg,
+        dir.inhibition_samelayer,
+        dir.inhibition_interlayer,
+    )
+}
+
 /// Full filming stage: expose + develop.
 pub fn process(
     image: &ImageBuf,
@@ -564,6 +609,46 @@ pub(crate) fn select_illuminant(name: &str) -> &'static [f32] {
 mod tests {
     use super::*;
     use spektrafilm_math::precision::from_f64;
+
+    #[test]
+    fn slide_dir_stock_defaults_preserve_partially_overridden_json() {
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let provia =
+            crate::profile::load_profile_by_name(&data_dir, "fujifilm_provia_100f").unwrap();
+        let velvia =
+            crate::profile::load_profile_by_name(&data_dir, "fujifilm_velvia_100").unwrap();
+
+        let defaults = DirCouplersParams::default();
+        assert_eq!(
+            dir_couplers_matrix(&provia, &defaults),
+            [
+                [0.156, 0.156, 0.078],
+                [0.104, 0.104, 0.078],
+                [0.078, 0.078, 0.078],
+            ]
+        );
+        assert_eq!(
+            dir_couplers_matrix(&velvia, &defaults),
+            [
+                [0.108, 0.108, 0.054],
+                [0.072, 0.072, 0.054],
+                [0.054, 0.054, 0.054],
+            ]
+        );
+
+        let overrides: DirCouplersParams =
+            serde_json::from_str(r#"{"gamma_interlayer_r_to_gb":[0.355,0.305]}"#).unwrap();
+        let encoded = serde_json::to_string(&overrides).unwrap();
+        let roundtrip: DirCouplersParams = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            dir_couplers_matrix(&provia, &roundtrip),
+            [
+                [0.156, 0.355, 0.305],
+                [0.104, 0.104, 0.078],
+                [0.078, 0.078, 0.078],
+            ]
+        );
+    }
 
     /// Deterministic synthetic image, mirrored bit-for-bit in the Python
     /// reference: a 300×200 gradient where each channel is

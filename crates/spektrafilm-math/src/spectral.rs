@@ -796,7 +796,10 @@ pub fn named_illuminant(name: &str) -> Option<IlluminantSpectrum> {
         "K75P" => (&ILLUMINANT_K75P, &ILLUMINANT_K75P_F64),
         _ => return None,
     };
-    Some(IlluminantSpectrum { samples, samples_f64 })
+    Some(IlluminantSpectrum {
+        samples,
+        samples_f64,
+    })
 }
 
 pub struct HanatosLut {
