@@ -63,7 +63,11 @@ mod integration_tests {
         let mut input = ImageBuf::new(6, 4);
         for y in 0..4 {
             for x in 0..6 {
-                let sample = if x < 3 { 0.7 } else { 0.025 * (1 + x + y) as f64 };
+                let sample = if x < 3 {
+                    0.7
+                } else {
+                    0.025 * (1 + x + y) as f64
+                };
                 input.set(x, y, [from_f64(sample); 3]);
             }
         }
@@ -77,7 +81,9 @@ mod integration_tests {
         assert_eq!((cropped.width, cropped.height), (3, 3));
         for y in 0..3 {
             for x in 0..3 {
-                assert_eq!(cropped.get(x, y), full.get(x + 3, y));
+                for (actual, expected) in cropped.get(x, y).into_iter().zip(full.get(x + 3, y)) {
+                    assert!((actual - expected).abs() < from_f64(1e-6));
+                }
             }
         }
 

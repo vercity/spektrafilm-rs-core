@@ -424,7 +424,10 @@ fn cmd_export_lut(
         "# Input {} ({transfer}) -> output sRGB SDR",
         input_encoding.color_space()
     )?;
-    writeln!(&mut cube_data, "TITLE \"spektrafilm {film_name} -> {print_stock}\"")?;
+    writeln!(
+        &mut cube_data,
+        "TITLE \"spektrafilm {film_name} -> {print_stock}\""
+    )?;
     writeln!(&mut cube_data, "LUT_3D_SIZE {size}")?;
     writeln!(&mut cube_data, "DOMAIN_MIN 0.0 0.0 0.0")?;
     writeln!(&mut cube_data, "DOMAIN_MAX 1.0 1.0 1.0")?;

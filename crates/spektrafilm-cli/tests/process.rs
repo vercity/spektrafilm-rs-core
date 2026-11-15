@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
 const SLIDE: &str = "fujifilm_provia_100f";
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 struct ProcessFixture(PathBuf);
 
@@ -13,9 +15,10 @@ impl ProcessFixture {
     fn new() -> Self {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let dir = std::env::temp_dir().join(format!(
-            "spektrafilm-cli-process-{}-{}",
+            "spektrafilm-cli-process-{}-{}-{}",
             std::process::id(),
-            stamp.as_nanos()
+            stamp.as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&dir).unwrap();
         let fixture = Self(dir);

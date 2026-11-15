@@ -239,8 +239,10 @@ pub fn scan(
             normalization,
         );
         let mut rgb = ImageBuf::new(density_cmy.width, density_cmy.height);
-        rgb.data.par_chunks_exact_mut(3).zip(log_xyz.par_chunks_exact(3)).for_each(
-            |(dst, xyz)| {
+        rgb.data
+            .par_chunks_exact_mut(3)
+            .zip(log_xyz.par_chunks_exact(3))
+            .for_each(|(dst, xyz)| {
                 let rgb = rgb_from_log_xyz(
                     [xyz[0], xyz[1], xyz[2]],
                     &adapt,
@@ -248,8 +250,7 @@ pub fn scan(
                     color_ref,
                 );
                 dst.copy_from_slice(&rgb);
-            },
-        );
+            });
         rgb
     } else {
         backend.scan_spectral(

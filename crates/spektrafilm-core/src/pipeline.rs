@@ -493,7 +493,11 @@ impl Pipeline {
         dump_if_env("SPEKTRAFILM_DUMP_FILM_LOG_RAW", &log_raw);
         let t = Instant::now();
         let filmed = stages::filming::develop_with_pixel_size(
-            &log_raw, &self.film, &self.params, backend, pix_um,
+            &log_raw,
+            &self.film,
+            &self.params,
+            backend,
+            pix_um,
         );
         print_stage_timing(stage_timings, "filming_develop", t);
         tracing::info!("pipeline: filming complete");
@@ -551,9 +555,7 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        if self.params.io.crop
-            || self.working_scale() != 1.0
-            || !self.can_render_resident(backend)
+        if self.params.io.crop || self.working_scale() != 1.0 || !self.can_render_resident(backend)
         {
             return None;
         }
@@ -612,18 +614,30 @@ impl Pipeline {
         }
         // image::resize clamps its float pixels to [0,1]. Normalize around the
         // source range so the interpolator preserves scene-linear headroom.
-        let (low, high) = image.data.par_iter().fold(
-            || (0.0_f64, 1.0_f64),
-            |(lo, hi), &value| (lo.min(value as f64), hi.max(value as f64)),
-        ).reduce(|| (0.0, 1.0), |(a, b), (c, d)| (a.min(c), b.max(d)));
+        let (low, high) = image
+            .data
+            .par_iter()
+            .fold(
+                || (0.0_f64, 1.0_f64),
+                |(lo, hi), &value| (lo.min(value as f64), hi.max(value as f64)),
+            )
+            .reduce(|| (0.0, 1.0), |(a, b), (c, d)| (a.min(c), b.max(d)));
         let span = high - low;
-        let f32buf: Vec<f32> = image.data.par_iter().map(|&v| ((v as f64 - low) / span) as f32).collect();
+        let f32buf: Vec<f32> = image
+            .data
+            .par_iter()
+            .map(|&v| ((v as f64 - low) / span) as f32)
+            .collect();
         let src =
             image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(image.width, image.height, f32buf)
                 .expect("ImageBuf dims match its data length");
         let dst =
             image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::CatmullRom);
-        let data = dst.into_raw().into_par_iter().map(|v| from_f64(v as f64 * span + low)).collect();
+        let data = dst
+            .into_raw()
+            .into_par_iter()
+            .map(|v| from_f64(v as f64 * span + low))
+            .collect();
         tracing::info!(
             from = format!("{}x{}", image.width, image.height),
             to = format!("{new_w}x{new_h}"),
@@ -991,41 +1005,42 @@ impl Pipeline {
 
         // Viewing glare is only applied to prints in the reference pipeline.
         let glare_params = &self.params.print_render.glare;
-        let glare = if !self.params.io.scan_film && glare_params.active && glare_params.percent > 0.0 {
-            let g = glare_params;
-            // LogNormal parameters (same derivation as `compute_random_glare_amount`).
-            let m = g.percent as f64;
-            let s = (g.roughness * g.percent) as f64;
-            let sigma2 = (1.0 + (s * s) / (m * m)).ln();
-            let sigma = sigma2.sqrt();
-            let mu = m.ln() - sigma2 / 2.0;
-            // glare_rgb_offset = (XYZ→RGB) · illuminant_xyz / 100.
-            let mut illu_xyz = [0.0f64; 3];
-            for i in 0..n_wl {
-                illu_xyz[0] += viewing_illu[i] * spektrafilm_math::spectral::CMF_X[i] as f64;
-                illu_xyz[1] += viewing_illu[i] * spektrafilm_math::spectral::CMF_Y[i] as f64;
-                illu_xyz[2] += viewing_illu[i] * spektrafilm_math::spectral::CMF_Z[i] as f64;
-            }
-            for c in 0..3 {
-                illu_xyz[c] /= scan_norm;
-            }
-            let mut offset_rgb = [0.0f32; 3];
-            for i in 0..3 {
-                let v = scan_xyz_to_rgb[i][0] * illu_xyz[0]
-                    + scan_xyz_to_rgb[i][1] * illu_xyz[1]
-                    + scan_xyz_to_rgb[i][2] * illu_xyz[2];
-                offset_rgb[i] = (v / 100.0) as f32;
-            }
-            Some(spektrafilm_gpu::GlareGpuParams {
-                mu: mu as f32,
-                sigma: sigma as f32,
-                blur_px: g.blur,
-                base_seed: 42,
-                rgb_offset: offset_rgb,
-            })
-        } else {
-            None
-        };
+        let glare =
+            if !self.params.io.scan_film && glare_params.active && glare_params.percent > 0.0 {
+                let g = glare_params;
+                // LogNormal parameters (same derivation as `compute_random_glare_amount`).
+                let m = g.percent as f64;
+                let s = (g.roughness * g.percent) as f64;
+                let sigma2 = (1.0 + (s * s) / (m * m)).ln();
+                let sigma = sigma2.sqrt();
+                let mu = m.ln() - sigma2 / 2.0;
+                // glare_rgb_offset = (XYZ→RGB) · illuminant_xyz / 100.
+                let mut illu_xyz = [0.0f64; 3];
+                for i in 0..n_wl {
+                    illu_xyz[0] += viewing_illu[i] * spektrafilm_math::spectral::CMF_X[i] as f64;
+                    illu_xyz[1] += viewing_illu[i] * spektrafilm_math::spectral::CMF_Y[i] as f64;
+                    illu_xyz[2] += viewing_illu[i] * spektrafilm_math::spectral::CMF_Z[i] as f64;
+                }
+                for c in 0..3 {
+                    illu_xyz[c] /= scan_norm;
+                }
+                let mut offset_rgb = [0.0f32; 3];
+                for i in 0..3 {
+                    let v = scan_xyz_to_rgb[i][0] * illu_xyz[0]
+                        + scan_xyz_to_rgb[i][1] * illu_xyz[1]
+                        + scan_xyz_to_rgb[i][2] * illu_xyz[2];
+                    offset_rgb[i] = (v / 100.0) as f32;
+                }
+                Some(spektrafilm_gpu::GlareGpuParams {
+                    mu: mu as f32,
+                    sigma: sigma as f32,
+                    blur_px: g.blur,
+                    base_seed: 42,
+                    rgb_offset: offset_rgb,
+                })
+            } else {
+                None
+            };
 
         // Unsharp mask: scanner.unsharp_mask = [sigma, amount].
         let [usm_sigma, usm_amount] = self.params.scanner.unsharp_mask;

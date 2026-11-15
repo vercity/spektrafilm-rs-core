@@ -457,10 +457,8 @@ impl App {
                     };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     let t_preview = Instant::now();
-                    let preview = make_preview_texture_data(
-                        &output,
-                        pipeline.params.io.output_cctf_encoding,
-                    );
+                    let preview =
+                        make_preview_texture_data(&output, pipeline.params.io.output_cctf_encoding);
                     let preview_ms = t_preview.elapsed().as_secs_f32() * 1000.0;
                     let worker_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
                     Ok(RenderResult {
@@ -1384,12 +1382,16 @@ impl App {
                 if io.crop {
                     for (index, axis) in ["X", "Y"].into_iter().enumerate() {
                         changed |= ui
-                            .add(egui::Slider::new(&mut io.crop_center[index], 0.0..=1.0)
-                                .text(format!("Crop center {axis}")))
+                            .add(
+                                egui::Slider::new(&mut io.crop_center[index], 0.0..=1.0)
+                                    .text(format!("Crop center {axis}")),
+                            )
                             .changed();
                         changed |= ui
-                            .add(egui::Slider::new(&mut io.crop_size[index], 0.01..=1.0)
-                                .text(format!("Crop size {axis}")))
+                            .add(
+                                egui::Slider::new(&mut io.crop_size[index], 0.01..=1.0)
+                                    .text(format!("Crop size {axis}")),
+                            )
                             .on_hover_text("Fraction of the original image's long edge")
                             .changed();
                     }

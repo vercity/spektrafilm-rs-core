@@ -249,8 +249,8 @@ impl ColorReference {
             );
             let mut out = [0.0f64; 3];
             for c in 0..3 {
-                out[c] = ((raw[c] * print_exposure_factor + preflash_raw[c]).max(0.0) + 1e-10)
-                    .log10();
+                out[c] =
+                    ((raw[c] * print_exposure_factor + preflash_raw[c]).max(0.0) + 1e-10).log10();
             }
             out
         };
@@ -602,6 +602,9 @@ mod parity_tests {
             "intercept = {intercept}"
         );
         let exposure = correction.printing_exposure_correction;
-        assert!((exposure - 1.58379724525614).abs() < 1e-6, "exposure = {exposure}");
+        assert!(
+            (exposure - 1.58379724525614).abs() < 1e-6,
+            "exposure = {exposure}"
+        );
     }
 }

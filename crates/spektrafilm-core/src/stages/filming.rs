@@ -95,7 +95,8 @@ fn measure_autoexposure_ev_with_cctf(
                 let idx = row_off + ix[x] * 3;
                 (rgb_to_xyz[1][0] * to_f32(cctf.decode(image.data[idx]))
                     + rgb_to_xyz[1][1] * to_f32(cctf.decode(image.data[idx + 1]))
-                    + rgb_to_xyz[1][2] * to_f32(cctf.decode(image.data[idx + 2]))) as f64
+                    + rgb_to_xyz[1][2] * to_f32(cctf.decode(image.data[idx + 2])))
+                    as f64
             })
         })
         .collect();
