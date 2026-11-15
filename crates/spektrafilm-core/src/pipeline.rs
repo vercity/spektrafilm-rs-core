@@ -553,7 +553,8 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        if self.params.io.crop
+        if !backend.is_gpu()
+            || self.params.io.crop
             || self.working_scale() != 1.0
             || (self.tc_lut.is_none() && self.mallett_core.is_none())
         {

@@ -209,7 +209,6 @@ struct App {
     last_render_ms: f32,
     last_pipeline_build_ms: f32,
     last_input_clone_ms: f32,
-    last_scale_ms: f32,
     last_preview_ms: f32,
     last_worker_total_ms: f32,
     status: String,
@@ -255,7 +254,6 @@ struct RenderResult {
     output: ImageBuf,
     preview: PreviewTextureData,
     input_clone_ms: f32,
-    scale_ms: f32,
     pipeline_build_ms: f32,
     render_ms: f32,
     preview_ms: f32,
@@ -326,7 +324,6 @@ impl App {
             last_render_ms: 0.0,
             last_pipeline_build_ms: 0.0,
             last_input_clone_ms: 0.0,
-            last_scale_ms: 0.0,
             last_preview_ms: 0.0,
             last_worker_total_ms: 0.0,
             render_generation: 0,
@@ -427,8 +424,8 @@ impl App {
         let input_clone_ms = t_clone.elapsed().as_secs_f32() * 1000.0;
         let film_name = self.film_name.clone();
         let print_name = self.print_name.clone();
-        let mut params = self.params.clone();
-        let (pipeline_template, pipeline_build_ms) =
+        let params = self.params.clone();
+        let (pipeline, pipeline_build_ms) =
             match self.preview_pipeline(&film_name, &print_name, &params) {
                 Ok(p) => p,
                 Err(msg) => {
@@ -448,25 +445,13 @@ impl App {
                 // and the user gets a uselessly vague status line.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t_total = Instant::now();
-                    let working_factor = params.io.upscale_factor;
-                    let t_scale = Instant::now();
-                    let scaled_image = if working_factor <= 0.0 || (working_factor - 1.0).abs() < 1e-6 {
-                        None
-                    } else {
-                        Some(rescale_preview_input_fast(image.clone(), working_factor))
-                    };
-                    let scale_ms = t_scale.elapsed().as_secs_f32() * 1000.0;
-                    params.io.upscale_factor = 1.0;
-                    let pipeline = pipeline_template.with_params(params);
                     let t = Instant::now();
-                    let output = match scaled_image {
-                        Some(image) => pipeline.process(image, backend.as_ref()),
-                        None if pipeline.params.io.scan_film && pipeline.film.is_positive() => {
-                            pipeline.process((*image).clone(), backend.as_ref())
-                        }
-                        None => pipeline
+                    let output = if pipeline.params.io.scan_film && pipeline.film.is_positive() {
+                        pipeline.process((*image).clone(), backend.as_ref())
+                    } else {
+                        pipeline
                             .process_resident_borrowed(image.as_ref(), backend.as_ref())
-                            .unwrap_or_else(|| pipeline.process((*image).clone(), backend.as_ref())),
+                            .unwrap_or_else(|| pipeline.process((*image).clone(), backend.as_ref()))
                     };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     let t_preview = Instant::now();
@@ -477,7 +462,6 @@ impl App {
                         output,
                         preview,
                         input_clone_ms,
-                        scale_ms,
                         pipeline_build_ms,
                         render_ms,
                         preview_ms,
@@ -598,7 +582,6 @@ impl App {
         match result {
             Ok(r) => {
                 self.last_input_clone_ms = r.input_clone_ms;
-                self.last_scale_ms = r.scale_ms;
                 self.last_pipeline_build_ms = r.pipeline_build_ms;
                 self.last_render_ms = r.render_ms;
                 self.last_preview_ms = r.preview_ms;
@@ -1392,6 +1375,20 @@ impl App {
                 if changed {
                     io.scan_film = scan_film;
                 }
+                changed |= ui.checkbox(&mut io.crop, "Crop").changed();
+                if io.crop {
+                    for (index, axis) in ["X", "Y"].into_iter().enumerate() {
+                        changed |= ui
+                            .add(egui::Slider::new(&mut io.crop_center[index], 0.0..=1.0)
+                                .text(format!("Crop center {axis}")))
+                            .changed();
+                        changed |= ui
+                            .add(egui::Slider::new(&mut io.crop_size[index], 0.01..=1.0)
+                                .text(format!("Crop size {axis}")))
+                            .on_hover_text("Fraction of the original image's long edge")
+                            .changed();
+                    }
+                }
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut io.upscale_factor, 0.1..=1.0)
@@ -1425,8 +1422,8 @@ impl App {
             self.last_pipeline_build_ms
         ));
         ui.monospace(format!(
-            "clone/scale:   {:>6.1} / {:>5.1} ms",
-            self.last_input_clone_ms, self.last_scale_ms
+            "input handle:  {:>6.1} ms",
+            self.last_input_clone_ms
         ));
         ui.monospace(format!(
             "preview pack:  {:>6.1} ms",
@@ -1744,28 +1741,6 @@ fn preview_pipeline_cache_key(
         },
     })
     .to_string()
-}
-
-fn rescale_preview_input_fast(image: Arc<ImageBuf>, factor: f32) -> ImageBuf {
-    if factor <= 0.0 || (factor - 1.0).abs() < 1e-6 {
-        return (*image).clone();
-    }
-    let new_w = (((image.width as f32) * factor).round() as u32).max(1);
-    let new_h = (((image.height as f32) * factor).round() as u32).max(1);
-    if new_w == image.width && new_h == image.height {
-        return (*image).clone();
-    }
-
-    let f32buf: Vec<f32> = image.data.par_iter().map(|&v| to_f32(v)).collect();
-    let src = image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(
-        image.width,
-        image.height,
-        f32buf,
-    )
-    .expect("ImageBuf dims match its data length");
-    let dst = image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::CatmullRom);
-    let data: Vec<Scalar> = dst.into_raw().into_par_iter().map(from_f32).collect();
-    ImageBuf::from_data(new_w, new_h, data)
 }
 
 fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
@@ -2360,7 +2335,6 @@ mod preview_tests {
             output,
             preview,
             input_clone_ms: 0.0,
-            scale_ms: 0.0,
             pipeline_build_ms: 0.0,
             render_ms: 0.0,
             preview_ms: 0.0,
