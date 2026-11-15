@@ -82,7 +82,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "spektrafilm",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc, backend, initial_image)))),
+        Box::new(|_| Ok(Box::new(App::new(backend, initial_image)))),
     )
 }
 
@@ -201,8 +201,7 @@ struct App {
     params: RuntimeParams,
     image_path: Option<PathBuf>,
     image: Option<Arc<ImageBuf>>,
-    /// Last rendered pipeline output (post sRGB encode + clip). Retained
-    /// so the Save button can write it without re-running the pipeline.
+    /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
     pipeline_cache_key: Option<String>,
@@ -214,17 +213,10 @@ struct App {
     last_preview_ms: f32,
     last_worker_total_ms: f32,
     status: String,
-    /// Set when any control change should trigger a re-render. The
-    /// next `update()` tick dispatches the render onto a worker
-    /// thread so the UI stays responsive while the pipeline (up to
-    /// ~500 ms on 6 MP) runs in the background.
-    dirty: bool,
-    /// Marked when the user changes a param while a previous render
-    /// is still in flight. After that render finishes we re-arm
-    /// `dirty` so the latest state gets a fresh pass instead of
-    /// dropping the user's mid-render edits on the floor.
-    pending_dirty: bool,
-    dirty_since: Option<Instant>,
+    /// The generation of the current inputs. Edits invalidate in-flight results.
+    render_generation: u64,
+    /// First request since the previous dispatch. Multiple edits share one render.
+    render_requested_at: Option<Instant>,
     /// Current preview zoom multiplier on top of the fit-to-panel
     /// scale (1.0 = fit). Mouse wheel adjusts it around the cursor,
     /// drag pans, double-click resets.
@@ -254,6 +246,7 @@ struct App {
 /// ImageBuf clone and, when it finishes, sends back the output buffer
 /// plus the two timings the status bar shows.
 struct RenderJob {
+    generation: u64,
     rx: mpsc::Receiver<Result<RenderResult, String>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -288,13 +281,7 @@ struct ExportJob {
 }
 
 impl App {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        backend: Arc<dyn ComputeBackend>,
-        initial_image: Option<PathBuf>,
-    ) -> Self {
-        let _ = cc;
-
+    fn new(backend: Arc<dyn ComputeBackend>, initial_image: Option<PathBuf>) -> Self {
         let data_dir = pick_data_dir();
         let (films, papers) = scan_profiles(&data_dir);
         let film_name = pick_default_stock(&films, "kodak_gold_200");
@@ -342,13 +329,12 @@ impl App {
             last_scale_ms: 0.0,
             last_preview_ms: 0.0,
             last_worker_total_ms: 0.0,
-            pending_dirty: false,
-            dirty_since: None,
+            render_generation: 0,
+            render_requested_at: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             render_job: None,
             status: String::from("Load an image to start."),
-            dirty: false,
             #[cfg(target_os = "macos")]
             metal_colorspace_tagged: false,
             export_job: None,
@@ -385,7 +371,8 @@ impl App {
                 );
                 self.image = Some(Arc::new(img));
                 self.image_path = Some(path.to_path_buf());
-                self.dirty = true;
+                self.output_tex = None;
+                self.request_render();
             }
             Err(e) => {
                 self.status = format!("Load error: {e:#}");
@@ -423,16 +410,16 @@ impl App {
         Ok((pipeline, t.elapsed().as_secs_f32() * 1000.0))
     }
 
-    /// Spawn a render on a worker thread. The UI stays interactive
-    /// during the 250–500 ms pipeline run (previously this blocked
-    /// the main thread, dropping mid-drag slider events). If a job
-    /// is already in flight, mark `pending_dirty` so the latest
-    /// params get re-rendered as soon as the in-flight one returns.
-    fn dispatch_render(&mut self, ctx: &egui::Context) {
-        if self.render_job.is_some() {
-            self.pending_dirty = true;
-            return;
+    fn request_render(&mut self) {
+        self.render_generation += 1;
+        self.output_image = None;
+        if self.image.is_some() {
+            self.render_requested_at.get_or_insert_with(Instant::now);
         }
+    }
+
+    /// Run a queued preview off the UI thread using a snapshot of the inputs.
+    fn dispatch_render(&mut self, ctx: &egui::Context) {
         let t_clone = Instant::now();
         let Some(image) = self.image.as_ref().cloned() else {
             return;
@@ -503,6 +490,7 @@ impl App {
             })
             .expect("OS thread spawn");
         self.render_job = Some(RenderJob {
+            generation: self.render_generation,
             rx,
             handle: Some(handle),
         });
@@ -589,9 +577,7 @@ impl App {
         );
     }
 
-    /// Called once per `update()`. If the in-flight render finished,
-    /// upload the texture and unblock the next pass. If more changes
-    /// arrived during the render, re-arm `dirty`.
+    /// Accept only a completed render for the current input generation.
     fn poll_render_job(&mut self, ctx: &egui::Context) {
         let Some(job) = self.render_job.as_mut() else {
             return;
@@ -599,16 +585,16 @@ impl App {
         let result = match job.rx.try_recv() {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.render_job = None;
-                self.status = "Render error: worker thread vanished".into();
-                return;
-            }
+            Err(mpsc::TryRecvError::Disconnected) => Err("worker thread vanished".into()),
         };
+        let generation = job.generation;
         if let Some(h) = job.handle.take() {
             let _ = h.join();
         }
         self.render_job = None;
+        if generation != self.render_generation {
+            return;
+        }
         match result {
             Ok(r) => {
                 self.last_input_clone_ms = r.input_clone_ms;
@@ -631,19 +617,12 @@ impl App {
                 self.status = format!("Render error: {msg}");
             }
         }
-        if self.pending_dirty {
-            self.pending_dirty = false;
-            self.dirty = true;
-        }
     }
 
-    /// Open a save dialog and write the most recent rendered output to
-    /// disk. Suggested filename is the input stem + the chosen film
-    /// stock + the chosen extension; default extension is PNG (8-bit
-    /// sRGB-encoded, matching what's on screen).
+    /// Save the rendered output for the current input and film selection.
     fn save_dialog(&mut self) {
-        let Some(out) = self.output_image.clone() else {
-            self.status = "Nothing to save yet — load an image first.".into();
+        let Some(out) = self.output_image.as_ref() else {
+            self.status = "Render a preview for the current settings before saving.".into();
             return;
         };
         let default_name = match &self.image_path {
@@ -664,7 +643,7 @@ impl App {
             return;
         };
         let t = Instant::now();
-        match save_image(&out, &path) {
+        match save_image(out, &path) {
             Ok(()) => {
                 self.status = format!(
                     "Saved {} in {:.0} ms",
@@ -847,7 +826,7 @@ impl App {
             let save_enabled = self.output_image.is_some();
             if ui
                 .add_enabled(save_enabled, egui::Button::new("Save…"))
-                .on_disabled_hover_text("Render an image first")
+                .on_disabled_hover_text("Render a preview for the current settings before saving")
                 .clicked()
             {
                 self.save_dialog();
@@ -912,7 +891,7 @@ impl App {
                             self.params.print_render.development_time = None;
                         }
                     }
-                    self.dirty = true;
+                    self.request_render();
                 }
                 // B&W stocks are profiled at several development times —
                 // pick one (longer = more contrast). Hidden for the
@@ -926,7 +905,7 @@ impl App {
                         &mut self.params.film_render.development_time,
                     )
                 {
-                    self.dirty = true;
+                    self.request_render();
                 }
                 // Slide films are scanned directly, so the print paper is
                 // unused — disable the picker and say why rather than
@@ -952,7 +931,7 @@ impl App {
                 if paper_changed {
                     self.print_dev_times = profile_dev_times(&self.data_dir, &self.print_name);
                     self.params.print_render.development_time = None;
-                    self.dirty = true;
+                    self.request_render();
                 }
                 if !self.params.io.scan_film
                     && self.print_dev_times.len() > 1
@@ -964,7 +943,7 @@ impl App {
                         &mut self.params.print_render.development_time,
                     )
                 {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1019,7 +998,7 @@ impl App {
                     )
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1064,7 +1043,7 @@ impl App {
                     .checkbox(&mut h.halation_renormalize, "Renormalize")
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1097,7 +1076,7 @@ impl App {
                     )
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1149,7 +1128,7 @@ impl App {
                     .add(egui::Slider::new(&mut df.bloom_size, 0.1..=3.0).text("Bloom size"))
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1173,7 +1152,7 @@ impl App {
                     .add(egui::Slider::new(&mut g.n_sub_layers, 1..=4).text("Sub-layers"))
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1194,7 +1173,7 @@ impl App {
                     .add(egui::Slider::new(&mut g.blur, 0.0..=5.0).text("Blur σ (px)"))
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1246,7 +1225,7 @@ impl App {
                         .changed();
                 }
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1286,7 +1265,7 @@ impl App {
                         .changed();
                 }
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1337,7 +1316,7 @@ impl App {
                         }
                     });
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1391,7 +1370,7 @@ impl App {
                         .changed();
                 }
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1428,7 +1407,7 @@ impl App {
                     .checkbox(&mut io.output_cctf_encoding, "Output sRGB encoded")
                     .changed();
                 if changed {
-                    self.dirty = true;
+                    self.request_render();
                 }
             });
 
@@ -1481,26 +1460,14 @@ impl eframe::App for App {
         }
         let _ = frame;
 
-        if self.dirty && self.image.is_some() {
-            let now = Instant::now();
-            let dirty_since = *self.dirty_since.get_or_insert(now);
-            if self.render_job.is_some() {
-                self.pending_dirty = true;
-                self.dirty = false;
-                self.dirty_since = None;
-            } else {
-                let elapsed = now.saturating_duration_since(dirty_since);
-                if elapsed >= PREVIEW_DEBOUNCE {
-                    self.dispatch_render(ctx);
-                    self.dirty = false;
-                    self.dirty_since = None;
-                } else {
-                    ctx.request_repaint_after(PREVIEW_DEBOUNCE - elapsed);
-                }
-            }
-        }
-        if self.render_job.is_some() {
-            ctx.request_repaint_after(IN_FLIGHT_REPAINT);
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .find_map(|file| file.path.clone())
+        });
+        if let Some(path) = dropped {
+            self.load_image_from_path(&path);
         }
         self.poll_render_job(ctx);
         self.poll_export_job(ctx);
@@ -1510,6 +1477,18 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.controls_panel(ui, ctx));
             });
+        if self.render_job.is_some() {
+            ctx.request_repaint_after(IN_FLIGHT_REPAINT);
+        } else if let Some(requested_at) = self.render_requested_at {
+            let delay = PREVIEW_DEBOUNCE.saturating_sub(requested_at.elapsed());
+            if delay.is_zero() {
+                self.render_requested_at = None;
+                self.dispatch_render(ctx);
+            } else {
+                ctx.request_repaint_after(delay);
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // Clone the texture handle (cheap — internally `Arc`) so we
             // can take `&mut self` to mutate `zoom` / `pan` from the
@@ -1519,22 +1498,15 @@ impl eframe::App for App {
                 self.draw_preview_with_zoom(ui, &tex);
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Drop or open an image to start.").size(18.0));
+                    let message = if self.image.is_some() {
+                        &self.status
+                    } else {
+                        "Drop or open an image to start."
+                    };
+                    ui.label(egui::RichText::new(message).size(18.0));
                 });
             }
         });
-
-        // Accept drag-and-dropped image files.
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        if let Some(path) = dropped.into_iter().next() {
-            self.load_image_from_path(&path);
-        }
     }
 
     /// Called once when the window is closing. If an export is still
@@ -2349,4 +2321,113 @@ fn tag_metal_layer_srgb<H: raw_window_handle::HasWindowHandle>(h: &H) -> Result<
         tracing::info!("tagged CAMetalLayer.colorspace = sRGB");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use spektrafilm_gpu::cpu_backend::CpuBackend;
+
+    fn start_preview(app: &mut App) -> mpsc::Sender<Result<RenderResult, String>> {
+        let (tx, rx) = mpsc::channel();
+        app.render_requested_at = None;
+        app.render_job = Some(RenderJob {
+            generation: app.render_generation,
+            rx,
+            handle: None,
+        });
+        tx
+    }
+
+    fn rendered_pixel(red: f32) -> RenderResult {
+        let output = ImageBuf::from_data(1, 1, vec![from_f32(red), from_f32(0.0), from_f32(0.0)]);
+        let preview = make_preview_texture_data(&output);
+        RenderResult {
+            output,
+            preview,
+            input_clone_ms: 0.0,
+            scale_ms: 0.0,
+            pipeline_build_ms: 0.0,
+            render_ms: 0.0,
+            preview_ms: 0.0,
+            worker_total_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn stale_preview_cannot_be_saved_after_multiple_edits() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(Arc::new(CpuBackend), None);
+        app.image = Some(Arc::new(ImageBuf::new(1, 1)));
+        app.request_render();
+        start_preview(&mut app)
+            .send(Ok(rendered_pixel(0.1)))
+            .unwrap();
+        app.poll_render_job(&ctx);
+        assert!(app.output_image.is_some());
+
+        app.params.camera.exposure_compensation_ev = 1.0;
+        app.request_render();
+        assert!(app.output_image.is_none());
+        let stale = start_preview(&mut app);
+        app.film_name = "another-stock".into();
+        app.request_render();
+        app.params.camera.exposure_compensation_ev = 2.0;
+        app.request_render();
+        let queued_at = app.render_requested_at.unwrap();
+
+        stale.send(Ok(rendered_pixel(0.2))).unwrap();
+        app.poll_render_job(&ctx);
+        assert!(app.output_image.is_none());
+        assert_eq!(app.render_requested_at, Some(queued_at));
+
+        start_preview(&mut app)
+            .send(Ok(rendered_pixel(0.3)))
+            .unwrap();
+        app.poll_render_job(&ctx);
+        assert_eq!(app.output_image.unwrap().data[0], from_f32(0.3));
+    }
+
+    #[test]
+    fn reloading_same_path_discards_old_preview_and_accepts_current_errors() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(Arc::new(CpuBackend), None);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = TempPath(std::env::temp_dir().join(format!(
+            "spektrafilm-reload-{}-{stamp}.png",
+            std::process::id(),
+        )));
+        image::RgbImage::from_pixel(1, 1, image::Rgb([128, 0, 0]))
+            .save(&path.0)
+            .unwrap();
+
+        app.load_image_from_path(&path.0);
+        assert_eq!(app.image_path.as_deref(), Some(path.0.as_path()));
+        start_preview(&mut app)
+            .send(Ok(rendered_pixel(0.1)))
+            .unwrap();
+        app.poll_render_job(&ctx);
+        assert!(app.output_tex.is_some());
+        let stale = start_preview(&mut app);
+
+        app.load_image_from_path(&path.0);
+        let loaded_status = app.status.clone();
+        assert!(app.output_image.is_none());
+        assert!(app.output_tex.is_none());
+        drop(stale);
+        app.poll_render_job(&ctx);
+        assert_eq!(app.status, loaded_status);
+        assert!(app.render_requested_at.is_some());
+
+        start_preview(&mut app)
+            .send(Err("test failure".into()))
+            .unwrap();
+        app.poll_render_job(&ctx);
+        assert_eq!(app.status, "Render error: test failure");
+        assert!(app.output_image.is_none());
+        assert!(app.output_tex.is_none());
+    }
 }
