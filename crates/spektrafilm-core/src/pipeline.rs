@@ -51,7 +51,7 @@ use crate::enlarger;
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
 use crate::spectral_service;
-use crate::stages::{self, dump_if_env};
+use crate::stages::{self, dump_if_env, filming::select_illuminant};
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
     if film.is_positive() {
@@ -802,13 +802,9 @@ impl Pipeline {
         } else {
             &self.print
         };
-        let viewing_illu_f32 = match scan_profile.info.viewing_illuminant.as_str() {
-            "D50" => &spektrafilm_math::spectral::ILLUMINANT_D50[..],
-            "D55" => &spektrafilm_math::spectral::ILLUMINANT_D55[..],
-            "D65" => &spektrafilm_math::spectral::ILLUMINANT_D65[..],
-            _ => &spektrafilm_math::spectral::ILLUMINANT_D50[..],
-        };
-        let viewing_illu: Vec<f64> = viewing_illu_f32.iter().map(|&v| v as f64).collect();
+        let viewing_illum =
+            stages::scanning::viewing_illuminant(&scan_profile.info.viewing_illuminant);
+        let viewing_illu: Vec<f64> = viewing_illum.samples.iter().map(|&v| v as f64).collect();
         let n_wl = if self.params.io.scan_film {
             film_channel_density.len()
         } else {
@@ -817,7 +813,7 @@ impl Pipeline {
         let scan_norm: f64 = (0..n_wl)
             .map(|i| viewing_illu[i] * spektrafilm_math::spectral::CMF_Y[i] as f64)
             .sum();
-        let viewing_white = spektrafilm_math::spectral::illuminant_xyz_f64(viewing_illu_f32);
+        let viewing_white = spektrafilm_math::spectral::illuminant_xyz_f64(viewing_illum.samples);
         let output_white = spektrafilm_math::spectral::colorspace_white_xyz_f64(
             &self.params.io.output_color_space,
         );
@@ -1180,22 +1176,8 @@ impl Pipeline {
     }
 }
 
-fn select_illuminant(name: &str) -> &'static [f32] {
-    use spektrafilm_math::spectral;
-    match name {
-        "D50" => &spectral::ILLUMINANT_D50,
-        "D55" => &spectral::ILLUMINANT_D55,
-        "D65" => &spectral::ILLUMINANT_D65,
-        _ => &spectral::ILLUMINANT_D55,
-    }
-}
-
 fn select_illuminant_f64(name: &str) -> &'static [f64] {
     use spektrafilm_math::spectral;
-    match name {
-        "D50" => &spectral::ILLUMINANT_D50_F64,
-        "D55" => &spectral::ILLUMINANT_D55_F64,
-        "D65" => &spectral::ILLUMINANT_D65_F64,
-        _ => &spectral::ILLUMINANT_D55_F64,
-    }
+    spectral::named_illuminant(name)
+        .map_or(&spectral::ILLUMINANT_D55_F64, |illum| illum.samples_f64)
 }

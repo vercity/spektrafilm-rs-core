@@ -557,12 +557,7 @@ pub fn input_colorspace_to_xyz(name: &str) -> [[f32; 3]; 3] {
 }
 
 pub(crate) fn select_illuminant(name: &str) -> &'static [f32] {
-    match name {
-        "D50" => &spectral::ILLUMINANT_D50,
-        "D55" => &spectral::ILLUMINANT_D55,
-        "D65" => &spectral::ILLUMINANT_D65,
-        _ => &spectral::ILLUMINANT_D55,
-    }
+    spectral::named_illuminant(name).map_or(&spectral::ILLUMINANT_D55, |illum| illum.samples)
 }
 
 #[cfg(test)]
