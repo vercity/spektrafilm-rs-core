@@ -22,6 +22,31 @@ fn print_stage_timing(enabled: bool, stage: &str, start: Instant) {
     }
 }
 
+fn crop_working(image: ImageBuf, center: [f32; 2], size: [f32; 2]) -> ImageBuf {
+    if image.pixel_count() == 0 {
+        return image;
+    }
+    let long_side = image.width.max(image.height) as f64;
+    let axis = |extent: u32, center: f32, size: f32| {
+        let length = ((long_side * size as f64).round_ties_even() as u32).clamp(1, extent);
+        let midpoint = (extent as f64 * center as f64).round_ties_even();
+        let start = (midpoint - length as f64 / 2.0).round_ties_even() as u32;
+        (start.min(extent - length), length)
+    };
+    let (x, width) = axis(image.width, center[0], size[0]);
+    let (y, height) = axis(image.height, center[1], size[1]);
+    if width == image.width && height == image.height {
+        return image;
+    }
+    let start = x as usize * 3;
+    let end = start + width as usize * 3;
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
+    for row in image.rows().skip(y as usize).take(height as usize) {
+        pixels.extend_from_slice(&row[start..end]);
+    }
+    ImageBuf::from_data(width, height, pixels)
+}
+
 use crate::enlarger;
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
@@ -437,26 +462,31 @@ impl Pipeline {
 
     pub fn process(&self, image: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
         let stage_timings = stage_timings_enabled();
-        // Working-resolution rescale (io.upscale_factor) — mirrors Python's
-        // ResizingService.crop_and_rescale. Done first so the whole pipeline
-        // (and the diffusion-filter kernel size, which scales with the image)
-        // runs at the chosen resolution. pixel_size_um is derived per-stage
-        // from the image dims, so it follows automatically.
         let t = Instant::now();
-        let image = self.rescale_working(image);
-        print_stage_timing(stage_timings, "rescale", t);
+        // Meter the original frame and keep its physical scale when cropping.
+        let exposure_scale = stages::filming::autoexposure_scale(&image, &self.params);
+        let scale = self.working_scale();
+        let pix_um = self.pixel_size_um(&image) / scale;
+        let image = if self.params.io.crop {
+            crop_working(image, self.params.io.crop_center, self.params.io.crop_size)
+        } else {
+            image
+        };
+        let image = Self::rescale_working(image, scale);
+        print_stage_timing(stage_timings, "preprocess", t);
         tracing::info!(backend = backend.name(), "pipeline: start");
 
         // Scanner B&W/slide exposure correction (no-op unless scanner
         // white/black correction is on for a slide or print scan). Computed
         // up front so both the GPU-resident and per-stage paths share it.
         let t = Instant::now();
-        let color_ref = crate::color_reference::ColorReference::compute(
+        let color_ref = crate::color_reference::ColorReference::compute_with_preflash(
             &self.film,
             &self.print,
             &self.params,
             &self.print_illuminant,
             self.print_exposure_factor,
+            self.preflash_raw,
         );
         print_stage_timing(stage_timings, "color_reference", t);
 
@@ -467,7 +497,7 @@ impl Pipeline {
         // highlight boost, and enlarger diffusion. Backends that do not
         // implement the resident chain return `None` and fall through.
         if self.tc_lut.is_some() || self.mallett_core.is_some() {
-            if let Some(out) = self.try_gpu_resident(&image, backend, &color_ref) {
+            if let Some(out) = self.try_gpu_resident(&image, backend, &color_ref, pix_um, exposure_scale) {
                 tracing::info!("pipeline: gpu-resident fast path complete");
                 if backend.resident_chain_applies_post_scan() {
                     return out;
@@ -477,20 +507,23 @@ impl Pipeline {
         }
 
         let t = Instant::now();
-        let log_raw = stages::filming::expose(
+        let log_raw = stages::filming::expose_working(
             &image,
-            &self.film,
             &self.params,
             backend,
             self.tc_lut.as_ref(),
             self.mallett_core.as_ref(),
             select_illuminant(&self.front_illuminant),
             color_ref.filming_exposure_correction,
+            pix_um,
+            exposure_scale,
         );
         print_stage_timing(stage_timings, "filming_expose", t);
         dump_if_env("SPEKTRAFILM_DUMP_FILM_LOG_RAW", &log_raw);
         let t = Instant::now();
-        let filmed = stages::filming::develop(&log_raw, &self.film, &self.params, backend);
+        let filmed = stages::filming::develop_with_pixel_size(
+            &log_raw, &self.film, &self.params, backend, pix_um,
+        );
         print_stage_timing(stage_timings, "filming_develop", t);
         tracing::info!("pipeline: filming complete");
         dump_if_env("SPEKTRAFILM_DUMP_FILM_DENSITY", &filmed);
@@ -510,7 +543,7 @@ impl Pipeline {
             result
         } else {
             let t = Instant::now();
-            let printed = stages::printing::process_with_calibration(
+            let printed = stages::printing::process_with_pixel_size(
                 &filmed,
                 &self.film,
                 &self.print,
@@ -520,6 +553,7 @@ impl Pipeline {
                 self.print_exposure_factor,
                 self.preflash_raw,
                 color_ref.printing_exposure_correction,
+                pix_um,
             );
             print_stage_timing(stage_timings, "printing", t);
             tracing::info!("pipeline: printing complete");
@@ -539,27 +573,35 @@ impl Pipeline {
         }
     }
 
-    /// Run only the GPU-resident path from a borrowed image. This is used by
-    /// the live GUI when it has already decided the working resolution, so a
-    /// full-resolution preview does not need to deep-clone the loaded image
-    /// just to satisfy `process(ImageBuf)`.
+    /// Run the GPU-resident path directly on the original image when no crop
+    /// or rescale is needed. This lets the live preview skip an input clone.
     pub fn process_resident_borrowed(
         &self,
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        if self.tc_lut.is_none() && self.mallett_core.is_none() {
+        if self.params.io.crop
+            || self.working_scale() != 1.0
+            || (self.tc_lut.is_none() && self.mallett_core.is_none())
+        {
             return None;
         }
         tracing::info!(backend = backend.name(), "pipeline: borrowed resident start");
-        let color_ref = crate::color_reference::ColorReference::compute(
+        let color_ref = crate::color_reference::ColorReference::compute_with_preflash(
             &self.film,
             &self.print,
             &self.params,
             &self.print_illuminant,
             self.print_exposure_factor,
+            self.preflash_raw,
         );
-        let out = self.try_gpu_resident(image, backend, &color_ref)?;
+        let out = self.try_gpu_resident(
+            image,
+            backend,
+            &color_ref,
+            self.pixel_size_um(image),
+            stages::filming::autoexposure_scale(image, &self.params),
+        )?;
         if backend.resident_chain_applies_post_scan() {
             Some(out)
         } else {
@@ -567,28 +609,44 @@ impl Pipeline {
         }
     }
 
-    /// Resize the working image by `io.upscale_factor` (bicubic), mirroring
-    /// Python's `ResizingService.crop_and_rescale`. No-op at factor 1.0.
-    /// Lets callers trade resolution for speed (the whole pipeline, and the
-    /// diffusion-filter kernel, scale with the image).
-    fn rescale_working(&self, image: ImageBuf) -> ImageBuf {
-        use spektrafilm_math::precision::{Scalar, from_f32, to_f32};
-        let uf = self.params.io.upscale_factor;
-        if uf <= 0.0 || (uf - 1.0).abs() < 1e-6 {
+    fn pixel_size_um(&self, image: &ImageBuf) -> f32 {
+        stages::filming::pixel_size_um(self.params.camera.film_format_mm, image.width, image.height)
+    }
+
+    fn working_scale(&self) -> f32 {
+        let scale = self.params.io.upscale_factor;
+        if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < 1e-6 {
+            1.0
+        } else {
+            scale
+        }
+    }
+
+    fn rescale_working(image: ImageBuf, scale: f32) -> ImageBuf {
+        use rayon::prelude::*;
+        use spektrafilm_math::precision::from_f64;
+        if scale == 1.0 || image.pixel_count() == 0 {
             return image;
         }
-        let new_w = (((image.width as f32) * uf).round() as u32).max(1);
-        let new_h = (((image.height as f32) * uf).round() as u32).max(1);
+        let new_w = ((image.width as f64 * scale as f64).round_ties_even() as u32).max(1);
+        let new_h = ((image.height as f64 * scale as f64).round_ties_even() as u32).max(1);
         if new_w == image.width && new_h == image.height {
             return image;
         }
-        let f32buf: Vec<f32> = image.data.iter().map(|&v| to_f32(v)).collect();
+        // image::resize clamps its float pixels to [0,1]. Normalize around the
+        // source range so the interpolator preserves scene-linear headroom.
+        let (low, high) = image.data.par_iter().fold(
+            || (0.0_f64, 1.0_f64),
+            |(lo, hi), &value| (lo.min(value as f64), hi.max(value as f64)),
+        ).reduce(|| (0.0, 1.0), |(a, b), (c, d)| (a.min(c), b.max(d)));
+        let span = high - low;
+        let f32buf: Vec<f32> = image.data.par_iter().map(|&v| ((v as f64 - low) / span) as f32).collect();
         let src =
             image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(image.width, image.height, f32buf)
                 .expect("ImageBuf dims match its data length");
         let dst =
             image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::CatmullRom);
-        let data: Vec<Scalar> = dst.into_raw().into_iter().map(from_f32).collect();
+        let data = dst.into_raw().into_par_iter().map(|v| from_f64(v as f64 * span + low)).collect();
         tracing::info!(
             from = format!("{}x{}", image.width, image.height),
             to = format!("{new_w}x{new_h}"),
@@ -605,6 +663,8 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
         color_ref: &crate::color_reference::ColorReference,
+        pix_um: f32,
+        autoexposure_scale: f64,
     ) -> Option<ImageBuf> {
         // Bake the exposure scale (auto-exposure × manual EV compensation)
         // into the front-pass matrix. Both upsamplers (hanatos and mallett)
@@ -613,19 +673,7 @@ impl Pipeline {
         // pass at the head of the chain. Auto-exposure metering itself stays
         // on CPU (~30 ms at 6 MP after the per-row rayon parallelization);
         // the result is a single float that's cheap to roll into the matrix.
-        let mut exposure_scale_f64 = 1.0f64;
-        if self.params.camera.auto_exposure {
-            // Borrow back the f32 matrix shape that the CPU metering
-            // function expects.
-            let rgb_to_xyz_f32 =
-                stages::filming::input_colorspace_to_xyz(&self.params.io.input_color_space);
-            let ae_ev = stages::filming::measure_autoexposure_ev(
-                image,
-                &rgb_to_xyz_f32,
-                &self.params.camera.auto_exposure_method,
-            );
-            exposure_scale_f64 *= 2.0f64.powf(ae_ev as f64);
-        }
+        let mut exposure_scale_f64 = autoexposure_scale;
         if self.params.camera.exposure_compensation_ev != 0.0 {
             exposure_scale_f64 *= 2.0f64.powf(self.params.camera.exposure_compensation_ev as f64);
         }
@@ -795,12 +843,6 @@ impl Pipeline {
             }
         }
 
-        let pix_um = stages::filming::pixel_size_um(
-            self.params.camera.film_format_mm,
-            image.width,
-            image.height,
-        );
-
         // print_exposure_factor × print_exposure, with the B&W printing
         // exposure correction folded in (CPU applies it as a further raw
         // multiply; print_spectral applies the whole product as one
@@ -814,11 +856,6 @@ impl Pipeline {
         // per-channel µm sigmas, converts to pixel space, and passes the
         // resulting scalars to the shaders.
         let halation = if self.params.film_render.halation.active {
-            let pix_um = stages::filming::pixel_size_um(
-                self.params.camera.film_format_mm,
-                image.width,
-                image.height,
-            );
             let h = &self.params.film_render.halation;
             // GPU shaders take f32 — narrow at the boundary.
             let avg_f64 = |a: [f64; 3]| (a[0] + a[1] + a[2]) / 3.0;
@@ -860,11 +897,6 @@ impl Pipeline {
         // Held in this binding so `&density_curves_0_f64` outlives the
         // backend call.
         let dir_inputs = if self.params.film_render.dir_couplers.active {
-            let pix_um = stages::filming::pixel_size_um(
-                self.params.camera.film_format_mm,
-                image.width,
-                image.height,
-            );
             let dir = &self.params.film_render.dir_couplers;
             let matrix = spektrafilm_model::couplers::compute_dir_couplers_matrix(
                 dir.gamma_samelayer_rgb,
@@ -953,11 +985,6 @@ impl Pipeline {
         // sampling; CPU does the same whenever λ > 30 / var > 9, which is
         // the typical regime for ≥ 1 MP images.
         let grain = if self.params.film_render.grain.active {
-            let pix_um = stages::filming::pixel_size_um(
-                self.params.camera.film_format_mm,
-                image.width,
-                image.height,
-            );
             let g = &self.params.film_render.grain;
             let pixel_area = pix_um * pix_um;
             let n_sub = g.n_sub_layers.max(1);
@@ -997,16 +1024,9 @@ impl Pipeline {
             None
         };
 
-        // Glare in the resident chain — applied after scan_spectral on the
-        // final RGB buffer. Mirrors the CPU lognormal + blur + add. The CPU
-        // scanning stage reads `film_render.glare` on the scan_film path and
-        // `print_render.glare` on the print path — follow the same choice.
-        let glare_params = if self.params.io.scan_film {
-            &self.params.film_render.glare
-        } else {
-            &self.params.print_render.glare
-        };
-        let glare = if glare_params.active && glare_params.percent > 0.0 {
+        // Viewing glare is only applied to prints in the reference pipeline.
+        let glare_params = &self.params.print_render.glare;
+        let glare = if !self.params.io.scan_film && glare_params.active && glare_params.percent > 0.0 {
             let g = glare_params;
             // LogNormal parameters (same derivation as `compute_random_glare_amount`).
             let m = g.percent as f64;

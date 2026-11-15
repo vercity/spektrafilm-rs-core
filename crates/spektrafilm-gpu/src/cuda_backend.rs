@@ -2042,9 +2042,13 @@ impl CudaBackend {
             } else {
                 p.print_normalization_factor as f32
             };
-            let preflash_r = p.preflash[0] as f32;
-            let preflash_g = p.preflash[1] as f32;
-            let preflash_b = p.preflash[2] as f32;
+            let preflash_scale = if has_enlarger_diffusion {
+                1.0
+            } else {
+                p.print_exposure_scale
+            };
+            let [preflash_r, preflash_g, preflash_b] =
+                p.preflash.map(|value| (value * preflash_scale) as f32);
             {
                 let mut launch = self.stream.launch_builder(&self.print_kernel);
                 launch

@@ -289,16 +289,45 @@ pub fn expose(
     bw_filming_correction: f64,
 ) -> ImageBuf {
     let pix_um = pixel_size_um(params.camera.film_format_mm, image.width, image.height);
-    let rgb_to_xyz = input_colorspace_to_xyz(&params.io.input_color_space);
+    expose_working(
+        image,
+        params,
+        backend,
+        tc_lut,
+        mallett_core,
+        front_illuminant,
+        bw_filming_correction,
+        pix_um,
+        autoexposure_scale(image, params),
+    )
+}
 
-    // Auto-exposure
-    let mut rgb = image.clone();
-    if params.camera.auto_exposure {
-        let ae_ev = measure_autoexposure_ev(&rgb, &rgb_to_xyz, &params.camera.auto_exposure_method);
-        let scale = from_f32(2.0f32.powf(ae_ev));
-        rgb.data.par_iter_mut().for_each(|v| *v *= scale);
+pub(crate) fn autoexposure_scale(image: &ImageBuf, params: &RuntimeParams) -> f64 {
+    if !params.camera.auto_exposure {
+        return 1.0;
     }
+    let rgb_to_xyz = input_colorspace_to_xyz(&params.io.input_color_space);
+    let ae_ev = measure_autoexposure_ev(image, &rgb_to_xyz, &params.camera.auto_exposure_method);
+    2.0f64.powf(ae_ev as f64)
+}
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expose_working(
+    image: &ImageBuf,
+    params: &RuntimeParams,
+    backend: &dyn ComputeBackend,
+    tc_lut: Option<&TcLut>,
+    mallett_core: Option<&[[f64; 3]; 3]>,
+    front_illuminant: &[f32],
+    bw_filming_correction: f64,
+    pix_um: f32,
+    autoexposure_scale: f64,
+) -> ImageBuf {
+    let mut rgb = image.clone();
+    let ae_scale = from_f64(autoexposure_scale);
+    if autoexposure_scale != 1.0 {
+        rgb.data.par_iter_mut().for_each(|v| *v *= ae_scale);
+    }
     // Exposure compensation
     let exp_comp = from_f32(2.0f32.powf(params.camera.exposure_compensation_ev));
     rgb.data.par_iter_mut().for_each(|v| *v *= exp_comp);
@@ -414,8 +443,18 @@ pub fn develop(
     params: &RuntimeParams,
     backend: &dyn ComputeBackend,
 ) -> ImageBuf {
-    let stage_timings = stage_timings_enabled();
     let pix_um = pixel_size_um(params.camera.film_format_mm, log_raw.width, log_raw.height);
+    develop_with_pixel_size(log_raw, film, params, backend, pix_um)
+}
+
+pub(crate) fn develop_with_pixel_size(
+    log_raw: &ImageBuf,
+    film: &Profile,
+    params: &RuntimeParams,
+    backend: &dyn ComputeBackend,
+    pix_um: f32,
+) -> ImageBuf {
+    let stage_timings = stage_timings_enabled();
     // f64 chain for Python parity — curves are f64 in the profile JSON.
     let log_exposure_f64 = film.log_exposure_f64();
     let density_curves_f64 = film.density_curves_f64();

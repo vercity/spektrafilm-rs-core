@@ -161,6 +161,37 @@ pub fn expose_calibrated(
     preflash: [f64; 3],
     bw_print_correction: f64,
 ) -> ImageBuf {
+    expose_with_pixel_size(
+        cmy_film,
+        film,
+        print,
+        params,
+        backend,
+        print_illuminant,
+        exposure_factor,
+        preflash,
+        bw_print_correction,
+        super::filming::pixel_size_um(
+            params.camera.film_format_mm,
+            cmy_film.width,
+            cmy_film.height,
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expose_with_pixel_size(
+    cmy_film: &ImageBuf,
+    film: &Profile,
+    print: &Profile,
+    params: &RuntimeParams,
+    backend: &dyn ComputeBackend,
+    print_illuminant: &[f64],
+    exposure_factor: f64,
+    preflash: [f64; 3],
+    bw_print_correction: f64,
+    pix_um: f32,
+) -> ImageBuf {
     // Python parity — `channel_density` and `base_density` are f64 in the profile JSON.
     let channel_density: Vec<[f64; 3]> = film
         .data
@@ -256,11 +287,6 @@ pub fn expose_calibrated(
                 *out = spektrafilm_math::precision::from_f64(raw * print_exposure * bw);
             }
         });
-        let pix_um = crate::stages::filming::pixel_size_um(
-            params.camera.film_format_mm,
-            lin.width,
-            lin.height,
-        );
         let dm = edf.to_model();
         lin = if backend.is_gpu() {
             spektrafilm_model::diffusion::apply_diffusion_filter_blur(
@@ -345,7 +371,7 @@ pub fn process_with_calibration(
     preflash: [f64; 3],
     bw_print_correction: f64,
 ) -> ImageBuf {
-    let log_raw = expose_calibrated(
+    process_with_pixel_size(
         cmy_film,
         film,
         print,
@@ -355,6 +381,38 @@ pub fn process_with_calibration(
         exposure_factor,
         preflash,
         bw_print_correction,
+        super::filming::pixel_size_um(
+            params.camera.film_format_mm,
+            cmy_film.width,
+            cmy_film.height,
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_with_pixel_size(
+    cmy_film: &ImageBuf,
+    film: &Profile,
+    print: &Profile,
+    params: &RuntimeParams,
+    backend: &dyn ComputeBackend,
+    print_illuminant: &[f64],
+    exposure_factor: f64,
+    preflash: [f64; 3],
+    bw_print_correction: f64,
+    pix_um: f32,
+) -> ImageBuf {
+    let log_raw = expose_with_pixel_size(
+        cmy_film,
+        film,
+        print,
+        params,
+        backend,
+        print_illuminant,
+        exposure_factor,
+        preflash,
+        bw_print_correction,
+        pix_um,
     );
     super::dump_if_env("SPEKTRAFILM_DUMP_PRINT_LOG_RAW", &log_raw);
     develop(&log_raw, print, params, backend)

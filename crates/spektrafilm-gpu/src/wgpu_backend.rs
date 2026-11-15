@@ -999,12 +999,18 @@ impl WgpuBackend {
         } else {
             print_normalization_factor as f32
         };
+        // If exposure is folded into the spectral pass, scale both terms.
+        let preflash_scale = if has_enlarger_diffusion {
+            1.0
+        } else {
+            p.print_exposure_scale
+        };
         let print_params = PrintParams {
             width: image.width,
             height: image.height,
             n_wavelengths: film_channel_density.len() as u32,
             normalization_factor: print_norm_for_shader,
-            preflash: [preflash[0] as f32, preflash[1] as f32, preflash[2] as f32],
+            preflash: preflash.map(|value| (value * preflash_scale) as f32),
             _pad: 0.0,
         };
         let print_params_buf = mk_uniform("print_params", bytemuck::bytes_of(&print_params));

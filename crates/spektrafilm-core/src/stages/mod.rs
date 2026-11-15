@@ -48,6 +48,58 @@ mod integration_tests {
     }
 
     #[test]
+    fn cropped_render_meters_full_frame_and_keeps_its_film_scale() {
+        let dir = data_dir();
+        let film = profile::load_profile_by_name(&dir, "kodak_portra_400").unwrap();
+        let print = profile::load_profile_by_name(&dir, "kodak_portra_endura").unwrap();
+        let backend = spektrafilm_gpu::cpu_backend::CpuBackend;
+        let mut params = RuntimeParams::default();
+        params.io.scan_film = true;
+        params.film_render.grain.active = false;
+        params.film_render.dir_couplers.active = false;
+        params.film_render.halation.active = false;
+        params.scanner.unsharp_mask = [0.0, 0.0];
+
+        let mut input = ImageBuf::new(6, 4);
+        for y in 0..4 {
+            for x in 0..6 {
+                let sample = if x < 3 { 0.7 } else { 0.025 * (1 + x + y) as f64 };
+                input.set(x, y, [from_f64(sample); 3]);
+            }
+        }
+        let full = Pipeline::new(film.clone(), print.clone(), params.clone())
+            .process(input.clone(), &backend);
+        params.io.crop = true;
+        params.io.crop_center = [1.0, 0.0];
+        params.io.crop_size = [0.5, 0.5];
+        let cropped = Pipeline::new(film.clone(), print.clone(), params.clone())
+            .process(input.clone(), &backend);
+        assert_eq!((cropped.width, cropped.height), (3, 3));
+        for y in 0..3 {
+            for x in 0..3 {
+                assert_eq!(cropped.get(x, y), full.get(x + 3, y));
+            }
+        }
+
+        params.camera.auto_exposure = false;
+        params.camera.lens_blur_um = 6000.0;
+        params.io.upscale_factor = 2.0;
+        let rendered = Pipeline::new(film.clone(), print.clone(), params.clone())
+            .process(input.clone(), &backend);
+        let mut pre_cropped = ImageBuf::new(3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                pre_cropped.set(x, y, input.get(x + 3, y));
+            }
+        }
+        params.io.crop = false;
+        params.camera.film_format_mm *= 0.5;
+        let expected = Pipeline::new(film, print, params).process(pre_cropped, &backend);
+        assert_eq!((rendered.width, rendered.height), (6, 6));
+        assert_eq!(rendered.data, expected.data);
+    }
+
+    #[test]
     fn test_full_pipeline_portra_400_to_endura() {
         let dir = data_dir();
         let film = profile::load_profile_by_name(&dir, "kodak_portra_400").unwrap();

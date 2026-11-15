@@ -94,7 +94,6 @@ fn scan_spectral_via_lut(
     normalization: f64,
     cat: &[[f64; 3]; 3],
     xyz_to_rgb: &[[f64; 3]; 3],
-    _backend: &dyn ComputeBackend,
     data_min: [f64; 3],
     data_max: [f64; 3],
     steps: usize,
@@ -125,34 +124,22 @@ fn scan_spectral_via_lut(
             let g = (src[1] as f64 - data_min[1]) * inv[1];
             let b = (src[2] as f64 - data_min[2]) * inv[2];
             let log_xyz = pchip_interp(&prepared, r, g, b);
-            // Post-LUT: 10^log_xyz → CAT → xyz_to_rgb, mirroring Python's
-            // `_density_to_rgb` AFTER the LUT call. bw_correction and
-            // glare run after this returns (RGB space).
-            let mut xyz = [
-                10.0f64.powf(log_xyz[0]),
-                10.0f64.powf(log_xyz[1]),
-                10.0f64.powf(log_xyz[2]),
-            ];
-            // B&W/slide luminance remap on the pre-CAT scan XYZ (Python's
-            // black_white_xyz_correction). Scalar scale from the Y channel;
-            // no-op when color_ref has no remap.
-            let scale = color_ref.xyz_scale(xyz[1]);
-            if scale != 1.0 {
-                xyz[0] *= scale;
-                xyz[1] *= scale;
-                xyz[2] *= scale;
-            }
-            let xa = cat[0][0] * xyz[0] + cat[0][1] * xyz[1] + cat[0][2] * xyz[2];
-            let ya = cat[1][0] * xyz[0] + cat[1][1] * xyz[1] + cat[1][2] * xyz[2];
-            let za = cat[2][0] * xyz[0] + cat[2][1] * xyz[1] + cat[2][2] * xyz[2];
-            dst[0] =
-                from_f64(xyz_to_rgb[0][0] * xa + xyz_to_rgb[0][1] * ya + xyz_to_rgb[0][2] * za);
-            dst[1] =
-                from_f64(xyz_to_rgb[1][0] * xa + xyz_to_rgb[1][1] * ya + xyz_to_rgb[1][2] * za);
-            dst[2] =
-                from_f64(xyz_to_rgb[2][0] * xa + xyz_to_rgb[2][1] * ya + xyz_to_rgb[2][2] * za);
+            dst.copy_from_slice(&rgb_from_log_xyz(log_xyz, cat, xyz_to_rgb, color_ref));
         });
     out
+}
+
+fn rgb_from_log_xyz(
+    log_xyz: [f64; 3],
+    cat: &[[f64; 3]; 3],
+    xyz_to_rgb: &[[f64; 3]; 3],
+    color_ref: &crate::color_reference::ColorReference,
+) -> [Scalar; 3] {
+    let xyz = log_xyz.map(|value| 10.0f64.powf(value));
+    let scale = color_ref.xyz_scale(xyz[1]);
+    let [x, y, z] = xyz.map(|value| value * scale);
+    let [xa, ya, za] = cat.map(|row| row[0] * x + row[1] * y + row[2] * z);
+    xyz_to_rgb.map(|row| from_f64(row[0] * xa + row[1] * ya + row[2] * za))
 }
 
 pub fn scan(
@@ -228,19 +215,8 @@ pub fn scan(
     let adapt = colorspace::chromatic_adaptation_matrix_f64(viewing_white, output_white);
     let base_xyz_to_rgb = output_colorspace_from_xyz_f64(&params.io.output_color_space);
 
-    // Dispatch spectral integration to backend (GPU or CPU). The backend
-    // applies the two matrices in sequence — we pass them separately.
-    //
-    // `use_scanner_lut` path: evaluate `scan_spectral` on a 17³ CMY
-    // grid and PCHIP-interpolate per pixel. Glare is added in RGB
-    // space after this returns (the existing post-step at the bottom
-    // of this function), so swapping to the LUT path is glare-safe.
-    // The faithful B&W/slide luminance remap (color_ref.has_remap) applies
-    // per-pixel on the scan XYZ inside scan_spectral_via_lut — so route
-    // through the LUT path when it's active (the LUT result matches the
-    // direct spectral path to sub-LSB, and only this path exposes the
-    // pre-CAT XYZ hook). Otherwise honour use_scanner_lut.
-    let mut rgb = if color_ref.has_remap() || params.settings.use_scanner_lut {
+    // Both scan paths apply white/black correction to XYZ before adaptation.
+    let mut rgb = if params.settings.use_scanner_lut {
         let (data_min, data_max) = scanner_lut_bounds(profile, params);
         scan_spectral_via_lut(
             density_cmy,
@@ -250,12 +226,32 @@ pub fn scan(
             normalization,
             &adapt,
             &base_xyz_to_rgb,
-            backend,
             data_min,
             data_max,
             params.settings.lut_resolution as usize,
             color_ref,
         )
+    } else if color_ref.has_remap() {
+        let log_xyz = spektrafilm_gpu::cpu_backend::scan_log_xyz_cpu(
+            density_cmy,
+            &channel_density,
+            &base_density,
+            &illuminant,
+            normalization,
+        );
+        let mut rgb = ImageBuf::new(density_cmy.width, density_cmy.height);
+        rgb.data.par_chunks_exact_mut(3).zip(log_xyz.par_chunks_exact(3)).for_each(
+            |(dst, xyz)| {
+                let rgb = rgb_from_log_xyz(
+                    [xyz[0], xyz[1], xyz[2]],
+                    &adapt,
+                    &base_xyz_to_rgb,
+                    color_ref,
+                );
+                dst.copy_from_slice(&rgb);
+            },
+        );
+        rgb
     } else {
         backend.scan_spectral(
             density_cmy,
@@ -281,12 +277,8 @@ pub fn scan(
     // glare in RGB space by pre-multiplying the illuminant XYZ through the same matrix.
     //   Python: rgb = M @ (xyz + g*illu) = M@xyz + g*(M@illu)
     //   Rust:   rgb = M @ xyz; then rgb += g * (M@illu)
-    let glare = if params.io.scan_film {
-        &params.film_render.glare
-    } else {
-        &params.print_render.glare
-    };
-    if glare.active && glare.percent > 0.0 {
+    let glare = &params.print_render.glare;
+    if !params.io.scan_film && glare.active && glare.percent > 0.0 {
         // Illuminant XYZ (Y=1) from the SPD (matches Python `contract('k,kl->l', illu, CMFs)/norm`).
         // Use the unnormalized integration here — the scaling cancels because we apply M next.
         let mut illu_xyz = [0.0f64; 3];
