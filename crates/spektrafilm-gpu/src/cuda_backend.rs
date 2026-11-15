@@ -479,14 +479,18 @@ extern "C" __global__ void scan_spectral_kernel(
 
 extern "C" __global__ void post_scan_kernel(
     float* __restrict__ rgb,
-    unsigned int n_pixels
+    unsigned int n_pixels,
+    const float* __restrict__ matrix
 ) {
     unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= n_pixels) return;
     unsigned int base = gid * 3u;
-    rgb[base] = srgb_encode_fast(rgb[base]);
-    rgb[base + 1u] = srgb_encode_fast(rgb[base + 1u]);
-    rgb[base + 2u] = srgb_encode_fast(rgb[base + 2u]);
+    float r = rgb[base];
+    float g = rgb[base + 1u];
+    float b = rgb[base + 2u];
+    rgb[base] = srgb_encode_fast(matrix[0] * r + matrix[1] * g + matrix[2] * b);
+    rgb[base + 1u] = srgb_encode_fast(matrix[3] * r + matrix[4] * g + matrix[5] * b);
+    rgb[base + 2u] = srgb_encode_fast(matrix[6] * r + matrix[7] * g + matrix[8] * b);
 }
 
 extern "C" __global__ void print_spectral_kernel(
@@ -1688,8 +1692,12 @@ impl CudaBackend {
         img: &mut CudaSlice<f32>,
         n_pixels: u32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use spektrafilm_math::colorspace::{SRGB_TO_XYZ_F64, XYZ_TO_SRGB_F64, mat3_mul3_f64};
+
+        let matrix = matrix_f32(&mat3_mul3_f64(&XYZ_TO_SRGB_F64, &SRGB_TO_XYZ_F64));
+        let matrix_dev = self.stream.clone_htod(&matrix)?;
         let mut launch = self.stream.launch_builder(&self.post_scan_kernel);
-        launch.arg(img).arg(&n_pixels);
+        launch.arg(img).arg(&n_pixels).arg(&matrix_dev);
         unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
         Ok(())
     }

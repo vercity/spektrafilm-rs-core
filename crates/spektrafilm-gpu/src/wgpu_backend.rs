@@ -3624,13 +3624,17 @@ fn build_post_scan_state(
     img: &wgpu::Buffer,
     backend: &WgpuBackend,
 ) -> InplaceUnaryState {
+    use spektrafilm_math::colorspace::{SRGB_TO_XYZ_F64, XYZ_TO_SRGB_F64, mat3_mul3_f64};
     use wgpu::util::DeviceExt;
     #[repr(C)]
     #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     struct Params {
         n_pixels: u32,
         _pad: [u32; 3],
+        rows: [[f32; 4]; 3],
     }
+    let rows = mat3_mul3_f64(&XYZ_TO_SRGB_F64, &SRGB_TO_XYZ_F64)
+        .map(|[r, g, b]| [r as f32, g as f32, b as f32, 0.0]);
     let pipe = backend.cached_pipeline(
         include_str!("../../spektrafilm-shaders/wgsl/post_scan.wgsl"),
         &[
@@ -3643,6 +3647,7 @@ fn build_post_scan_state(
         contents: bytemuck::bytes_of(&Params {
             n_pixels,
             _pad: [0; 3],
+            rows,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });

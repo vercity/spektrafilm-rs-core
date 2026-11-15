@@ -128,6 +128,17 @@ pub const XYZ_TO_ACES_F64: [[f64; 3]; 3] = [
     [0.0, 0.0, 0.9912520182],
 ];
 
+/// Multiply two row-major 3×3 matrices.
+pub fn mat3_mul3_f64(left: &[[f64; 3]; 3], right: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut product = [[0.0; 3]; 3];
+    for (out, row) in product.iter_mut().zip(left) {
+        for (j, value) in out.iter_mut().enumerate() {
+            *value = row[0] * right[0][j] + row[1] * right[1][j] + row[2] * right[2][j];
+        }
+    }
+    product
+}
+
 /// CIE XYZ (D65) → sRGB linear.
 /// Exact inverse of the 4-digit SRGB_TO_XYZ above.
 pub const XYZ_TO_SRGB: [[f32; 3]; 3] = [

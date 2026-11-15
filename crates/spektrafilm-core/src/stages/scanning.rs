@@ -385,15 +385,7 @@ fn rgb_to_rgb_identity_matrix(name: &str) -> [[f64; 3]; 3] {
         "ACES2065-1" => colorspace::ACES_TO_XYZ_F64,
         _ => colorspace::SRGB_TO_XYZ_F64,
     };
-    let mut m = [[0.0f64; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            m[i][j] = xyz_to_rgb[i][0] * rgb_to_xyz[0][j]
-                + xyz_to_rgb[i][1] * rgb_to_xyz[1][j]
-                + xyz_to_rgb[i][2] * rgb_to_xyz[2][j];
-        }
-    }
-    m
+    colorspace::mat3_mul3_f64(&xyz_to_rgb, &rgb_to_xyz)
 }
 
 pub fn process(

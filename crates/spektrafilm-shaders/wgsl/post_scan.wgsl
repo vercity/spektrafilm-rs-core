@@ -5,6 +5,7 @@ struct Params {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    rows: array<vec4<f32>, 3>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -24,7 +25,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let base = idx * 3u;
-    rgb[base] = srgb_encode(rgb[base]);
-    rgb[base + 1u] = srgb_encode(rgb[base + 1u]);
-    rgb[base + 2u] = srgb_encode(rgb[base + 2u]);
+    let value = vec3<f32>(rgb[base], rgb[base + 1u], rgb[base + 2u]);
+    rgb[base] = srgb_encode(dot(params.rows[0].xyz, value));
+    rgb[base + 1u] = srgb_encode(dot(params.rows[1].xyz, value));
+    rgb[base + 2u] = srgb_encode(dot(params.rows[2].xyz, value));
 }
