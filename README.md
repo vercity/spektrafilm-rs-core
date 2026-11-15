@@ -1,5 +1,9 @@
 # spektrafilm-rs
 
+This repository is an independently maintained continuation of [turbasvin/spektrafilm-rs v0.1.2](https://github.com/turbasvin/spektrafilm-rs/releases/tag/v0.1.2) (commit `9dd59b0380194b93686aaa230a8bb9680aa270a4`). The Rust port builds on [spektrafilm by Andrea Volpato](https://github.com/andreavolpato/spektrafilm). See [Credits](#credits) for the original acknowledgements.
+
+The inherited film and paper profiles retain their [CC BY-SA 4.0 license and attribution](https://github.com/andreavolpato/spektrafilm/blob/main/SPEKTRAFILM_LICENSE.txt).
+
 ![banner](docs/card.jpg)
 
 A Rust port of [andreavolpato/spektrafilm](https://github.com/andreavolpato/spektrafilm) — a spectral simulator for analogue colour film and the print-and-scan chain.
