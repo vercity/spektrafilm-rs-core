@@ -1,39 +1,62 @@
 # Python ↔ Rust parity harness
 
-Side-by-side comparison tooling against the Python reference
-implementation in `/Users/sasha/Desktop/spektrafilm`.
+`spektra_compare.py` compares Python 0.3.4 and the Rust CPU f64 pipeline using a
+shared scene-linear RGB float32 TIFF. It reports maximum, 99th-percentile, and
+mean absolute errors at each stage. Both pipelines run with autoexposure,
+spatial effects, random effects, and output transfer encoding disabled.
 
-## One-time setup
+## Setup
 
-Python 3.13 + a venv with the spektrafilm reference deps:
+From the Rust repository root, build the f64 CLI and create a Python 3.13
+environment. The dependency bounds below follow the 0.3.4 reference checkout's
+`pyproject.toml`. Set `PYTHONPATH` to that checkout's `src` directory.
 
 ```bash
-brew install python@3.13
-/opt/homebrew/bin/python3.13 -m venv /tmp/spektravenv
-/tmp/spektravenv/bin/pip install --upgrade pip setuptools wheel
-/tmp/spektravenv/bin/pip install --prefer-binary numpy scipy colour-science \
-    scikit-image opt-einsum lmfit Pillow numba rawpy PyYAML OpenImageIO \
-    exiv2 pyfftw lensfunpy
-/tmp/spektravenv/bin/pip install --no-deps -e /Users/sasha/Desktop/spektrafilm
+cargo build --locked --release -p spektrafilm-cli --bin spektrafilm-f64 --features precision-f64
+
+uv venv --python 3.13 /tmp/spektrafilm-parity-env
+parity_python=/tmp/spektrafilm-parity-env/bin/python
+uv pip install --python "$parity_python" \
+    'numpy~=2.4' 'scipy~=1.17' 'colour-science~=0.4.6' 'scikit-image~=0.26' \
+    'matplotlib~=3.10' 'opt-einsum~=3.4.0' 'numba~=0.64' 'OpenImageIO~=3.1.11' \
+    'pyfftw~=0.15.0' 'rawpy~=0.26.1' 'exiv2~=0.18.1' 'lensfunpy~=1.18.0'
+export PYTHONPATH=/path/to/python/spektrafilm/src
 ```
 
-## Scripts
+## Compare a fixture
 
-- `spektra_compare.py <raw.dng> <out_dir> [film] [paper] [max_dim]`
-  Decodes the RAW via rawpy → linear ACES2065-1, downsamples to
-  `max_dim` (default 1500 px on the long edge) so Python doesn't OOM at
-  full resolution, saves the downsampled image as a linear-float TIFF,
-  and renders it through the Python pipeline. Prints the suggested Rust
-  CLI invocation to render the same TIFF.
+```bash
+"$parity_python" scripts/parity/spektra_compare.py \
+    --synthetic --film kodak_portra_400 --paper kodak_portra_endura \
+    --out-dir "$(mktemp -d)"
 
-- `py_stages.py`
-  Per-stage dump for 5 hard-coded test colors. Prints `raw`, `log_raw`,
-  `film dens`, and `final RGB` after running through Python's
-  SimulationPipeline. Pair with the `rs_stages` probe binary (kept in
-  `/tmp/cmp/rs_stages.rs` during the diagnostic session) for a stage-by-
-  stage comparison.
+"$parity_python" scripts/parity/spektra_compare.py \
+    --synthetic --film fujifilm_provia_100f --scan-film \
+    --out-dir "$(mktemp -d)"
+```
 
-## Current findings (session ending 2026-05-23)
+The synthetic fixture contains a gray ramp through 4.0, saturated color patches,
+and mixed highlights. A direct scan omits the print exposure and print CMY taps.
+Use `--pointwise-dir` to enable DIR without diffusion. Use `--enlarger-lut` and
+`--scanner-lut` to compare the internal spectral LUT paths independently.
+`--rust-bin` and `--data-dir` accept alternate paths.
+
+For an existing image, replace `--synthetic` with `--input /path/to/frame.tif`.
+The default input primaries are ACES2065-1. Add `--input-color-space 'ProPhoto RGB'`
+or `--input-color-space sRGB` for a TIFF already linear in those primaries. The
+earlier positional RAW workflow now starts with decoding the RAW to a scene-linear
+float32 RGB TIFF separately. Both implementations read that same TIFF.
+
+Use a new or empty output directory for each run. It receives the exact Rust JSON
+parameters, a 16-bit convenience TIFF from the Rust CLI, and `metrics.json`.
+`python_<tap>.npy` and `rust_<tap>.f64le` contain the compared values in interleaved
+H×W×3 order. Rust probes contain headerless little-endian float64 samples. The
+`rgb_out` tap is linear sRGB after scan-stage processing and before the terminal
+clamp or transfer encoding.
+
+`py_stages.py`, `py_bisect.py`, and `rs_bisect.rs` contain earlier diagnostic probes.
+
+## Historical findings from 2026-05-23
 
 Tested on `IMG_8096.dng` downsampled to 1500 px, kodak_gold_200 +
 fujifilm_crystal_archive_typeii, all effects off, AE off:

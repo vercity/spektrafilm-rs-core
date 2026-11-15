@@ -12,30 +12,6 @@ use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::spectral::TcLut;
 
-/// Diagnostic helper: when env var `$var` is set, dump the image's f64
-/// pixel data to that path as a raw little-endian f64 blob. Used to
-/// bisect the Python ↔ Rust drift one stage at a time without
-/// modifying call sites. Silent no-op when the env var is unset.
-fn dump_if_env(var: &str, image: &ImageBuf) {
-    let Ok(path) = std::env::var(var) else {
-        return;
-    };
-    let bytes: Vec<u8> = image
-        .data
-        .iter()
-        .flat_map(|&v| (v as f64).to_le_bytes())
-        .collect();
-    match std::fs::write(&path, &bytes) {
-        Ok(()) => tracing::info!(
-            path = %path,
-            count = image.data.len(),
-            "dumped f64 buffer for {}",
-            var
-        ),
-        Err(e) => tracing::error!("dump {var} → {path}: {e}"),
-    }
-}
-
 fn stage_timings_enabled() -> bool {
     std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some()
 }
@@ -50,7 +26,7 @@ use crate::enlarger;
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
 use crate::spectral_service;
-use crate::stages;
+use crate::stages::{self, dump_if_env};
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
     if film.is_positive() {

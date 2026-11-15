@@ -355,6 +355,7 @@ pub fn scan(
         rgb =
             spektrafilm_model::diffusion::apply_unsharp_mask(&rgb, usm_sigma, usm_amount, backend);
     }
+    super::dump_if_env("SPEKTRAFILM_DUMP_SCAN_LINEAR_RGB", &rgb);
 
     // CCTF encoding + clip.
     //

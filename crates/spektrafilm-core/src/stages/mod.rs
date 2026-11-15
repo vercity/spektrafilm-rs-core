@@ -3,6 +3,32 @@ pub mod filming;
 pub mod printing;
 pub mod scanning;
 
+use spektrafilm_math::image::ImageBuf;
+
+/// Write packed row-major, channel-interleaved little-endian f64 samples
+/// to the path in `var`. These taps run in the staged pipeline. Select the
+/// CPU backend for parity comparisons because the GPU resident chain
+/// bypasses the stages.
+pub(crate) fn dump_if_env(var: &str, image: &ImageBuf) {
+    let Ok(path) = std::env::var(var) else {
+        return;
+    };
+    let bytes: Vec<u8> = image
+        .data
+        .iter()
+        .flat_map(|&v| (v as f64).to_le_bytes())
+        .collect();
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => tracing::info!(
+            path = %path,
+            count = image.data.len(),
+            "dumped f64 buffer for {}",
+            var
+        ),
+        Err(e) => tracing::error!("dump {var} → {path}: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod integration_tests {
     use crate::params::RuntimeParams;

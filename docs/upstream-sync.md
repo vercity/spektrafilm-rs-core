@@ -10,6 +10,26 @@ Rust 已有曝光、显影、印相和扫描主链。28 份共有片纸配置逐
 2. **公开逐阶段浮点诊断输出。** Rust 现有环境变量可导出胶片曝光对数、胶片 CMY 和相纸 CMY。补印相曝光对数和编码、限幅前的线性扫描 RGB。`--raw-out` 的现有文件仍是 `process` 的最终浮点结果，帮助文本需描述真实语义。Python 对应数据边界在 `src/spektrafilm/runtime/pipeline.py`。基准先固定 CPU f64。出处见 [Rust 管线](../crates/spektrafilm-core/src/pipeline.rs#L503) 和 [CLI 最终缓冲](../crates/spektrafilm-cli/src/main.rs#L297)。
 3. **统一输入及比较口径。** [旧脚本](../scripts/parity/spektra_compare.py#L66) 给 Python 指定 ACES2065-1，却在建议的 Rust 命令里省略输入色域和相纸。用同一份场景线性 float32 TIFF、显式片纸 ID 和色域，比较同配置的阶段缓冲。先选 Portra 400／Portra Endura、Gold 200／Fuji Crystal、Vision3 500T／2383，以及 Provia／Velvia 直扫。先做小尺寸灰阶、饱和色块和超白，再加入真实景物。第一轮关闭 AE、空间及随机效果和 DIR，随后单独测试逐像素 DIR 和内部印相／扫描 LUT。各阶段记录最大绝对误差、P99 和均值。把测得的当前差异与回归阈值一同记录。
 
+### 分支验证结果
+
+P0 的 CLI 修复、阶段探针和对照脚本已落地。复跑命令及 `metrics.json`、原始阶段文件的格式见 [对照脚本说明](../scripts/parity/README.md)。f64 核心测试通过 33 项，CLI 集成测试分别在 f32 和 f64 下通过 2 项。手动关掉色域压缩后，线性探针保留了 `-0.00662895`。将探针值限幅后的数组与关闭编码时的 `--raw-out` 完全一致。
+
+以下数值来自 macOS arm64、Rust 1.89.0、Python 3.13.13、NumPy 2.5.4、SciPy 1.18.1、colour-science 0.4.7 和 OpenImageIO 3.1.19.0。合成样本为 8×8 线性 ACES2065-1。实拍用原版附带的 `img/test/portrait_leaves_32bit_linear_prophoto_rgb.tif`（667×1000）。这些是观察值，可用于给指定配置建立后续回归门槛。
+
+| 配置 | 线性 RGB 最大绝对误差 | 最早可见的差异 |
+| --- | ---: | --- |
+| Portra 400／Portra Endura，合成图 | `4.11e-9` | 印相前后的中间值误差均小于 `3e-15` |
+| Gold 200／Fuji Crystal，合成图 | `4.16e-9` | 单独开启印相 LUT 或扫描 LUT，RGB 误差仍约 `4.16e-9` |
+| Gold 200／Fuji Crystal，仅开逐像素 DIR | `5.73e-8` | 胶片 CMY 最大误差 `1.11e-7` |
+| Provia／Velvia，直接扫描 | `4.10e-9`／`3.77e-9` | 胶片 CMY 最大误差均小于 `6e-15` |
+| Provia 直扫，仅开逐像素 DIR | `4.15e-2` | 胶片 CMY 最大误差 `0.273145`，单独开启扫描 LUT 时 RGB 误差仍约 `4.10e-9` |
+| Vision3 500T／2383，合成图 | `0.259739` | 胶片曝光对数最大误差 `0.718375` |
+| Portra 400／Portra Endura，实拍 TIFF | `1.37e-4` | 曝光对数最大误差 `1.84e-4`，最终 RGB P99 `4.75e-5`、均值 `2.15e-6` |
+
+Vision3 的 `T` 参考光源会被 Rust 的曝光选择器回退为 D55，2383 的 `K75P` 观看光源也会被扫描选择器回退为 D50。原版分别使用 Incandescent 和 Kinoton 75P 的 81 波段光谱。P1 应先以这组对照验证光源取值，再测 Provia／Velvia 的片种专属 DIR。出处见 [Vision3 profile](../data/profiles/kodak_vision3_500t.json#L22)、[2383 profile](../data/profiles/kodak_2383.json#L23)、[曝光光源选择](../crates/spektrafilm-core/src/pipeline.rs#L1163) 和 [扫描光源选择](../crates/spektrafilm-core/src/stages/scanning.rs#L432)。
+
+Python 快照的四份测试模块（`test_regression_baselines`、`test_topology`、`test_runtime_api` 和 `test_lut_mode`）通过 22 项并失败 4 项。三份印相 RGB 快照与当前执行结果不一致，另一个 LUT 测试仍引用已移除的 `GrainParams.mult_usm_amount`。跨语言报告采用当次执行的 Python 阶段输出。历史 `.npz` 快照的差异仍待核实。
+
 ## P1 确定性照片渲染与单 LUT
 
 - **统一色域和传递函数。** Rust 核心尚未读取 `input_cctf_decoding`。扫描端按 sRGB 编码任意输出空间，并在核心中硬限幅。让 GUI 和 CLI 共享每张输入的色彩信息，向写出边界移动格式限幅。补 GUI 打开的 JPEG 在 f64 CLI 里无法重新读取的问题，测试 JPEG 往返、图片切换不继承前一张的色域、等价编码／线性灰阶、非 sRGB 和浮点超白。出处见 [输入曝光](../crates/spektrafilm-core/src/stages/filming.rs#L291) 和 [扫描编码](../crates/spektrafilm-core/src/stages/scanning.rs#L359)。

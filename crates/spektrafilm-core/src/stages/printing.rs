@@ -356,6 +356,7 @@ pub fn process_with_calibration(
         preflash,
         bw_print_correction,
     );
+    super::dump_if_env("SPEKTRAFILM_DUMP_PRINT_LOG_RAW", &log_raw);
     develop(&log_raw, print, params, backend)
 }
 

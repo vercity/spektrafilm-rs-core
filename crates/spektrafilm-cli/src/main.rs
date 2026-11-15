@@ -31,10 +31,10 @@ enum Commands {
         #[arg(long)]
         film: String,
         /// Paper stock name (e.g. fujifilm_crystal_archive_typeii).
-        /// If omitted and --scan-film is not set, uses the film's target_print.
+        /// If omitted in print mode, uses the film's target_print.
         #[arg(long)]
         paper: Option<String>,
-        /// Scan film directly (skip printing stage).
+        /// Scan film directly (skip printing stage). If omitted, use io.scan_film from --params.
         #[arg(long)]
         scan_film: bool,
         /// Print per-stage timing information.
@@ -43,8 +43,8 @@ enum Commands {
         /// Path to JSON params file for overrides.
         #[arg(long)]
         params: Option<PathBuf>,
-        /// Dump the raw f64 output buffer (HxWx3, row-major, channel-interleaved)
-        /// before sRGB encoding/clipping. Used for bit-exact parity comparison.
+        /// Dump the final pipeline buffer as native-endian f64 (HxWx3, row-major,
+        /// channel-interleaved) after pipeline color processing and before file quantization.
         #[arg(long)]
         raw_out: Option<PathBuf>,
         /// Run the pipeline N times in the same process. Each iteration is
@@ -150,35 +150,36 @@ fn cmd_process(
 ) -> Result<()> {
     let total_start = Instant::now();
 
+    let mut params = if let Some(pf) = params_file {
+        let f = std::fs::File::open(pf)
+            .with_context(|| format!("opening params file: {}", pf.display()))?;
+        serde_json::from_reader(std::io::BufReader::new(f))
+            .with_context(|| format!("parsing params file: {}", pf.display()))?
+    } else {
+        RuntimeParams::default()
+    };
+    params.io.scan_film = scan_film || params.io.scan_film;
+
     // Load profiles
     let t = Instant::now();
     let film = profile::load_profile_by_name(data_dir, film_name)
         .with_context(|| format!("loading film profile: {film_name}"))?;
 
-    let print_stock = if scan_film {
+    let print_stock = if params.io.scan_film {
         film_name.to_string()
     } else if let Some(p) = paper_name {
         p.to_string()
     } else if let Some(ref target) = film.info.target_print {
         target.clone()
     } else {
-        bail!("no paper specified and film has no target_print — use --paper or --scan-film");
+        bail!(
+            "no paper specified and film has no target_print. Use --paper, --scan-film, or io.scan_film in --params"
+        );
     };
 
     let print = profile::load_profile_by_name(data_dir, &print_stock)
         .with_context(|| format!("loading print profile: {print_stock}"))?;
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
-
-    // Load params (defaults + optional overrides)
-    let mut params = if let Some(pf) = params_file {
-        let f = std::fs::File::open(pf)
-            .with_context(|| format!("opening params file: {}", pf.display()))?;
-        serde_json::from_reader(std::io::BufReader::new(f))
-            .with_context(|| "parsing params file")?
-    } else {
-        RuntimeParams::default()
-    };
-    params.io.scan_film = scan_film;
 
     // Auto-detect input color space from file extension
     let ext = input
@@ -243,23 +244,13 @@ fn cmd_process(
     let backend = spektrafilm_gpu::select_backend();
     eprintln!("Backend: {}", backend.name());
 
-    // Run pipeline (with full Hanatos2025 spectral upsampling)
+    // Build the calibrated pipeline with the selected spectral upsampler.
     let t = Instant::now();
-    let pipeline = Pipeline::new_with_spectral(film, print, params, data_dir).unwrap_or_else(|e| {
-        eprintln!("Warning: spectral LUT not available ({e}), using simplified path");
-        Pipeline::new(
-            profile::load_profile_by_name(data_dir, film_name).unwrap(),
-            profile::load_profile_by_name(data_dir, &print_stock).unwrap(),
-            {
-                let mut p = RuntimeParams::default();
-                p.io.scan_film = scan_film;
-                if ext == "png" {
-                    p.io.input_color_space = "sRGB".to_string();
-                }
-                p
-            },
-        )
-    });
+    let pipeline = Pipeline::new_with_spectral(film, print, params, data_dir)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!("initializing spectral pipeline for {film_name} / {print_stock}")
+        })?;
     let result = if iters > 1 {
         // Warm-cache bench: process the image `iters` times in the same backend
         // instance. The first iteration pays shader-compile cost; subsequent ones
@@ -294,7 +285,7 @@ fn cmd_process(
         t.elapsed().as_millis()
     );
 
-    // Optional raw f64 dump for bit-exact parity comparison.
+    // Optional dump of the final pipeline buffer without file quantization.
     if let Some(p) = raw_out {
         use std::io::Write;
         let buf: Vec<f64> = result.data.iter().map(|&v| v as f64).collect();
