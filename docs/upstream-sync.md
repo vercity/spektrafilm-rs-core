@@ -37,6 +37,14 @@ Python 快照的四份测试模块（`test_regression_baselines`、`test_topolog
 - **统一印相预闪和扫描端点。** Rust 黑白端点漏算预闪，黑白校正还会强制使用扫描 LUT。直扫胶片默认加眩光也与 Python 不同。共享端点和图像变换，分别验收预闪、黑／白校正、LUT 和正片直扫。出处见 [端点计算](../crates/spektrafilm-core/src/color_reference.rs#L213) 和 [扫描分支](../crates/spektrafilm-core/src/stages/scanning.rs#L234)。
 - **让 `.cube` 复用完整光谱管线。** 现有 CLI 用简化构造，无片纸曝光校准，且关闭所有 DIR。按 Python LUT 模式保留逐像素 DIR，关闭扩散、颗粒、眩光、AE 和全图高光调整。明确色域、传递函数和白点曝光，批量采样并拒绝边长 0／1。验收要求 `n³` 行有限值、网格点匹配确定性直出、像素调序及热点不影响映射。SDR 离网格可采用原版 QA 的 ΔE00 P99 ≤ 1、最大 ≤ 2。出处见 [现有 LUT 导出](../crates/spektrafilm-cli/src/main.rs#L368)。
 
+### P1 本轮验证
+
+- Vision3 500T 直扫的胶片曝光对数最大误差从 `0.718375` 降到 `2.78e-15`。Gold 200／2383 的线性 RGB 最大误差从 `0.0424707` 降到 `4.35e-9`。Vision3 500T／2383 为 `4.29e-9`。两种照明都覆盖了同光源的其他片纸配置。
+- Provia 仅开启逐像素 DIR 时胶片 CMY 最大误差从 `0.273145` 降到 `1.82e-7`，Velvia 为 `5.26e-7`。显式 JSON 系数按原数组格式输入，覆盖片种默认值。Rust `DirCouplersParams` 的四个系数字段改用 `Option` 表示覆盖值。
+- Portra 400／Portra Endura 的原版实拍 ProPhoto TIFF，线性 RGB 最大误差从 `1.37e-4` 降到 `2.52e-9`。编码 sRGB 和裁切前测光一起开启时，测试色板误差 `1.22e-8`。预闪与扫描黑白校正一起开启时，直接积分和扫描 LUT 的最大误差都约 `5.27e-9`。眩光只应用于印相路径。
+- Portra 400／Portra Endura 的 33³ sRGB 输入 SDR `.cube`，网格点最大绝对误差 `1.32e-7`。固定种子的 10,000 个离网格样本中，三线性和四面体插值的 ΔE00 P99 分别为 `0.187`、`0.156`，最大值分别为 `0.488`、`0.435`。这是原生曝光域的单 LUT。CLI 的输入域可选线性 ProPhoto 或编码 sRGB，命令见 [使用说明](../README.md#cli)。
+- Rust 默认精度测试通过 82 项，f64 CLI、核心和数学通过 75 项，GUI 通过 3 项。GUI 的保存状态回归覆盖连续改参数、同路径重载和旧渲染完成。f64 导出用每个流输出 1 MiB 的测试子进程验收。Metal 上验证了四种输出传递格式和线性负值，CUDA 后端做了编译检查。
+
 ## P2 默认胶片质感、GPU 与文件工作流
 
 - **多层颗粒和光学预设。** Rust 有感光层数据但使用整体颗粒。补 Python 默认的多层颗粒、染料云与微结构，验收分密度 RMS、空间相关和通道协方差。补片种晕光预设、Velvia／Provia DIR，并修晕光尺度为零时跳过加光却仍归一化的问题。Rust 黑白配置单测显影时间选择和通道一致性。出处见 [颗粒调用](../crates/spektrafilm-core/src/stages/filming.rs#L467) 和 [晕光归一化](../crates/spektrafilm-model/src/diffusion.rs#L131)。
