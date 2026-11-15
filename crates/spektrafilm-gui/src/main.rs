@@ -2158,6 +2158,13 @@ fn run_f64_export(
             .context("serializing params to JSON")?;
     }
 
+    // Redirect diagnostics to disk so the child can make progress while the
+    // GUI polls for completion or cancellation.
+    let stderr_path = temp.0.with_extension("stderr");
+    let stderr_file = std::fs::File::create_new(&stderr_path)
+        .with_context(|| format!("creating export log {}", stderr_path.display()))?;
+    let stderr_path = TempPath(stderr_path);
+
     let mut cmd = std::process::Command::new(cli_path);
     // Force the CPU backend: the wgpu shaders run f32 even in a
     // precision-f64 build (WGSL has no f64). Letting the child default
@@ -2175,8 +2182,8 @@ fn run_f64_export(
         .arg(&temp.0)
         .arg("--data-dir")
         .arg(data_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_file);
     if params.io.scan_film {
         cmd.arg("--scan-film");
     }
@@ -2199,15 +2206,11 @@ fn run_f64_export(
         std::thread::sleep(Duration::from_millis(100));
     };
 
-    // The child has exited; piped buffers are drained safely.
-    let mut stderr_buf = String::new();
-    if let Some(mut s) = child.stderr.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut stderr_buf);
-    }
-
     if !status.success() {
-        let trimmed = stderr_buf.trim();
+        let stderr_bytes = std::fs::read(&stderr_path.0)
+            .with_context(|| format!("reading export log after CLI exited {status}"))?;
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let trimmed = stderr.trim();
         let code = status
             .code()
             .map(|c| c.to_string())
@@ -2328,6 +2331,17 @@ mod preview_tests {
     use super::*;
     use spektrafilm_gpu::cpu_backend::CpuBackend;
 
+    fn fixture_path(name: &str) -> TempPath {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        TempPath(std::env::temp_dir().join(format!(
+            "spektrafilm-test-{}-{stamp}-{name}",
+            std::process::id(),
+        )))
+    }
+
     fn start_preview(app: &mut App) -> mpsc::Sender<Result<RenderResult, String>> {
         let (tx, rx) = mpsc::channel();
         app.render_requested_at = None;
@@ -2392,14 +2406,7 @@ mod preview_tests {
     fn reloading_same_path_discards_old_preview_and_accepts_current_errors() {
         let ctx = egui::Context::default();
         let mut app = App::new(Arc::new(CpuBackend), None);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = TempPath(std::env::temp_dir().join(format!(
-            "spektrafilm-reload-{}-{stamp}.png",
-            std::process::id(),
-        )));
+        let path = fixture_path("reload.png");
         image::RgbImage::from_pixel(1, 1, image::Rgb([128, 0, 0]))
             .save(&path.0)
             .unwrap();
@@ -2429,5 +2436,49 @@ mod preview_tests {
         assert_eq!(app.status, "Render error: test failure");
         assert!(app.output_image.is_none());
         assert!(app.output_tex.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verbose_export_child_exits_and_preserves_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = fixture_path("verbose-export.sh");
+        std::fs::write(
+            &script.0,
+            r#"#!/bin/sh
+head -c 1048576 /dev/zero
+head -c 1048576 /dev/zero | tr '\000' x >&2
+printf '\nexpected export error\n' >&2
+exit 23
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let err = std::thread::scope(|scope| {
+            let (done, waiting) = mpsc::channel::<()>();
+            let cancel = &cancel;
+            scope.spawn(move || {
+                if waiting.recv_timeout(Duration::from_secs(5)).is_err() {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            });
+            let result = run_f64_export(
+                &script.0,
+                Path::new("unused-input"),
+                Path::new("unused-output"),
+                "film",
+                "paper",
+                &RuntimeParams::default(),
+                Path::new("."),
+                cancel,
+            );
+            done.send(()).ok();
+            result.unwrap_err().to_string()
+        });
+        assert!(err.contains("exited 23"));
+        assert!(err.ends_with("expected export error"));
     }
 }
