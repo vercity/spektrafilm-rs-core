@@ -70,6 +70,48 @@ f64 CPU 与 Python 0.3.4 共用 64×48 场景线性 ProPhoto RGB TIFF（红绿�
 - 0.4 µm／像素时单独验证微结构，另以 4 µm／像素验证快速采样。该次运行的最坏相对 RMS 误差分别为 `0.83%` 和 `2.57%`。Python Numba 采样序列独立，按统计量比较。GPU 预览继续使用聚合颗粒。
 - Rust 默认精度 91 项、f64 89 项、GUI 3 项测试通过，CUDA 通过编译检查。Metal 上零晕光与关闭晕光输出逐位一致，散射在零晕光时独立生效。UV／IR 场景的 GPU／CPU 线性 RGB 最大绝对差为 `6.26e-6`。独立散射场景的 GPU／CPU 差为 `0.0257`，常驻 GPU 散射近似需要单独对齐。
 
+## CPU 测光、缩放与文件读写
+
+本轮分支为 `codex/python-parity-geometry-io`，起点 `f4e02d3`。对照用本机 `/Users/ougu/Downloads/spektrafilm-main`，对应 Python `0.3.4` 官方提交 [`3bb2c2d`](https://github.com/andreavolpato/spektrafilm/commit/3bb2c2d2801ff68b92019cf1dbcbb133d60832bc)。环境沿用本交接的 macOS arm64、Rust 1.89.0 与 Python 3.13.13。
+
+### CPU 测光与缩放
+
+测光沿用全图、裁切前的顺序，先对缩小的轴做 Gaussian 抗混叠，再进行近邻采样和 CCTF 解码。工作图改为基于像素中心的三次 B-spline、镜像边界与原数据范围裁切。CPU 镜头模糊、扫描锐化与 DIR 的小半径 FIR 使用反射边界。共享输入保留文件存储的传递函数，Metal 常驻路径在上传前按同一顺序应用测光和解码。
+
+| 用例 | 对照指标 | 本轮结果 |
+| --- | --- | ---: |
+| 512×384 线性棋盘，灰度交替 0.02／0.8，默认中心测光 | 胶片曝光对数最大绝对误差，此前对应约 3.81 EV | `4.66e-15` |
+| 原版 667×1000 ProPhoto 人像，默认中心测光 | 胶片曝光对数最大绝对误差 | `7.99e-15` |
+| 64×48 线性 ProPhoto 高频色板，工作比例 0.75×／1.5× | 胶片曝光对数最大绝对误差 | `3.22e-15`／`3.41e-15` |
+| 带负值和超白的非对称边缘裁切，工作比例 1.5× | 胶片曝光对数最大绝对误差，输出 15×22 | `2.13e-14` |
+| 相机模糊 8 µm、扫描模糊 2 px、扫描锐化、DIR，单项开启 | 相机曝光、扫描 RGB、扫描 RGB、胶片 CMY 的最大绝对误差 | `1.28e-15`／`1.22e-9`／`6.33e-9`／`1.39e-7` |
+
+复跑时将色板写为 float32 TIFF。令 `x=0…63`、`y=0…47`，RGB 分别取 `0.035+0.65*x/63`、`0.06+0.60*y/47`、`0.08+0.4*((x+y)%2)`。Python 收集 `log_e_film` 或 `cmy_film`，Rust 用 `SPEKTRAFILM_DUMP_FILM_LOG_RAW` 或 `SPEKTRAFILM_DUMP_FILM_DENSITY` 对读，模型尺度用 `film_format_mm=0.32`，实拍测光用 35 mm。
+
+共有 28 款片纸用同一高频色板和默认 35 mm 图幅遍历，负片配目标相纸、正片走直扫、相纸用 Portra 400。关闭 AE、颗粒和眩光，保留默认 DIR、晕光和锐化。最终线性 RGB 最坏最大绝对误差从 `0.003657` 降到 `3.16e-7`，最坏 P99 从 `0.000580` 降到 `2.32e-7`。出处见 [测光](../crates/spektrafilm-core/src/stages/filming.rs)、[缩放](../crates/spektrafilm-math/src/resize.rs) 和 [CPU 光学](../crates/spektrafilm-model/src/diffusion.rs)。
+
+Double-X、Tri-X 和 2302 的 `log_sensitivity: null` 现转换为零线性感光度，真实 log 值 `0` 仍对应灵敏度 `1`。以旧二进制和替换为空波段近零灵敏度（log 值 −200）的临时 profile 作参考，两套片纸组合的线性输出从最大误差 `0.379351`／`0.514453` 降为逐位一致。这是 Rust 扩展片种自己的验证。出处见 [profile 读取](../crates/spektrafilm-core/src/profile.rs)。
+
+### RAW 与图像读写
+
+RAW 由 CLI、GUI 和 `decode_raw_gui` 共用。方向及有效区在模拟前应用，读取结果及诊断 TIFF 标注为线性 ACES2065-1。CLI 支持 as-shot、daylight、tungsten 和 custom 白平衡。原生 Rawler 的解码、去马赛克及高光响应与 Python 的 LibRaw 不同，以下误差在共同的线性 ACES AP0 中测量。
+
+| 样本 | Rust 与 Python 的解码尺寸 | ACES AP0 P99 绝对误差 | 平均绝对误差 |
+| --- | --- | ---: | ---: |
+| 合成 Bayer DNG，Orientation=6，ActiveArea 92×60，DefaultCrop 88×52 | 60×92，此前 Rust 为 88×52 | `0.02403` | `0.000711` |
+| [Nikon NEF](https://github.com/letmaik/rawpy/blob/v0.26.1/test/iss030e122639.NEF) | 4284×2844 | `0.00982` | `0.001549` |
+| [Fuji X-T2 RAF](https://raw.pixls.us/getfile.php/865/nice/Fujifilm%20-%20X-T2%20-%2014bit%2014bit%20compressed%20%283%3A2%29.RAF)，X-Trans | 6032×4028 | `0.01406` | `0.001478` |
+
+DNG 直接渲染与输出后重新读取带 ACES 标记的 float32 TIFF，在 f64 胶片曝光阶段逐位一致。以 DNG 测 as-shot、daylight、tungsten、自定义 5000 K／1.15，曝光对数 P99 绝对误差为 `0.0316–0.0504`。NEF 原生高光最大到 `1.4163`，Python 的 16 位 RAW 输出最大为 `1.0`。单像素最大差异为 `1.1444`，后续需单独验证去马赛克与高光。
+
+CLI 使用 `--raw-lens-correction` 开启 Lensfun。匹配到直线投影镜头时应用暗角、自动缩放、径向畸变与逐通道 TCA，顺序在分析白平衡和 tint 前。未匹配到镜头时保持原图。CLI 端到端实测 Fuji 裁切图的线性 RGB 最大变化为 `0.00571`，缺镜头信息的 DNG 重跑逐位一致。以同一份 Python 解出的 Fuji 6032×4028 线性 ACES 输入隔离验证，XF35mmF1.4 R @35 mm、f/2.8 的校正结果与 Python lensfunpy 的 P99 绝对误差为 `0.001779`，平均 `0.0002291`，最大 `0.009976`。同一输入关闭校正时，对 Python 校正结果的 P99 为 `0.103072`。非直线投影到直线投影的转换仍待对齐。原生依赖是 [Lensfun Rust 0.7](https://github.com/vdavid/lensfun-rs)，算法许可为 LGPL-3.0-or-later，捆绑数据库许可为 CC BY-SA 3.0。
+
+PNG、JPEG、TIFF、EXR 共用读写。文件中可识别的色域和传递函数优先用于读取，未标记 TIFF 沿用配置，未标记 PNG/JPEG 按 sRGB 编码读取，未标记 EXR 按线性 sRGB 读取。CLI 用 `process --bit-depth 32` 生成 float32 TIFF／EXR，GUI 在 **Output** 选择 **TIFF / EXR bit depth**。设置 `io.output_cctf_encoding=false` 可生成线性输出。
+
+同一 f64 渲染缓冲由 Rust CLI 与 Python OpenImageIO 保存，输入为存有 EXIF 和 XMP 的 TIFF，输出尺寸 48×36。PNG8、TIFF 8／16／32 和 EXR half／float 的读回数据逐值一致。TIFF32／EXR32 保留线性范围约 `[-1.68706, 2.00211]`，EXR half 符合独立半精度转换。TIFF／PNG／JPEG 生成与实际样本匹配的 ICC，刷新 EXIF 方向、像素尺寸、软件名，并保留受支持的 EXIF、GPS、XMP 与 IPTC。Exiv2 在 TIFF、JPEG、PNG 之间的 9 种转存中均读回同一 IPTC 标题。EXR 写色度和传递函数。JPEG 沿用 Rust 质量 95，厂商 MakerNote、内嵌缩略图和 EXR 通用容器元数据仍待对齐。出处见 [加载与颜色识别](../crates/spektrafilm-io/src/input.rs)、[RAW](../crates/spektrafilm-io/src/raw.rs) 和 [栅格读写](../crates/spektrafilm-io/src/raster.rs)。
+
+工作区默认精度（GUI 单列）通过 103 项，f64 通过 101 项，GUI 通过 3 项。GUI 子进程测试同时检查 32 位选项转发和大量日志排空。Metal 实测编码及线性输入的常驻路径，CUDA 通过编译检查。
+
 ## P3 进阶交付和持续验证
 
 单 LUT 达标后，先稳定胶片 CMY 的 2-LUT 接口，再做 3／4-LUT、曝光 shaper、OCIO 和其他交付格式。输入／输出进阶色域算法、Hanatos adaptation surface、自定义 profile 形状校验各自验收。CI 增加 CPU f32／f64 回归和任意工作目录下的打包冒烟测试，Metal、CUDA 用对应硬件测画质。出处见 [现有发布流程](../.github/workflows/release.yml)。
