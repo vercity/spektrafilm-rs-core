@@ -3715,9 +3715,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
- "exr",
  "image",
- "rayon",
  "serde_json",
  "spektrafilm-core",
  "spektrafilm-gpu",
@@ -3734,7 +3732,6 @@ version = "0.1.2"
 dependencies = [
  "blas-src",
  "cblas",
- "image",
  "libm",
  "rayon",
  "serde",
@@ -3793,9 +3790,14 @@ name = "spektrafilm-io"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "exr",
+ "image",
+ "moxcms",
+ "png",
  "rawler",
  "rayon",
  "spektrafilm-math",
+ "tiff 0.10.3",
 ]
 
 [[package]]

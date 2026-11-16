@@ -1,13 +1,12 @@
 // Write the pixels shared by the GUI and CLI to a linear ACES2065-1 float TIFF.
 
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
-use spektrafilm_io::raw;
-use spektrafilm_math::precision::to_f32;
-use tiff::encoder::{TiffEncoder, colortype::RGB32Float};
+use anyhow::{Result, anyhow};
+use spektrafilm_io::{
+    raster::{RasterWriteOptions, read_source_metadata, write_raster},
+    raw,
+};
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -21,7 +20,6 @@ fn main() -> Result<()> {
     let output = Path::new(&output);
 
     let image = raw::decode(input)?;
-    let floats: Vec<f32> = image.data.into_iter().map(to_f32).collect();
     eprintln!(
         "[decode_raw_gui] decoded {}×{} → linear {}",
         image.width,
@@ -29,11 +27,16 @@ fn main() -> Result<()> {
         raw::INPUT_COLOR_SPACE
     );
 
-    let f = File::create(output).with_context(|| format!("creating {}", output.display()))?;
-    let mut encoder = TiffEncoder::new(BufWriter::new(f)).context("init TiffEncoder")?;
-    encoder
-        .write_image::<RGB32Float>(image.width, image.height, &floats)
-        .context("write TIFF image")?;
+    write_raster(
+        output,
+        &image,
+        &RasterWriteOptions {
+            bit_depth: Some(32),
+            color_space: Some(raw::INPUT_COLOR_SPACE),
+            cctf_encoding: false,
+            source_metadata: Some(&read_source_metadata(input)),
+        },
+    )?;
     eprintln!("[decode_raw_gui] wrote {}", output.display());
     Ok(())
 }

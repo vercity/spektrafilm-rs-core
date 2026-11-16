@@ -19,8 +19,13 @@ use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
+use spektrafilm_io::{
+    raster::{RasterColor, RasterMetadata, RasterWriteOptions, write_raster},
+    raw::WhiteBalance,
+    read_image,
+};
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{Scalar, from_f32, srgb_decode, srgb_encode, to_f32};
+use spektrafilm_math::precision::{from_f32, srgb_encode, to_f32};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 const IN_FLIGHT_REPAINT: Duration = Duration::from_millis(16);
@@ -201,6 +206,8 @@ struct App {
     params: RuntimeParams,
     image_path: Option<PathBuf>,
     image: Option<Arc<ImageBuf>>,
+    source_metadata: RasterMetadata,
+    output_bit_depth: u8,
     /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
@@ -317,6 +324,8 @@ impl App {
             params,
             image_path: None,
             image: None,
+            source_metadata: RasterMetadata::default(),
+            output_bit_depth: 16,
             output_image: None,
             output_tex: None,
             pipeline_cache_key: None,
@@ -344,22 +353,16 @@ impl App {
 
     fn load_image_from_path(&mut self, path: &Path) {
         let t = Instant::now();
-        match load_image(path) {
-            Ok(img) => {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                self.params.io.input_color_space = if spektrafilm_io::raw::is_raw(path) {
-                    spektrafilm_io::raw::INPUT_COLOR_SPACE
-                } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
-                    "sRGB"
-                } else {
-                    "ProPhoto RGB"
-                }
-                .into();
-                self.params.io.input_cctf_decoding = false;
+        match read_image(path, WhiteBalance::AsShot) {
+            Ok(loaded) => {
+                let color = loaded.color.unwrap_or(RasterColor {
+                    color_space: "ProPhoto RGB",
+                    cctf_encoding: false,
+                });
+                self.params.io.input_color_space = color.color_space.into();
+                self.params.io.input_cctf_decoding = color.cctf_encoding;
+                self.source_metadata = loaded.metadata;
+                let img = loaded.image;
                 self.status = format!(
                     "Loaded {} × {} ({:.1} MP) in {:.0} ms",
                     img.width,
@@ -389,7 +392,10 @@ impl App {
         if self.pipeline_cache_key.as_deref() == Some(key.as_str())
             && let Some(pipeline) = self.pipeline_cache.as_ref()
         {
-            return Ok((pipeline.clone().with_params(params.clone()), t.elapsed().as_secs_f32() * 1000.0));
+            return Ok((
+                pipeline.clone().with_params(params.clone()),
+                t.elapsed().as_secs_f32() * 1000.0,
+            ));
         }
 
         let film = profile::load_profile_by_name(&self.data_dir, film_name)
@@ -620,15 +626,27 @@ impl App {
             }
             None => "spektrafilm.png".into(),
         };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "tif", "tiff"])
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "tif", "tiff", "exr", "jpg", "jpeg"])
             .set_file_name(&default_name)
             .save_file()
         else {
             return;
         };
         let t = Instant::now();
-        match save_image(out, &path) {
+        if path.extension().is_none() {
+            path.set_extension("png");
+        }
+        match write_raster(
+            &path,
+            out,
+            &RasterWriteOptions {
+                bit_depth: self.bit_depth_for(&path),
+                color_space: Some(&self.params.io.output_color_space),
+                cctf_encoding: self.params.io.output_cctf_encoding,
+                source_metadata: Some(&self.source_metadata),
+            },
+        ) {
             Ok(()) => {
                 self.status = format!(
                     "Saved {} in {:.0} ms",
@@ -644,10 +662,16 @@ impl App {
         }
     }
 
+    fn bit_depth_for(&self, path: &Path) -> Option<u8> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        (self.output_bit_depth != 16 && matches!(extension.as_str(), "tif" | "tiff" | "exr"))
+            .then_some(self.output_bit_depth)
+    }
+
     /// Export the current frame by subprocessing the f64-built
     /// `spektrafilm` CLI. The GUI runs the pipeline at f32 on the GPU
     /// for fast iteration; export re-runs the pipeline at f64 (CPU)
-    /// using the same params and writes a standard PNG/TIFF/JPEG.
+    /// using the same params and writes the selected image format.
     ///
     /// The f64 CLI is located via, in order: `$SPEKTRAFILM_F64_CLI`,
     /// then `spektrafilm-f64` on `PATH`, then `target/release/spektrafilm-f64`
@@ -672,7 +696,7 @@ impl App {
             .unwrap_or("spektrafilm");
         let default_name = format!("{stem}_{}_spektra_f64.png", self.film_name);
         let Some(out_path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "tif", "tiff", "jpg", "jpeg"])
+            .add_filter("Image", &["png", "tif", "tiff", "exr", "jpg", "jpeg"])
             .set_file_name(&default_name)
             .save_file()
         else {
@@ -694,6 +718,7 @@ impl App {
         let mut params = self.params.clone();
         params.settings.use_enlarger_lut = true;
         params.settings.use_scanner_lut = true;
+        let bit_depth = self.bit_depth_for(&out_path);
         let data_dir = self.data_dir.clone();
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
@@ -707,6 +732,7 @@ impl App {
                     &cli_path,
                     &input_path,
                     &out_path,
+                    bit_depth,
                     &film,
                     &paper,
                     &params,
@@ -797,7 +823,7 @@ impl App {
                     .add_filter(
                         "Image",
                         &[
-                            "png", "tif", "tiff", "jpg", "jpeg", // standard
+                            "png", "tif", "tiff", "exr", "jpg", "jpeg", // standard
                             "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
                             "rw2", "pef", "srw", "x3f", "iiq", "3fr", "crw", "rwl", "mrw", "mef",
                             "kdc",
@@ -831,7 +857,7 @@ impl App {
                     .add_enabled(export_enabled, egui::Button::new("Export…"))
                     .on_hover_text(
                         "Re-run the pipeline at f64 precision (CPU, via the spektrafilm-f64 \
-                         CLI subprocess) and write a PNG/TIFF/JPEG. The live preview stays \
+                         CLI subprocess) and write the selected image format. The live preview stays \
                          at f32 GPU for speed; export trades time for precision.",
                     )
                     .on_disabled_hover_text("Load an image first")
@@ -1363,6 +1389,24 @@ impl App {
         egui::CollapsingHeader::new("Output")
             .default_open(false)
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("TIFF / EXR bit depth");
+                    egui::ComboBox::from_id_salt("output_bit_depth")
+                        .selected_text(format!("{} bit", self.output_bit_depth))
+                        .show_ui(ui, |ui| {
+                            for depth in [8, 16, 32] {
+                                ui.selectable_value(
+                                    &mut self.output_bit_depth,
+                                    depth,
+                                    format!("{depth} bit"),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "TIFF supports 8, 16 and 32 bits. EXR supports 16 and 32 bits.",
+                        );
+                });
                 let io = &mut self.params.io;
                 let mut changed = false;
                 let mut scan_film = io.scan_film;
@@ -1431,10 +1475,7 @@ impl App {
             "input handle:  {:>6.1} ms",
             self.last_input_clone_ms
         ));
-        ui.monospace(format!(
-            "preview pack:  {:>6.1} ms",
-            self.last_preview_ms
-        ));
+        ui.monospace(format!("preview pack:  {:>6.1} ms", self.last_preview_ms));
         ui.monospace(format!(
             "worker total:  {:>6.1} ms",
             self.last_worker_total_ms
@@ -1702,11 +1743,7 @@ fn fps_label(ms: f32) -> &'static str {
     }
 }
 
-fn preview_pipeline_cache_key(
-    film_name: &str,
-    print_name: &str,
-    params: &RuntimeParams,
-) -> String {
+fn preview_pipeline_cache_key(film_name: &str, print_name: &str, params: &RuntimeParams) -> String {
     serde_json::json!({
         "film": film_name,
         "print": print_name,
@@ -1760,79 +1797,6 @@ fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
             .map(|e| e.stock.clone())
             .unwrap_or_else(|| preferred.to_string())
     }
-}
-
-fn load_image(path: &Path) -> Result<ImageBuf> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    if spektrafilm_io::raw::is_raw(path) {
-        return spektrafilm_io::raw::decode(path);
-    }
-    // Disable the `image` crate's default 512 MiB allocation cap — a 60 MP
-    // 32-bit float TIFF alone needs ~720 MiB and would otherwise be
-    // rejected with "Memory limit exceeded". Local files are trusted.
-    let mut reader = image::ImageReader::open(path)
-        .with_context(|| format!("opening image: {}", path.display()))?
-        .with_guessed_format()
-        .with_context(|| format!("detecting image format: {}", path.display()))?;
-    reader.no_limits();
-    let img = reader
-        .decode()
-        .with_context(|| format!("decoding image: {}", path.display()))?;
-    let rgb = img.to_rgb32f();
-    let (w, h) = (rgb.width(), rgb.height());
-    let data: Vec<f32> = rgb.into_raw();
-    let scalars: Vec<Scalar> = match ext.as_str() {
-        "png" | "jpg" | "jpeg" => data
-            .into_par_iter()
-            .map(|v| srgb_decode(from_f32(v)))
-            .collect(),
-        _ => data.into_par_iter().map(from_f32).collect(),
-    };
-    Ok(ImageBuf::from_data(w, h, scalars))
-}
-
-fn save_image(out: &ImageBuf, path: &Path) -> Result<()> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png")
-        .to_lowercase();
-    let w = out.width;
-    let h = out.height;
-    match ext.as_str() {
-        "tif" | "tiff" => {
-            // Pack into 16-bit RGB.
-            let n = (w as usize) * (h as usize) * 3;
-            let mut buf = vec![0u16; n];
-            buf.par_iter_mut()
-                .zip(out.data.par_iter())
-                .for_each(|(dst, &src)| {
-                    *dst = (to_f32(src).clamp(0.0, 1.0) * 65535.0).round() as u16;
-                });
-            let img = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w, h, buf)
-                .context("packing 16-bit TIFF buffer")?;
-            img.save_with_format(path, image::ImageFormat::Tiff)
-                .with_context(|| format!("writing TIFF {}", path.display()))?;
-        }
-        _ => {
-            let n = (w as usize) * (h as usize) * 3;
-            let mut buf = vec![0u8; n];
-            buf.par_iter_mut()
-                .zip(out.data.par_iter())
-                .for_each(|(dst, &src)| {
-                    *dst = (to_f32(src).clamp(0.0, 1.0) * 255.0).round() as u8;
-                });
-            let img = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buf)
-                .context("packing 8-bit PNG buffer")?;
-            img.save_with_format(path, image::ImageFormat::Png)
-                .with_context(|| format!("writing PNG {}", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 /// Convert the pipeline's RGB output into a display-encoded RGBA preview.
@@ -2000,6 +1964,7 @@ fn run_f64_export(
     cli_path: &Path,
     input: &Path,
     output: &Path,
+    bit_depth: Option<u8>,
     film: &str,
     paper: &str,
     params: &spektrafilm_core::params::RuntimeParams,
@@ -2049,6 +2014,10 @@ fn run_f64_export(
         .stderr(stderr_file);
     if params.io.scan_film {
         cmd.arg("--scan-film");
+    }
+
+    if let Some(bit_depth) = bit_depth {
+        cmd.arg("--bit-depth").arg(bit_depth.to_string());
     }
 
     let mut child = cmd
@@ -2331,6 +2300,7 @@ exit 23
                 &script.0,
                 Path::new("unused-input"),
                 Path::new("unused-output"),
+                None,
                 "film",
                 "paper",
                 &RuntimeParams::default(),

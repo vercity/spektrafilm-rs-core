@@ -62,7 +62,7 @@ WGSL is the default GPU backend and can be selected explicitly with `SPEKTRAFILM
 - **Sliders** — exposure, film format, halation, DIR couplers, grain, glare, scanner, enlarger, output. All live-updating against the GPU preview.
 - **Profiles** — film stock and print paper combo boxes; picking a film auto-selects its paired paper (`target_print` in the profile).
 - **Zoom** — scroll wheel or trackpad pinch over the preview (cursor-anchored), click-drag to pan, double-click to reset.
-- **Export…** — re-runs the pipeline at f64 precision on the CPU and writes a PNG/TIFF/JPEG. Status bar shows elapsed time; **Cancel** kills the child cleanly. Closing the GUI mid-export also kills the child (no orphans).
+- **Export…** — re-runs the pipeline at f64 precision on the CPU and writes PNG, TIFF, JPEG, or EXR. The **TIFF / EXR bit depth** setting applies to both Save and Export. **Cancel** stops the export.
 - **Save…** — write the f32 GPU preview directly (instant, less precise).
 
 ### CLI
@@ -88,6 +88,13 @@ SPEKTRAFILM_BACKEND=cpu \
 # List available film + paper profiles
 ./target/release/spektrafilm list-profiles --data-dir data
 ```
+
+Use `process --bit-depth 32` with a TIFF or EXR output path for float32 samples.
+TIFF defaults to uint16 and EXR defaults to half. For scene-linear output, set
+`io.output_cctf_encoding` to `false` in the JSON passed via `--params`.
+Camera RAW decodes to linear ACES2065-1. The default white balance is as-shot.
+Select `--raw-white-balance daylight`, `tungsten`, or `custom --raw-temperature 5000`
+to override it.
 
 A calibrated SDR cube uses the same spectral pipeline as CPU photo processing.
 The domain is `[0, 1]` on each channel. The default input is linear ProPhoto RGB,

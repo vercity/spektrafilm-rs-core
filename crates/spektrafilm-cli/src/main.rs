@@ -8,6 +8,10 @@ use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_io::raw;
+use spektrafilm_io::{
+    raster::{RasterWriteOptions, write_raster},
+    read_image,
+};
 use spektrafilm_math::image::ImageBuf;
 
 #[derive(Parser)]
@@ -24,11 +28,14 @@ struct Cli {
 enum Commands {
     /// Process an image through the film simulation pipeline.
     Process {
-        /// Input image (TIFF, PNG, JPEG, or camera RAW).
+        /// Input image (TIFF, PNG, JPEG, EXR, or camera RAW).
         input: PathBuf,
         /// Output image path.
         #[arg(short, long)]
         output: PathBuf,
+        /// Output sample depth. TIFF supports 8/16/32, EXR 16/32, PNG 8/16, JPEG 8.
+        #[arg(long)]
+        bit_depth: Option<u8>,
         /// Film stock name (e.g. kodak_portra_400).
         #[arg(long)]
         film: String,
@@ -167,6 +174,7 @@ fn main() -> Result<()> {
         Commands::Process {
             input,
             output,
+            bit_depth,
             film,
             paper,
             scan_film,
@@ -180,6 +188,7 @@ fn main() -> Result<()> {
             cmd_process(
                 &input,
                 &output,
+                bit_depth,
                 &film,
                 paper.as_deref(),
                 scan_film,
@@ -220,6 +229,7 @@ fn main() -> Result<()> {
 fn cmd_process(
     input: &Path,
     output: &Path,
+    bit_depth: Option<u8>,
     film_name: &str,
     paper_name: Option<&str>,
     scan_film: bool,
@@ -263,29 +273,14 @@ fn cmd_process(
         .with_context(|| format!("loading print profile: {print_stock}"))?;
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
 
-    // Auto-detect input color space from file extension
-    let ext = input
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let is_raw = raw::is_raw(input);
-    let white_balance = raw_options.white_balance(is_raw)?;
-    if is_raw {
-        params.io.input_color_space = raw::INPUT_COLOR_SPACE.into();
-        params.io.input_cctf_decoding = false;
-    } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
-        params.io.input_color_space = "sRGB".into();
-        params.io.input_cctf_decoding = false;
-    }
-
-    // Load image
     let t = Instant::now();
-    let image = if is_raw {
-        raw::decode_with_white_balance(input, white_balance)?
-    } else {
-        load_image(input)?
-    };
+    let white_balance = raw_options.white_balance(raw::is_raw(input))?;
+    let loaded = read_image(input, white_balance)?;
+    if let Some(color) = loaded.color {
+        params.io.input_color_space = color.color_space.into();
+        params.io.input_cctf_decoding = color.cctf_encoding;
+    }
+    let image = loaded.image;
     eprintln!(
         "Image loaded: {}x{} ({} MP), {} ms",
         image.width,
@@ -330,7 +325,16 @@ fn cmd_process(
 
     // Save output
     let t = Instant::now();
-    save_image(&result, output)?;
+    write_raster(
+        output,
+        &result,
+        &RasterWriteOptions {
+            bit_depth,
+            color_space: Some(&pipeline.params.io.output_color_space),
+            cctf_encoding: pipeline.params.io.output_cctf_encoding,
+            source_metadata: Some(&loaded.metadata),
+        },
+    )?;
     eprintln!(
         "Saved: {} ({}x{}), {} ms",
         output.display(),
@@ -494,137 +498,4 @@ fn lut_runtime_params(input_encoding: LutInputEncoding) -> RuntimeParams {
     params.scanner.lens_blur = 0.0;
     params.scanner.unsharp_mask = [0.0, 0.0];
     params
-}
-
-/// Load raster RGB without changing the transfer function of a TIFF.
-fn load_image(path: &Path) -> Result<ImageBuf> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "tif" | "tiff" => load_tiff(path),
-        "png" | "jpg" | "jpeg" => load_srgb_raster(path),
-        _ => bail!("unsupported image format: .{ext} (supported: tiff, png, jpeg, camera RAW)"),
-    }
-}
-
-fn decode_no_limits(path: &Path) -> Result<image::DynamicImage> {
-    let mut reader = image::ImageReader::open(path)
-        .with_context(|| format!("opening image: {}", path.display()))?
-        .with_guessed_format()
-        .with_context(|| format!("detecting image format: {}", path.display()))?;
-    reader.no_limits();
-    reader
-        .decode()
-        .with_context(|| format!("decoding image: {}", path.display()))
-}
-
-fn load_tiff(path: &Path) -> Result<ImageBuf> {
-    let img = decode_no_limits(path)?;
-    let rgb = img.to_rgb32f();
-    let (w, h) = (rgb.width(), rgb.height());
-    let data: Vec<f32> = rgb.into_raw();
-    let scalars: Vec<spektrafilm_math::precision::Scalar> = data
-        .into_iter()
-        .map(spektrafilm_math::precision::from_f32)
-        .collect();
-    Ok(ImageBuf::from_data(w, h, scalars))
-}
-
-fn load_srgb_raster(path: &Path) -> Result<ImageBuf> {
-    let img = decode_no_limits(path)?;
-    let rgb = img.to_rgb32f();
-    let (w, h) = (rgb.width(), rgb.height());
-    let data: Vec<f32> = rgb.into_raw();
-    // PNG and JPEG use the standard sRGB transfer curve by default.
-    let scalars: Vec<spektrafilm_math::precision::Scalar> = data
-        .into_iter()
-        .map(|v| spektrafilm_math::precision::srgb_decode(spektrafilm_math::precision::from_f32(v)))
-        .collect();
-    Ok(ImageBuf::from_data(w, h, scalars))
-}
-
-/// Save an ImageBuf to TIFF (16-bit) or PNG (8-bit).
-fn save_image(img: &ImageBuf, path: &Path) -> Result<()> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "tif" | "tiff" => save_tiff(img, path),
-        "png" => save_png(img, path),
-        "jpg" | "jpeg" => save_jpeg(img, path),
-        _ => bail!("unsupported output format: .{ext} (supported: tiff, png, jpg)"),
-    }
-}
-
-fn save_tiff(img: &ImageBuf, path: &Path) -> Result<()> {
-    // Convert to 16-bit
-    let data_u16: Vec<u16> = img
-        .data
-        .iter()
-        .map(|&v| ((v.clamp(0.0, 1.0) * 65535.0).round_ties_even()) as u16)
-        .collect();
-
-    let buf: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> =
-        image::ImageBuffer::from_raw(img.width, img.height, data_u16)
-            .context("creating image buffer")?;
-
-    buf.save(path)
-        .with_context(|| format!("saving TIFF: {}", path.display()))?;
-    Ok(())
-}
-
-fn save_jpeg(img: &ImageBuf, path: &Path) -> Result<()> {
-    // Same 8-bit quantize as PNG; round_ties_even keeps the pre-encode
-    // pixel values numpy-identical. Quality 95 — defending the f64
-    // export path against silent quality loss; `image`'s default of 75
-    // would defeat the point of running the pipeline at f64.
-    use image::ImageEncoder;
-    let data_u8: Vec<u8> = img
-        .data
-        .iter()
-        .map(|&v| ((v.clamp(0.0, 1.0) * 255.0).round_ties_even()) as u8)
-        .collect();
-    let mut file = std::io::BufWriter::new(
-        std::fs::File::create(path)
-            .with_context(|| format!("creating JPEG: {}", path.display()))?,
-    );
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, 95)
-        .write_image(
-            &data_u8,
-            img.width,
-            img.height,
-            image::ExtendedColorType::Rgb8,
-        )
-        .with_context(|| format!("saving JPEG: {}", path.display()))?;
-    Ok(())
-}
-
-fn save_png(img: &ImageBuf, path: &Path) -> Result<()> {
-    // Python: `np.round(x * 255).astype(np.uint8)`. Numpy uses
-    // round-half-to-even (banker's rounding), *not* round-half-up.
-    // `f64::round()` in Rust is round-half-away-from-zero so it
-    // disagrees with numpy at exact x.5 inputs — a rare but real
-    // diff that prevented the bare-chain output from being
-    // bit-identical with Python. `round_ties_even` (stable since
-    // Rust 1.77) matches numpy literally.
-    let data_u8: Vec<u8> = img
-        .data
-        .iter()
-        .map(|&v| ((v.clamp(0.0, 1.0) * 255.0).round_ties_even()) as u8)
-        .collect();
-
-    let buf: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-        image::ImageBuffer::from_raw(img.width, img.height, data_u8)
-            .context("creating image buffer")?;
-
-    buf.save(path)
-        .with_context(|| format!("saving PNG: {}", path.display()))?;
-    Ok(())
 }

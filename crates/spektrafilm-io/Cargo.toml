@@ -9,6 +9,11 @@ precision-f64 = ["spektrafilm-math/precision-f64"]
 
 [dependencies]
 anyhow.workspace = true
+exr.workspace = true
+image.workspace = true
+moxcms = "0.8"
+png = "0.18"
 rawler = "0.7"
 rayon.workspace = true
 spektrafilm-math.workspace = true
+tiff = "0.10"

@@ -21,7 +21,6 @@ rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libm.workspace = true
-image.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cblas = "0.4"
