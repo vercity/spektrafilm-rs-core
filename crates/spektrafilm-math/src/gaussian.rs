@@ -14,18 +14,23 @@ use rayon::prelude::*;
 /// independently avoids the 3x-redundant work of blurring a 3-channel
 /// ImageBuf where all channels are identical.
 pub fn gaussian_blur_channel(data: &[Scalar], w: u32, h: u32, sigma: f32) -> Vec<Scalar> {
+    let mut channel = data.to_vec();
+    gaussian_blur_channel_in_place(&mut channel, w, h, from_f32(sigma));
+    channel
+}
+
+/// Blur a single channel using one scratch buffer.
+pub fn gaussian_blur_channel_in_place(data: &mut [Scalar], w: u32, h: u32, sigma: Scalar) {
     let wu = w as usize;
     let hu = h as usize;
     assert_eq!(data.len(), wu * hu);
-    if sigma <= 0.0 {
-        return data.to_vec();
+    // A truncated FIR kernel with radius zero is an identity.
+    if data.is_empty() || (from_f64(3.0) * sigma + from_f64(0.5)) < from_f64(1.0) {
+        return;
     }
-    let sigma_s = from_f32(sigma);
-    let mut chan = data.to_vec();
     let mut tmp = vec![ZERO; wu * hu];
-    blur_1d_parallel(&chan, &mut tmp, wu, hu, sigma_s, true);
-    blur_1d_parallel(&tmp, &mut chan, wu, hu, sigma_s, false);
-    chan
+    blur_1d_parallel(data, &mut tmp, wu, hu, sigma, true);
+    blur_1d_parallel(&tmp, data, wu, hu, sigma, false);
 }
 
 /// Sum-of-3-Gaussians approximation of an isotropic 2D exponential PSF

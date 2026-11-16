@@ -436,9 +436,8 @@ pub fn resolve_for_render(mut profile: Profile, development_time: Option<f64>) -
         model.amplitudes = pick(&model.amplitudes);
         model.sigmas = pick(&model.sigmas);
     }
-    // Layers are n_le × n_layers × n_times on B&W families (upstream slices
-    // `[:, :, idx]`). Unconsumed by the runtime today, but collapse anyway so
-    // no future consumer reads the stale family.
+    // Keep the selected development-time column for the monochrome grain
+    // model, matching upstream's `[:, :, idx]`.
     for layer_row in &mut d.density_curves_layers {
         for layer in layer_row.iter_mut() {
             let i = idx.min(layer.len().saturating_sub(1));

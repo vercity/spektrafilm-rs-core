@@ -8,6 +8,7 @@ use spektrafilm_math::colorspace;
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::{from_f32, from_f64, to_f32};
 use spektrafilm_math::spectral::{self, TcLut};
+use spektrafilm_model::grain::{self, LayeredGrainParams};
 use std::time::Instant;
 
 use crate::params::{DirCouplersParams, RuntimeParams};
@@ -489,10 +490,9 @@ pub(crate) fn develop_with_pixel_size(
     // f64 chain for Python parity — curves are f64 in the profile JSON.
     let log_exposure_f64 = film.log_exposure_f64();
     let density_curves_f64 = film.density_curves_f64();
-    // f32 versions kept for DIR couplers (still f32 API) and grain (legacy).
+    // f32 versions kept for DIR couplers (still f32 API).
     let log_exposure = &film.log_exposure_f32();
     let density_curves = &film.density_curves_f32();
-    let norm_curves = spektrafilm_model::density_curves::normalize_density_curves(density_curves);
     let gamma = params.film_render.density_curve_gamma;
 
     // Filming.develop uses NORMALIZED curves (Python `develop` subtracts nanmin).
@@ -530,27 +530,47 @@ pub(crate) fn develop_with_pixel_size(
     let grain = &params.film_render.grain;
     if grain.active {
         let t = Instant::now();
-        // Use f64 throughout — Python reads these from JSON as f64; the
-        // f32 storage in `GrainParams` would otherwise truncate to ~7
-        // decimals and shift every Poisson lambda by ~5e-8, producing a
-        // visibly different grain pattern.
-        let norm_curves_f64 = spektrafilm_model::density_curves::normalize_density_curves_f64(
-            &film.density_curves_f64(),
-        );
-        let density_max = spektrafilm_model::density_curves::max_density_f64(&norm_curves_f64);
-        density_cmy = spektrafilm_model::grain::apply_grain_to_density(
-            &density_cmy,
-            pix_um,
-            grain.agx_particle_area_um2,
-            grain.agx_particle_scale,
-            grain.density_min,
-            density_max,
-            grain.uniformity,
-            grain.blur,
-            grain.n_sub_layers,
-            grain.monochrome,
-            backend,
-        );
+        // Keep the aggregate model for GPU previews until shaders consume
+        // the emulsion tables.
+        let layered = if grain.sublayers_active && !backend.is_gpu() {
+            grain::apply_grain_to_density_layers(
+                &density_cmy,
+                &norm_curves_f64,
+                &film.data.density_curves_layers,
+                &LayeredGrainParams {
+                    pixel_size_um: f64::from(pix_um),
+                    particle_area_um2: grain.agx_particle_area_um2,
+                    particle_scale: grain.agx_particle_scale,
+                    particle_scale_layers: grain.agx_particle_scale_layers,
+                    density_min: grain.density_min,
+                    uniformity: grain.uniformity,
+                    blur_px: f64::from(grain.blur),
+                    blur_dye_clouds_um: f64::from(grain.blur_dye_clouds_um),
+                    micro_structure: grain.micro_structure.map(f64::from),
+                    positive_film: film.is_positive(),
+                    monochrome: film.is_bw(),
+                    use_fast_stats: params.settings.use_fast_stats,
+                },
+            )
+        } else {
+            None
+        };
+        density_cmy = layered.unwrap_or_else(|| {
+            let density_max = spektrafilm_model::density_curves::max_density_f64(&norm_curves_f64);
+            grain::apply_grain_to_density(
+                &density_cmy,
+                pix_um,
+                grain.agx_particle_area_um2,
+                grain.agx_particle_scale,
+                grain.density_min,
+                density_max,
+                grain.uniformity,
+                grain.blur,
+                grain.n_sub_layers,
+                grain.monochrome,
+                backend,
+            )
+        });
         print_stage_timing(stage_timings, "filming_develop.grain", t);
     }
 
@@ -640,6 +660,52 @@ pub(crate) fn select_illuminant(name: &str) -> &'static [f32] {
 mod tests {
     use super::*;
     use spektrafilm_math::precision::from_f64;
+
+    #[test]
+    fn develop_uses_profiled_grain_layers_with_aggregate_fallback() {
+        use spektrafilm_gpu::cpu_backend::CpuBackend;
+
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let log_raw = ImageBuf::from_data(16, 16, vec![from_f64(-0.5); 16 * 16 * 3]);
+        let mut params = RuntimeParams::default();
+        params.film_render.dir_couplers.active = false;
+        for stock in ["kodak_portra_400", "fujifilm_velvia_100", "kodak_doublex"] {
+            let film = crate::profile::load_profile_by_name(&data_dir, stock).unwrap();
+            let mut film = crate::profile::resolve_for_render(film, None);
+            params.film_render.grain.monochrome = film.is_bw();
+            if film.is_bw() {
+                let g = &mut params.film_render.grain;
+                g.agx_particle_scale = [g.agx_particle_scale[0]; 3];
+                g.uniformity = [g.uniformity[0]; 3];
+            }
+            let develop = |film: &Profile, p: &RuntimeParams| {
+                develop_with_pixel_size(&log_raw, film, p, &CpuBackend, 2.0)
+            };
+
+            params.film_render.grain.sublayers_active = false;
+            let aggregate = develop(&film, &params);
+            params.film_render.grain.sublayers_active = true;
+            let layered = develop(&film, &params);
+            assert!(layered.data.iter().all(|value| value.is_finite()));
+            assert_ne!(aggregate.data, layered.data, "stock {stock}");
+            if film.is_bw() {
+                assert!(layered.pixels().all(|px| px[0] == px[1] && px[0] == px[2]));
+            }
+
+            film.data.density_curves_layers[0][0].pop();
+            assert_eq!(
+                develop(&film, &params).data,
+                aggregate.data,
+                "stock {stock}"
+            );
+            film.data.density_curves_layers.clear();
+            assert_eq!(
+                develop(&film, &params).data,
+                aggregate.data,
+                "stock {stock}"
+            );
+        }
+    }
 
     #[test]
     fn slide_dir_stock_defaults_preserve_partially_overridden_json() {
