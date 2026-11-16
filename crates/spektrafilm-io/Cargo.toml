@@ -11,6 +11,7 @@ precision-f64 = ["spektrafilm-math/precision-f64"]
 anyhow.workspace = true
 exr.workspace = true
 image.workspace = true
+lensfun = "=0.7.0"
 moxcms = "0.8"
 png = "0.18"
 rawler = "0.7"
