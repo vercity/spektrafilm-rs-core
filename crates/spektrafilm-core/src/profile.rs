@@ -90,7 +90,8 @@ fn default_d50() -> String {
 pub struct ProfileData {
     #[serde(default)]
     pub wavelengths: Vec<f64>,
-    #[serde(default, deserialize_with = "deser_zero_matrix")]
+    /// Null samples have zero linear sensitivity after exponentiation.
+    #[serde(default, deserialize_with = "deser_nullable_matrix")]
     pub log_sensitivity: Vec<Vec<f64>>,
     #[serde(default, deserialize_with = "deser_zero_vec")]
     pub hanatos2025_adaptation_window_params: Vec<f64>,
@@ -159,7 +160,7 @@ impl DensityCurvesModel {
     }
 }
 
-/// Deserialize with null → 0.0 (for data that must be finite: sensitivity, density curves).
+/// Deserialize with null → 0.0 for finite curves and adaptation parameters.
 /// Whole-field `null` (B&W profiles null out unused fields) reads as empty.
 fn deser_zero_vec<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
 where
@@ -210,8 +211,7 @@ where
 }
 
 /// Deserialize a Vec<Vec<f64>> where elements may be null.
-/// For channel_density, null means "no data at this wavelength" — we use NaN
-/// to propagate this correctly through spectral calculations (matching Python).
+/// Preserve missing measurements as NaN, matching Python's spectral arrays.
 fn deser_nullable_matrix<'de, D>(deserializer: D) -> Result<Vec<Vec<f64>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -531,6 +531,15 @@ pub enum ProfileError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn empty_sensitivity_samples_are_distinct_from_log_zero() {
+        let data: ProfileData =
+            serde_json::from_str(r#"{"log_sensitivity":[[null,0.0,-1.0]]}"#).unwrap();
+
+        assert!(data.log_sensitivity[0][0].is_nan());
+        assert_eq!(data.log_sensitivity[0][1..], [0.0, -1.0]);
+    }
+
     fn data_profile(name: &str) -> Option<Profile> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -580,7 +589,7 @@ mod tests {
             r.data
                 .log_sensitivity
                 .iter()
-                .all(|row| row.len() == 3 && row[0] == row[1] && row[1] == row[2])
+                .all(|row| row.len() == 3 && row.iter().all(|v| v.to_bits() == row[0].to_bits()))
         );
         for (row, want) in r.data.density_curves.iter().zip(&want_curve) {
             assert_eq!(row.len(), 3);
