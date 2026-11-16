@@ -2,17 +2,7 @@ use crate::image::ImageBuf;
 use crate::precision::{Scalar, ZERO, from_f32, from_f64};
 use rayon::prelude::*;
 
-/// Separable Gaussian blur on an ImageBuf.
-///
-/// Uses FIR convolution for small sigma (<= 3.0) and recursive IIR
-/// (Young-van Vliet) for larger sigma. Each channel is processed independently.
-/// Processes rows in parallel via rayon.
-/// Single-channel 2D Gaussian blur. Same separable FIR (σ ≤ 3) +
-/// Young-van Vliet IIR (σ > 3) dispatch as `gaussian_blur`, just on a
-/// `Vec<Scalar>` of length `w * h`. Used by callers that need
-/// per-channel σ — extracting channels and processing each
-/// independently avoids the 3x-redundant work of blurring a 3-channel
-/// ImageBuf where all channels are identical.
+/// Single-channel Gaussian blur with replicated edges.
 pub fn gaussian_blur_channel(data: &[Scalar], w: u32, h: u32, sigma: f32) -> Vec<Scalar> {
     let mut channel = data.to_vec();
     gaussian_blur_channel_in_place(&mut channel, w, h, from_f32(sigma));
@@ -21,6 +11,15 @@ pub fn gaussian_blur_channel(data: &[Scalar], w: u32, h: u32, sigma: f32) -> Vec
 
 /// Blur a single channel using one scratch buffer.
 pub fn gaussian_blur_channel_in_place(data: &mut [Scalar], w: u32, h: u32, sigma: Scalar) {
+    blur_channel::<false>(data, w, h, sigma);
+}
+
+/// Match Python's reflected FIR edges and replicated IIR edges.
+pub fn gaussian_blur_channel_reflect_in_place(data: &mut [Scalar], w: u32, h: u32, sigma: Scalar) {
+    blur_channel::<true>(data, w, h, sigma);
+}
+
+fn blur_channel<const REFLECT: bool>(data: &mut [Scalar], w: u32, h: u32, sigma: Scalar) {
     let wu = w as usize;
     let hu = h as usize;
     assert_eq!(data.len(), wu * hu);
@@ -29,30 +28,53 @@ pub fn gaussian_blur_channel_in_place(data: &mut [Scalar], w: u32, h: u32, sigma
         return;
     }
     let mut tmp = vec![ZERO; wu * hu];
-    blur_1d_parallel(data, &mut tmp, wu, hu, sigma, true);
-    blur_1d_parallel(&tmp, data, wu, hu, sigma, false);
+    // Python's FIR starts with the vertical pass.
+    let horizontal_first = !REFLECT || sigma >= from_f64(3.0);
+    blur_1d_parallel::<REFLECT>(data, &mut tmp, wu, hu, sigma, horizontal_first);
+    blur_1d_parallel::<REFLECT>(&tmp, data, wu, hu, sigma, !horizontal_first);
 }
 
 /// Sum-of-3-Gaussians approximation of an isotropic 2D exponential PSF
-/// `exp(-r / decay) / (2π · decay²)`. Matches Python's
-/// `fast_exponential_filter` with `n_gaussians=3` bit-for-bit (same
-/// amplitudes and σ/λ ratios; relies on `gaussian_blur_channel`'s
-/// FIR/IIR dispatch matching Python's). Used for the scatter-tail
-/// component of halation.
+/// `exp(-r / decay) / (2π · decay²)` with replicated edges.
 pub fn exponential_filter_channel(
     data: &[Scalar],
     w: u32,
     h: u32,
     decay_constant: f32,
 ) -> Vec<Scalar> {
+    exponential_filter::<false>(data, w, h, f64::from(decay_constant))
+}
+
+/// Python's scatter-tail filter, with reflected edges for small radii.
+pub fn exponential_filter_channel_reflect(
+    data: &[Scalar],
+    w: u32,
+    h: u32,
+    decay_constant: f64,
+) -> Vec<Scalar> {
+    exponential_filter::<true>(data, w, h, decay_constant)
+}
+
+fn exponential_filter<const REFLECT: bool>(
+    data: &[Scalar],
+    w: u32,
+    h: u32,
+    decay_constant: f64,
+) -> Vec<Scalar> {
     // Python `_EXPONENTIAL_GAUSSIAN_FITS[3]` — amplitude, σ / decay.
     const FIT: [(f64, f64); 3] = [(0.1633, 0.5360), (0.6496, 1.5236), (0.1870, 2.7684)];
     let n = data.len();
     let mut result = vec![ZERO; n];
-    let decay_f64 = decay_constant as f64;
+    let mut component = vec![ZERO; n];
     for &(amp, ratio) in &FIT {
-        let sigma_k = (ratio * decay_f64) as f32;
-        let component = gaussian_blur_channel(data, w, h, sigma_k);
+        let sigma = ratio * decay_constant;
+        let sigma = if REFLECT {
+            from_f64(sigma)
+        } else {
+            from_f32(sigma as f32)
+        };
+        component.copy_from_slice(data);
+        blur_channel::<REFLECT>(&mut component, w, h, sigma);
         let amp_s = from_f64(amp);
         for (r, &v) in result.iter_mut().zip(component.iter()) {
             *r += amp_s * v;
@@ -61,6 +83,7 @@ pub fn exponential_filter_channel(
     result
 }
 
+/// Separable Gaussian blur with each image channel processed independently.
 pub fn gaussian_blur(img: &ImageBuf, sigma: f32) -> ImageBuf {
     if sigma <= 0.0 {
         return img.clone();
@@ -76,9 +99,9 @@ pub fn gaussian_blur(img: &ImageBuf, sigma: f32) -> ImageBuf {
     channels.par_iter_mut().for_each(|chan| {
         // Horizontal pass
         let mut tmp = vec![ZERO; w * h];
-        blur_1d_parallel(chan, &mut tmp, w, h, sigma_s, true);
+        blur_1d_parallel::<false>(chan, &mut tmp, w, h, sigma_s, true);
         // Vertical pass
-        blur_1d_parallel(&tmp, chan, w, h, sigma_s, false);
+        blur_1d_parallel::<false>(&tmp, chan, w, h, sigma_s, false);
     });
 
     let mut out = ImageBuf::new(img.width, img.height);
@@ -89,7 +112,7 @@ pub fn gaussian_blur(img: &ImageBuf, sigma: f32) -> ImageBuf {
 }
 
 /// 1D blur pass — either horizontal (along rows) or vertical (along columns).
-fn blur_1d_parallel(
+fn blur_1d_parallel<const REFLECT: bool>(
     src: &[Scalar],
     dst: &mut [Scalar],
     w: usize,
@@ -101,14 +124,14 @@ fn blur_1d_parallel(
     // strictly less → FIR. We use the same `>=` boundary so σ exactly
     // at 3.0 doesn't pick a different branch than Python.
     if sigma < from_f64(3.0) {
-        fir_blur_1d(src, dst, w, h, sigma, horizontal);
+        fir_blur_1d::<REFLECT>(src, dst, w, h, sigma, horizontal);
     } else {
         iir_blur_1d(src, dst, w, h, sigma, horizontal);
     }
 }
 
 /// FIR Gaussian blur (truncated kernel). Good for small sigma.
-fn fir_blur_1d(
+fn fir_blur_1d<const REFLECT: bool>(
     src: &[Scalar],
     dst: &mut [Scalar],
     w: usize,
@@ -135,9 +158,8 @@ fn fir_blur_1d(
                 for x in 0..w {
                     let mut sum = ZERO;
                     for (ki, &kv) in kernel.iter().enumerate() {
-                        let sx = (x as isize + ki as isize - radius as isize)
-                            .max(0)
-                            .min(w as isize - 1) as usize;
+                        let sx =
+                            edge_index::<REFLECT>(x as isize + ki as isize - radius as isize, w);
                         sum += row_src[sx] * kv;
                     }
                     row_dst[x] = sum;
@@ -150,15 +172,26 @@ fn fir_blur_1d(
                 for x in 0..w {
                     let mut sum = ZERO;
                     for (ki, &kv) in kernel.iter().enumerate() {
-                        let sy = (y as isize + ki as isize - radius as isize)
-                            .max(0)
-                            .min(h as isize - 1) as usize;
+                        let sy =
+                            edge_index::<REFLECT>(y as isize + ki as isize - radius as isize, h);
                         sum += src[sy * w + x] * kv;
                     }
                     row_dst[x] = sum;
                 }
             });
     }
+}
+
+#[inline]
+fn edge_index<const REFLECT: bool>(index: isize, len: usize) -> usize {
+    if !REFLECT {
+        return index.clamp(0, len as isize - 1) as usize;
+    }
+    if (index as usize) < len {
+        return index as usize;
+    }
+    let wrapped = index.rem_euclid(2 * len as isize) as usize;
+    wrapped.min(2 * len - 1 - wrapped)
 }
 
 /// Young-van Vliet recursive IIR Gaussian blur. Good for large sigma.
@@ -311,6 +344,20 @@ mod tests {
         let img = ImageBuf::from_data(4, 4, vec![from_f64(0.5); 4 * 4 * 3]);
         let out = gaussian_blur(&img, 0.0);
         assert_eq!(img.data, out.data);
+    }
+
+    #[test]
+    fn single_channel_fir_reflects_samples_across_image_edges() {
+        let sigma = from_f64(1.0);
+        let mut pixels = [ZERO, from_f64(1.0), ZERO];
+        let replicated = gaussian_blur_channel(&pixels, 3, 1, 1.0);
+        gaussian_blur_channel_reflect_in_place(&mut pixels, 3, 1, sigma);
+
+        let kernel = make_gaussian_kernel(sigma, 3);
+        let tolerance = from_f64(1e-6);
+        assert!((replicated[0] - kernel[4]).abs() < tolerance);
+        assert!((pixels[0] - (kernel[1] + kernel[4])).abs() < tolerance);
+        assert!((pixels[0] - pixels[2]).abs() < tolerance);
     }
 
     #[test]

@@ -47,10 +47,28 @@ Python 快照的四份测试模块（`test_regression_baselines`、`test_topolog
 
 ## P2 默认胶片质感、GPU 与文件工作流
 
-- **多层颗粒和光学预设。** Rust 有感光层数据但使用整体颗粒。补 Python 默认的多层颗粒、染料云与微结构，验收分密度 RMS、空间相关和通道协方差。补片种晕光预设、Velvia／Provia DIR，并修晕光尺度为零时跳过加光却仍归一化的问题。Rust 黑白配置单测显影时间选择和通道一致性。出处见 [颗粒调用](../crates/spektrafilm-core/src/stages/filming.rs#L467) 和 [晕光归一化](../crates/spektrafilm-model/src/diffusion.rs#L131)。
+- **CPU 光学和胶片颗粒已对齐。** 感光度应用 UV／IR 后保留参考光源下各通道的响应，曝光和印相中灰标定共用过滤后的感光度。晕光按片种预设，零半径不改变曝光，散射可独立生效。CPU f32／f64 默认使用多层颗粒、染料云和微结构。关闭多层或层数据不可用时走既有聚合模型。出处见 [感光度校正](../crates/spektrafilm-core/src/spectral_service.rs)、[晕光](../crates/spektrafilm-model/src/diffusion.rs) 和 [显影](../crates/spektrafilm-core/src/stages/filming.rs)。
 - **GPU 以 CPU 同配置为基准。** WGSL 和 CUDA 常驻路径的印相曝光倍率漏乘预闪项（放大机柔焦关闭时），CUDA 在色域压缩之前限幅，常驻路径也未消费内部印相／扫描 LUT 选项。用曝光倍率 0.5／2.0、非零预闪、强饱和色和锐化边缘分别比较 CPU 直接光谱、CPU LUT、WGSL 和 CUDA。出处见 [GPU 参数](../crates/spektrafilm-core/src/pipeline.rs#L828)、[WGSL 印相](../crates/spektrafilm-shaders/wgsl/print_spectral.wgsl#L61) 和 [CUDA 扫描](../crates/spektrafilm-gpu/src/cuda_backend.rs#L2119)。
 - **GUI 保存和进程管理。** 将预览结果绑定文件和参数代次，避免切换文件／片种时保存旧输出。导出子进程的日志应及时排空，避免写满管道。用延迟预览和大量日志的测试子进程验收。随后补独立预览分辨率、全尺寸导出和设置持久化。出处见 [预览保存](../crates/spektrafilm-gui/src/main.rs#L644) 和 [导出子进程](../crates/spektrafilm-gui/src/main.rs#L2206)。
 - **RAW 和容器输出。** 在感光模拟前单独比较 rawpy 的线性 ACES AP0 和 rawler 的线性 sRGB 路径。共用 Rust 解码入口，先用非对称竖拍 RAW、Bayer 和 X-Trans 验收方向、裁切、灰阶和色块，再做白平衡、色温／色调和 Lensfun。优先补浮点 TIFF／EXR 和与成品相符的 ICC、EXIF。出处见 [Rust RAW](../crates/spektrafilm-cli/src/main.rs#L444)、[Rust 整数输出](../crates/spektrafilm-cli/src/main.rs#L551)。
+
+### P2 本轮验证
+
+f64 CPU 与 Python 0.3.4 共用 64×48 场景线性 ProPhoto RGB TIFF（红绿渐变、蓝色棋盘格，5 µm／像素）。各用例关闭自动曝光、DIR、颗粒和其他空间效果，单独开启待测项。下表是胶片曝光对数的最大绝对误差。
+
+| 配置 | P1 | P2 |
+| --- | ---: | ---: |
+| Portra 400，Hanatos，UV `[1, 430, 8]`、IR `[1, 650, 15]` | `0.571244` | `2.50e-15` |
+| Portra 400，Mallett，同一滤镜 | `8.663662` | `6.79e-14` |
+| Portra 400，晕光半径和散射均为零 | `0.021189` | `2.61e-15` |
+| Portra 400，零晕光、开启散射 | `0.053643` | `4.11e-15` |
+| Portra 400，显式强度 `[0.18, 0.10, 0.12]` 和半径 `[0, 32, 0]` µm | `0.071882` | `6.88e-15` |
+| Gold 200／Vision3 500T，各自的默认晕光，关闭散射 | `0.034506`／`0.139845` | `8.05e-14`／`9.63e-15` |
+
+- 打开 UV／IR 时，Hanatos 和 Mallett 的印相曝光对数最大误差均小于 `3e-15`。关闭滤镜的曝光逐位与 P1 一致。Rust 的 `HalationParams` 强度和半径字段现用 `Option`，显式覆盖写作 `Some([…])`，JSON 仍接收数组。
+- 颗粒用 192×192 线性灰阶图测胶片 CMY，三条色带的输入值分别为 0.045、0.18、0.72。统计区域排除每条色带边缘 6 像素。4 µm／像素时，Portra 400 和 Velvia 100 的最坏相对 RMS 误差由 `64.5%`／`61.8%` 降至 `4.57e-8`／`4.61e-8`（比例）。最大均值误差 `1.14e-11` OD，相邻像素和跨通道相关系数的最大差分别为 `3.39e-8` 和 `2.58e-9`。Rust 重跑及显式关闭分层后的 P1 对照均逐位一致。Double-X 的三通道共用同一颗粒场。
+- 0.4 µm／像素时单独验证微结构，另以 4 µm／像素验证快速采样。该次运行的最坏相对 RMS 误差分别为 `0.83%` 和 `2.57%`。Python Numba 采样序列独立，按统计量比较。GPU 预览继续使用聚合颗粒。
+- Rust 默认精度 91 项、f64 89 项、GUI 3 项测试通过，CUDA 通过编译检查。Metal 上零晕光与关闭晕光输出逐位一致，散射在零晕光时独立生效。UV／IR 场景的 GPU／CPU 线性 RGB 最大绝对差为 `6.26e-6`。独立散射场景的 GPU／CPU 差为 `0.0257`，常驻 GPU 散射近似需要单独对齐。
 
 ## P3 进阶交付和持续验证
 

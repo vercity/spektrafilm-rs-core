@@ -3,7 +3,9 @@
 
 use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
-use spektrafilm_math::gaussian::gaussian_blur_channel_in_place;
+use spektrafilm_math::gaussian::{
+    gaussian_blur_channel_in_place, gaussian_blur_channel_reflect_in_place,
+};
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::numpy_rng::{GaussRng, rk_binomial, rk_double, rk_poisson};
 use spektrafilm_math::precision::{Scalar, ZERO, from_f64, to_f64};
@@ -194,7 +196,7 @@ pub fn apply_grain_to_density_layers(
 
             if params.blur_dye_clouds_um > 0.0 {
                 let sigma = params.blur_dye_clouds_um * layer.particle_density().sqrt();
-                gaussian_blur_channel_in_place(&mut grain, width, height, from_f64(sigma));
+                gaussian_blur_channel_reflect_in_place(&mut grain, width, height, from_f64(sigma));
             }
             for (sum, grain) in sum.iter_mut().zip(grain) {
                 *sum += grain;
@@ -207,7 +209,12 @@ pub fn apply_grain_to_density_layers(
             *value -= density_min;
         }
         if params.blur_px > 0.0 {
-            gaussian_blur_channel_in_place(&mut sum, width, height, from_f64(params.blur_px));
+            gaussian_blur_channel_reflect_in_place(
+                &mut sum,
+                width,
+                height,
+                from_f64(params.blur_px),
+            );
         }
         if params.monochrome {
             for (pixel, value) in out.pixels_mut().zip(sum) {
@@ -322,7 +329,7 @@ fn add_micro_structure(
         .collect();
     let blur_px = blur_um / params.pixel_size_um;
     if blur_px > 0.4 {
-        gaussian_blur_channel_in_place(&mut clumping, width, height, from_f64(blur_px));
+        gaussian_blur_channel_reflect_in_place(&mut clumping, width, height, from_f64(blur_px));
     }
     for (density, clump) in channel.iter_mut().zip(clumping) {
         *density *= clump;

@@ -82,7 +82,9 @@ pub fn apply_halation_um(
     //   * tail weight is per-channel.
     // i.e. every place Python takes a length-3 array, we treat it as a
     // length-3 array, not as `(sum / 3.0)`.
-    use spektrafilm_math::gaussian::{exponential_filter_channel, gaussian_blur_channel};
+    use spektrafilm_math::gaussian::{
+        exponential_filter_channel_reflect, gaussian_blur_channel_reflect_in_place,
+    };
 
     let w = raw.width;
     let h = raw.height;
@@ -104,13 +106,15 @@ pub fn apply_halation_um(
             if sigma_c_px_f64 <= 0.0 && lambda_t_px_f64 <= 0.0 {
                 continue;
             }
-            // gaussian_blur/exponential_filter take f32 sigma — narrow at the
-            // boundary (the kernel itself produces the same bits for any
-            // f32-representable sigma, this is just so we don't break the API).
-            let sigma_c_px = sigma_c_px_f64.max(1e-6) as f32;
-            let lambda_t_px = lambda_t_px_f64.max(1e-6) as f32;
-            let core = gaussian_blur_channel(&channels[c], w, h, sigma_c_px);
-            let tail = exponential_filter_channel(&channels[c], w, h, lambda_t_px);
+            let mut core = channels[c].clone();
+            gaussian_blur_channel_reflect_in_place(
+                &mut core,
+                w,
+                h,
+                from_f64(sigma_c_px_f64.max(1e-6)),
+            );
+            let tail =
+                exponential_filter_channel_reflect(&channels[c], w, h, lambda_t_px_f64.max(1e-6));
             let one = from_f64(1.0);
             let wt = from_f64(scatter_tail_weight[c]);
             let sa = from_f64(scatter_amount);
@@ -162,8 +166,9 @@ pub fn apply_halation_um(
             }
             let mut hb = vec![ZERO; n_pix];
             for (k, &wk) in decay.iter().enumerate() {
-                let sigma_k = (sigma_first_px[c] * ((k as f64) + 1.0).sqrt()).max(1e-6) as f32;
-                let blurred = gaussian_blur_channel(&channels[c], w, h, sigma_k);
+                let sigma_k = (sigma_first_px[c] * ((k as f64) + 1.0).sqrt()).max(1e-6);
+                let mut blurred = channels[c].clone();
+                gaussian_blur_channel_reflect_in_place(&mut blurred, w, h, from_f64(sigma_k));
                 let wk_s = from_f64(wk);
                 for i in 0..n_pix {
                     hb[i] += wk_s * blurred[i];
