@@ -76,7 +76,15 @@ pub fn decode_with_white_balance(path: &Path, white_balance: WhiteBalance) -> Re
         .unwrap_or(raw.orientation);
 
     let sensor = Rect::new(Point::new(0, 0), raw.dim());
-    let area = raw.active_area.unwrap_or(sensor);
+    let area = if matches!(
+        &raw.photometric,
+        RawPhotometricInterpretation::Cfa(config) if config.cfa.width == 6 && config.cfa.height == 6
+    ) {
+        fuji_xtrans_active_area(source.buf(), sensor.d, raw.crop_area).or(raw.active_area)
+    } else {
+        raw.active_area
+    }
+    .unwrap_or(sensor);
     validate_area(area, sensor.d)?;
     if path
         .extension()
@@ -221,6 +229,54 @@ fn validate_area(area: Rect, sensor: Dim2) -> Result<()> {
         "invalid RAW active area"
     );
     Ok(())
+}
+
+fn fuji_xtrans_active_area(data: &[u8], sensor: Dim2, inset: Option<Rect>) -> Option<Rect> {
+    // The X-T2 generation stores the full active dimensions in RAFData,
+    // distinct from the camera's suggested crop and sensor padding.
+    // LibRaw 0.22 identifies the 6048/6160-pixel sensor family at left=0,
+    // then rounds the top margin up to the next six-row CFA boundary.
+    if !data.starts_with(b"FUJIFILMCCD-RAW") || !matches!(sensor.w, 6048 | 6160) {
+        return None;
+    }
+    let inset = inset?;
+    let offset = u32::from_be_bytes(data.get(92..96)?.try_into().ok()?) as usize;
+    let (count, mut fields) = data.get(offset..)?.split_first_chunk::<4>()?;
+    let count = u32::from_be_bytes(*count);
+    if count > 4000 {
+        return None;
+    }
+    for _ in 0..count {
+        let (&[tag_high, tag_low, len_high, len_low], tail) = fields.split_first_chunk::<4>()?;
+        let len = usize::from(u16::from_be_bytes([len_high, len_low]));
+        let (value, remaining) = tail.split_at_checked(len)?;
+        fields = remaining;
+        if [tag_high, tag_low] != [0xc0, 0x00]
+            || !value.get(4..8).is_some_and(|magic| magic == b"WRTS")
+        {
+            continue;
+        }
+        let width = u32::from_le_bytes(value.get(8..12)?.try_into().ok()?) as usize;
+        let height = u32::from_le_bytes(value.get(12..16)?.try_into().ok()?) as usize;
+        let unaligned_top = sensor.h.checked_sub(height)? / 4 * 2;
+        let top = unaligned_top.next_multiple_of(6);
+        let height = height.checked_sub(top - unaligned_top)?;
+        let area = Rect::new(Point::new(0, top), Dim2::new(width, height));
+        validate_area(area, sensor).ok()?;
+        let [_, inset_top, inset_right, inset_bottom] = inset.as_ltrb();
+        // Keep the existing decoder's fallback for in-camera crops and
+        // variants whose recommended rectangle does not describe a full shot.
+        if inset_top < top
+            || inset_right > width
+            || inset_bottom > top + height
+            || inset.d.w * 20 < width * 19
+            || inset.d.h * 20 < height * 19
+        {
+            return None;
+        }
+        return Some(area);
+    }
+    None
 }
 
 fn adjust_dng_white_level(raw: &mut RawImage, area: Rect) {
@@ -559,6 +615,25 @@ mod tests {
                 assert_eq!(rgb, expect);
             }
         }
+    }
+
+    #[test]
+    fn fuji_wrts_rounds_the_active_area_to_xtrans_phase() {
+        let mut raf = vec![0; 96];
+        raf[..15].copy_from_slice(b"FUJIFILMCCD-RAW");
+        raf[92..96].copy_from_slice(&96u32.to_be_bytes());
+        raf.extend_from_slice(&1u32.to_be_bytes());
+        raf.extend_from_slice(&[0xc0, 0x00, 0x00, 0x10]);
+        raf.extend_from_slice(&0x0258_0000u32.to_le_bytes());
+        raf.extend_from_slice(b"WRTS");
+        raf.extend_from_slice(&6032u32.to_le_bytes());
+        raf.extend_from_slice(&4032u32.to_le_bytes());
+        let inset = Rect::new(Point::new(16, 21), Dim2::new(6000, 4000));
+        let sensor = Dim2::new(6048, 4038);
+        let active = fuji_xtrans_active_area(&raf, sensor, Some(inset)).unwrap();
+        assert_eq!(active, Rect::new(Point::new(0, 6), Dim2::new(6032, 4028)));
+        raf.pop();
+        assert_eq!(fuji_xtrans_active_area(&raf, sensor, Some(inset)), None);
     }
 
     #[test]
