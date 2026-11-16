@@ -40,7 +40,7 @@ cargo build --release -p spektrafilm-cli --features spektrafilm-gpu/cuda-backend
 cargo build --release --features precision-f64 -p spektrafilm-cli
 cp target/release/spektrafilm target/release/spektrafilm-f64
 
-# Helper used by the GUI's Export button — bit-identical RAW decode
+# Diagnostic helper for the shared RAW decoder
 cargo build --release -p spektrafilm-cli --bin decode_raw_gui
 ```
 
@@ -58,7 +58,7 @@ WGSL is the default GPU backend and can be selected explicitly with `SPEKTRAFILM
 ./target/release/spektrafilm-gui [optional/path/to/image.orf]
 ```
 
-- **Open…** — load a TIFF, PNG, JPEG, or camera RAW (DNG/CR2/CR3/NEF/ARW/ORF/RW2/etc., decoded via [`rawler`](https://github.com/dnglab/dnglab)).
+- **Open…** — load a TIFF, PNG, JPEG, EXR, or camera RAW (DNG/CR2/CR3/NEF/ARW/ORF/RW2/etc., decoded via [`rawler`](https://github.com/dnglab/dnglab)).
 - **Sliders** — exposure, film format, halation, DIR couplers, grain, glare, scanner, enlarger, output. All live-updating against the GPU preview.
 - **Profiles** — film stock and print paper combo boxes; picking a film auto-selects its paired paper (`target_print` in the profile).
 - **Zoom** — scroll wheel or trackpad pinch over the preview (cursor-anchored), click-drag to pan, double-click to reset.
@@ -93,8 +93,9 @@ Use `process --bit-depth 32` with a TIFF or EXR output path for float32 samples.
 TIFF defaults to uint16 and EXR defaults to half. For scene-linear output, set
 `io.output_cctf_encoding` to `false` in the JSON passed via `--params`.
 Camera RAW decodes to linear ACES2065-1. The default white balance is as-shot.
-Select `--raw-white-balance daylight`, `tungsten`, or `custom --raw-temperature 5000`
-to override it.
+Use `--raw-white-balance daylight` or `--raw-white-balance tungsten` for a preset.
+For a custom setting, pass `--raw-white-balance custom --raw-temperature 5000`.
+Use `--raw-lens-correction` to apply matching lens calibration on RAW inputs.
 
 A calibrated SDR cube uses the same spectral pipeline as CPU photo processing.
 The domain is `[0, 1]` on each channel. The default input is linear ProPhoto RGB,
@@ -107,11 +108,11 @@ grain, and other effects that depend on neighboring pixels or the full frame.
     --film kodak_gold_200 --paper kodak_portra_endura --size 33 -o gold.cube
 ```
 
-`process --params` can control TIFF input decoding and output encoding for
-sRGB, ProPhoto RGB, BT.2020, and linear ACES2065-1. PNG, JPEG, and camera RAW
-inputs follow the loaders' linear sRGB convention. The `--raw-out` float
-buffer retains signed values and highlights above 1. Integer image files
-clip to their representable range.
+`process --params` controls the color space and decoding for untagged TIFFs.
+Recognized file tags supply the input color space and transfer function.
+Untagged PNG and JPEG use encoded sRGB. Untagged EXR uses linear sRGB.
+The `--raw-out` buffer and floating-point image formats retain signed values
+and highlights above 1. Integer image files clip to their representable range.
 
 ## Parity
 
@@ -155,6 +156,7 @@ crates/
   spektrafilm-core/    pipeline orchestration, profiles, stage definitions
   spektrafilm-gpu/     ComputeBackend trait + CPU (rayon + BLAS) and wgpu backends
   spektrafilm-shaders/ WGSL / Metal / CUDA compute shaders
+  spektrafilm-io/      shared RAW decoder and raster codecs
   spektrafilm-cli/     `spektrafilm` (process, list-profiles, export-lut) + `decode_raw_gui`
   spektrafilm-gui/     egui/eframe preview (wgpu renderer, Metal-backed on macOS)
 data/

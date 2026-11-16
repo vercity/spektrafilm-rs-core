@@ -50,11 +50,18 @@ pub enum WhiteBalance {
     },
 }
 
-pub fn decode(path: &Path) -> Result<ImageBuf> {
-    decode_with_white_balance(path, WhiteBalance::AsShot)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DevelopOptions {
+    pub white_balance: WhiteBalance,
+    pub lens_correction: bool,
 }
 
-pub fn decode_with_white_balance(path: &Path, white_balance: WhiteBalance) -> Result<ImageBuf> {
+pub fn decode(path: &Path) -> Result<ImageBuf> {
+    decode_with_options(path, DevelopOptions::default())
+}
+
+pub fn decode_with_options(path: &Path, options: DevelopOptions) -> Result<ImageBuf> {
+    let white_balance = options.white_balance;
     let adaptation = white_balance.adaptation()?;
     let source =
         RawSource::new(path).with_context(|| format!("opening RAW image {}", path.display()))?;
@@ -153,6 +160,10 @@ pub fn decode_with_white_balance(path: &Path, white_balance: WhiteBalance) -> Re
             path.display()
         )
     })?;
+    if options.lens_correction {
+        crate::lens::apply(&source, &mut image)
+            .with_context(|| format!("correcting RAW lens for {}", path.display()))?;
+    }
     if let Some(matrix) = adaptation {
         image.data.par_chunks_exact_mut(3).for_each(|rgb| {
             let input = [rgb[0] as f64, rgb[1] as f64, rgb[2] as f64];

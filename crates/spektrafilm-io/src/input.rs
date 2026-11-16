@@ -4,15 +4,15 @@ use anyhow::Result;
 
 use crate::{
     raster::{RasterColor, RasterImage, read_raster, read_source_metadata},
-    raw::{self, WhiteBalance},
+    raw::{self, DevelopOptions},
 };
 
 /// Load one frame and identify the color encoding the renderer should consume.
 /// Untagged TIFF retains the caller's configured input color space.
-pub fn read_image(path: &Path, raw_white_balance: WhiteBalance) -> Result<RasterImage> {
+pub fn read_image(path: &Path, raw_options: DevelopOptions) -> Result<RasterImage> {
     if raw::is_raw(path) {
         return Ok(RasterImage {
-            image: raw::decode_with_white_balance(path, raw_white_balance)?,
+            image: raw::decode_with_options(path, raw_options)?,
             metadata: read_source_metadata(path),
             color: Some(RasterColor {
                 color_space: raw::INPUT_COLOR_SPACE,

@@ -102,6 +102,9 @@ enum Commands {
 
 #[derive(Args)]
 struct RawOptions {
+    /// Apply the matching Lensfun calibration to camera RAW inputs.
+    #[arg(long)]
+    raw_lens_correction: bool,
     /// White balance for camera RAW inputs (defaults to as-shot).
     #[arg(long, value_enum)]
     raw_white_balance: Option<RawWhiteBalance>,
@@ -122,6 +125,17 @@ enum RawWhiteBalance {
 }
 
 impl RawOptions {
+    fn decode_options(&self, is_raw: bool) -> Result<raw::DevelopOptions> {
+        ensure!(
+            is_raw || !self.raw_lens_correction,
+            "--raw-lens-correction requires a camera RAW input"
+        );
+        Ok(raw::DevelopOptions {
+            white_balance: self.white_balance(is_raw)?,
+            lens_correction: self.raw_lens_correction,
+        })
+    }
+
     fn white_balance(&self, is_raw: bool) -> Result<raw::WhiteBalance> {
         let Some(balance) = self.raw_white_balance else {
             return Ok(raw::WhiteBalance::AsShot);
@@ -274,8 +288,7 @@ fn cmd_process(
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
 
     let t = Instant::now();
-    let white_balance = raw_options.white_balance(raw::is_raw(input))?;
-    let loaded = read_image(input, white_balance)?;
+    let loaded = read_image(input, raw_options.decode_options(raw::is_raw(input))?)?;
     if let Some(color) = loaded.color {
         params.io.input_color_space = color.color_space.into();
         params.io.input_cctf_decoding = color.cctf_encoding;

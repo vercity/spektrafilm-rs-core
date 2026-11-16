@@ -21,7 +21,7 @@ use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_io::{
     raster::{RasterColor, RasterMetadata, RasterWriteOptions, write_raster},
-    raw::WhiteBalance,
+    raw::DevelopOptions,
     read_image,
 };
 use spektrafilm_math::image::ImageBuf;
@@ -353,7 +353,7 @@ impl App {
 
     fn load_image_from_path(&mut self, path: &Path) {
         let t = Instant::now();
-        match read_image(path, WhiteBalance::AsShot) {
+        match read_image(path, DevelopOptions::default()) {
             Ok(loaded) => {
                 let color = loaded.color.unwrap_or(RasterColor {
                     color_space: "ProPhoto RGB",
@@ -2278,6 +2278,10 @@ mod preview_tests {
         std::fs::write(
             &script.0,
             r#"#!/bin/sh
+case " $* " in
+    *" --bit-depth 32 "*) ;;
+    *) printf 'missing export bit depth\n' >&2; exit 24 ;;
+esac
 head -c 1048576 /dev/zero
 head -c 1048576 /dev/zero | tr '\000' x >&2
 printf '\nexpected export error\n' >&2
@@ -2300,7 +2304,7 @@ exit 23
                 &script.0,
                 Path::new("unused-input"),
                 Path::new("unused-output"),
-                None,
+                Some(32),
                 "film",
                 "paper",
                 &RuntimeParams::default(),

@@ -1,4 +1,5 @@
 mod input;
+mod lens;
 pub mod raster;
 pub mod raw;
 
