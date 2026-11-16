@@ -663,48 +663,21 @@ impl Pipeline {
     }
 
     fn rescale_working(image: ImageBuf, scale: f32) -> ImageBuf {
-        use rayon::prelude::*;
-        use spektrafilm_math::precision::from_f64;
-        if scale == 1.0 || image.pixel_count() == 0 {
+        use spektrafilm_math::resize::{Interpolation, resize, scaled_dimensions};
+
+        if scale == 1.0 || image.data.is_empty() {
             return image;
         }
-        let new_w = ((image.width as f64 * scale as f64).round_ties_even() as u32).max(1);
-        let new_h = ((image.height as f64 * scale as f64).round_ties_even() as u32).max(1);
-        if new_w == image.width && new_h == image.height {
+        let [new_w, new_h] = scaled_dimensions(image.width, image.height, f64::from(scale));
+        if [new_w, new_h] == [image.width, image.height] {
             return image;
         }
-        // image::resize clamps its float pixels to [0,1]. Normalize around the
-        // source range so the interpolator preserves scene-linear headroom.
-        let (low, high) = image
-            .data
-            .par_iter()
-            .fold(
-                || (0.0_f64, 1.0_f64),
-                |(lo, hi), &value| (lo.min(value as f64), hi.max(value as f64)),
-            )
-            .reduce(|| (0.0, 1.0), |(a, b), (c, d)| (a.min(c), b.max(d)));
-        let span = high - low;
-        let f32buf: Vec<f32> = image
-            .data
-            .par_iter()
-            .map(|&v| ((v as f64 - low) / span) as f32)
-            .collect();
-        let src =
-            image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(image.width, image.height, f32buf)
-                .expect("ImageBuf dims match its data length");
-        let dst =
-            image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::CatmullRom);
-        let data = dst
-            .into_raw()
-            .into_par_iter()
-            .map(|v| from_f64(v as f64 * span + low))
-            .collect();
         tracing::info!(
             from = format!("{}x{}", image.width, image.height),
             to = format!("{new_w}x{new_h}"),
             "pipeline: rescaled working image"
         );
-        ImageBuf::from_data(new_w, new_h, data)
+        resize(&image, [new_w, new_h], Interpolation::CubicSpline)
     }
 
     /// Try the GPU-resident fast path. Builds all the per-stage data and

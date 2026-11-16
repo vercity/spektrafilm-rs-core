@@ -15,7 +15,7 @@ pub fn apply_unsharp_mask(
     if sigma <= 0.0 || amount <= 0.0 {
         return image.clone();
     }
-    let blurred = backend.gaussian_blur(image, sigma);
+    let blurred = apply_gaussian_blur(image, f64::from(sigma), backend);
     let amount_s = from_f32(amount);
     let mut result = image.clone();
     for (r, (o, b)) in result
@@ -28,6 +28,15 @@ pub fn apply_unsharp_mask(
     result
 }
 
+/// Apply optical Gaussian blur in pixels using the selected rendering backend.
+pub fn apply_gaussian_blur(image: &ImageBuf, sigma: f64, backend: &dyn ComputeBackend) -> ImageBuf {
+    if backend.is_gpu() {
+        backend.gaussian_blur(image, sigma as f32)
+    } else {
+        spektrafilm_math::gaussian::gaussian_blur_reflect(image, from_f64(sigma))
+    }
+}
+
 /// Apply Gaussian blur in physical units (micrometers).
 pub fn apply_gaussian_blur_um(
     image: &ImageBuf,
@@ -35,9 +44,9 @@ pub fn apply_gaussian_blur_um(
     pixel_size_um: f32,
     backend: &dyn ComputeBackend,
 ) -> ImageBuf {
-    let sigma_px = sigma_um / pixel_size_um;
+    let sigma_px = f64::from(sigma_um) / f64::from(pixel_size_um);
     if sigma_px > 0.0 {
-        backend.gaussian_blur(image, sigma_px)
+        apply_gaussian_blur(image, sigma_px, backend)
     } else {
         image.clone()
     }

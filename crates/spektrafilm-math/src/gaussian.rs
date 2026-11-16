@@ -85,23 +85,23 @@ fn exponential_filter<const REFLECT: bool>(
 
 /// Separable Gaussian blur with each image channel processed independently.
 pub fn gaussian_blur(img: &ImageBuf, sigma: f32) -> ImageBuf {
-    if sigma <= 0.0 {
+    gaussian_blur_image::<false>(img, from_f32(sigma))
+}
+
+/// Gaussian blur with reflected FIR edges and replicated IIR edges.
+pub fn gaussian_blur_reflect(img: &ImageBuf, sigma: Scalar) -> ImageBuf {
+    gaussian_blur_image::<true>(img, sigma)
+}
+
+fn gaussian_blur_image<const REFLECT: bool>(img: &ImageBuf, sigma: Scalar) -> ImageBuf {
+    if sigma <= ZERO || img.data.is_empty() {
         return img.clone();
     }
 
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let sigma_s = from_f32(sigma);
-
-    // Process each channel separately for cache-friendly access
-    let mut channels: Vec<Vec<Scalar>> = (0..3).map(|c| img.extract_channel(c)).collect();
-
-    channels.par_iter_mut().for_each(|chan| {
-        // Horizontal pass
-        let mut tmp = vec![ZERO; w * h];
-        blur_1d_parallel::<false>(chan, &mut tmp, w, h, sigma_s, true);
-        // Vertical pass
-        blur_1d_parallel::<false>(&tmp, chan, w, h, sigma_s, false);
+    // Process each channel separately for cache-friendly access.
+    let mut channels = [0, 1, 2].map(|c| img.extract_channel(c));
+    channels.par_iter_mut().for_each(|channel| {
+        blur_channel::<REFLECT>(channel, img.width, img.height, sigma);
     });
 
     let mut out = ImageBuf::new(img.width, img.height);

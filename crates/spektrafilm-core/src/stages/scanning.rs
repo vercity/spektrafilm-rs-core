@@ -338,7 +338,11 @@ pub fn scan(
 
     // Lens blur
     if params.scanner.lens_blur > 0.0 {
-        rgb = backend.gaussian_blur(&rgb, params.scanner.lens_blur);
+        rgb = spektrafilm_model::diffusion::apply_gaussian_blur(
+            &rgb,
+            f64::from(params.scanner.lens_blur),
+            backend,
+        );
     }
 
     // Unsharp mask

@@ -698,6 +698,10 @@ mod parity_tests {
         // matrix is exercised, not just the identity case.
         params.camera.exposure_compensation_ev = 0.5;
         params.film_render.grain.active = false;
+        // Test the spectral front pass independently of spatial kernels.
+        params.film_render.dir_couplers.active = false;
+        params.film_render.halation.active = false;
+        params.scanner.unsharp_mask = [0.0, 0.0];
         // Output gamut compression forces the per-stage path — keep it off
         // so this test exercises the GPU-resident chain.
         params.io.output_gamut_compress.algorithm = "off".into();

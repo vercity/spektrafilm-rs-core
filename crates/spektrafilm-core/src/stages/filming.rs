@@ -6,9 +6,11 @@ use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::colorspace;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{from_f32, from_f64, to_f32};
+use spektrafilm_math::precision::{from_f32, from_f64, to_f64};
+use spektrafilm_math::resize::{Interpolation, resize, scaled_dimensions};
 use spektrafilm_math::spectral::{self, TcLut};
 use spektrafilm_model::grain::{self, LayeredGrainParams};
+use std::borrow::Cow;
 use std::time::Instant;
 
 use crate::params::{DirCouplersParams, RuntimeParams};
@@ -32,78 +34,52 @@ pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
 /// Auto-exposure compensation, Python-compatible
 /// (`spektrafilm/utils/autoexposure.py`).
 ///
-/// Python downsamples the image to ≤ 256 px on the long edge using
-/// `skimage.transform.rescale(order=0)` (nearest neighbour) before
-/// measuring (`small_preview`), then meters luminance Y with one of
-/// several patterns. We mirror that — the downsample is what makes the
-/// metered mean Python-parity-compatible; measuring on the full-res
-/// image gives a different pixel set and shifts the resulting EV by
-/// tenths of a stop.
+/// Python samples a Gaussian-prefiltered image at up to 256 px on the long
+/// edge, then decodes the sample values and meters luminance Y.
 ///
-/// `method` selects the metering pattern: `average`, `median`,
+////// `method` selects the metering pattern: `average`, `median`,
 /// `center_weighted`, `partial`, `matrix`, `multi_zone`,
 /// `highlight_weighted`. Anything else meters a flat 1.0 (0 EV), matching
 /// the Python `else` branch.
 pub fn measure_autoexposure_ev(image: &ImageBuf, rgb_to_xyz: &[[f32; 3]; 3], method: &str) -> f32 {
-    measure_autoexposure_ev_with_cctf(image, rgb_to_xyz, method, colorspace::Cctf::Linear)
+    measure_autoexposure_ev_with_cctf(
+        image,
+        rgb_to_xyz[1].map(f64::from),
+        method,
+        colorspace::Cctf::Linear,
+    ) as f32
 }
 
 fn measure_autoexposure_ev_with_cctf(
     image: &ImageBuf,
-    rgb_to_xyz: &[[f32; 3]; 3],
+    [r, g, b]: [f64; 3],
     method: &str,
     cctf: colorspace::Cctf,
-) -> f32 {
-    const MAX_SIZE: usize = 256;
-    let w = image.width as usize;
-    let h = image.height as usize;
-    let max_dim = w.max(h);
-    // skimage.rescale(scale, order=0) with scale = MAX/max_dim:
-    // output shape = round(orig * scale); each output pixel takes the
-    // nearest source via iy = round((oy + 0.5) / scale - 0.5)
-    // (scipy.ndimage.zoom convention).
-    let (sw, sh, ix, iy) = if max_dim > MAX_SIZE {
-        let scale = (MAX_SIZE as f64) / (max_dim as f64);
-        let sw = ((w as f64) * scale).round() as usize;
-        let sh = ((h as f64) * scale).round() as usize;
-        // skimage rounds each axis independently, so the effective per-axis
-        // scale is src_dim/out_dim — which differs from the global `scale` on
-        // the short edge (e.g. 200/171 vs 300/256). Sample at the pixel centre
-        // (skimage `warp` convention): src = round((o + 0.5)·src/out − 0.5).
-        let map = |out_dim: usize, src_dim: usize| -> Vec<usize> {
-            let axis_scale = src_dim as f64 / out_dim as f64;
-            (0..out_dim)
-                .map(|o| {
-                    let f = ((o as f64 + 0.5) * axis_scale - 0.5).round() as isize;
-                    f.clamp(0, src_dim as isize - 1) as usize
-                })
-                .collect()
-        };
-        (sw, sh, map(sw, w), map(sh, h))
+) -> f64 {
+    const MAX_SIZE: u32 = 256;
+    if image.data.is_empty() {
+        return 0.0;
+    }
+    let max_dim = image.width.max(image.height);
+    let small = if max_dim > MAX_SIZE {
+        let scale = f64::from(MAX_SIZE) / f64::from(max_dim);
+        let size = scaled_dimensions(image.width, image.height, scale);
+        Cow::Owned(resize(image, size, Interpolation::Nearest))
     } else {
-        let ix: Vec<usize> = (0..w).collect();
-        let iy: Vec<usize> = (0..h).collect();
-        (w, h, ix, iy)
+        Cow::Borrowed(image)
     };
-
-    // Downsampled luminance grid (row-major, sw × sh).
-    let (ix, iy) = (&ix, &iy);
-    let lum: Vec<f64> = (0..sh)
-        .into_par_iter()
-        .flat_map_iter(|y| {
-            let row_off = iy[y] * w * 3;
-            (0..sw).map(move |x| {
-                let idx = row_off + ix[x] * 3;
-                (rgb_to_xyz[1][0] * to_f32(cctf.decode(image.data[idx]))
-                    + rgb_to_xyz[1][1] * to_f32(cctf.decode(image.data[idx + 1]))
-                    + rgb_to_xyz[1][2] * to_f32(cctf.decode(image.data[idx + 2])))
-                    as f64
-            })
+    let (sw, sh) = (small.width as usize, small.height as usize);
+    let lum: Vec<f64> = small
+        .par_pixels()
+        .map(|px| {
+            r * to_f64(cctf.decode(px[0]))
+                + g * to_f64(cctf.decode(px[1]))
+                + b * to_f64(cctf.decode(px[2]))
         })
         .collect();
 
     let metered = meter_luminance(&lum, sw, sh, method);
-    let exposure = (metered / 0.184) as f32;
+    let exposure = metered / 0.184;
     if exposure <= 0.0 || exposure.is_infinite() {
         return 0.0;
     }
@@ -328,14 +304,14 @@ pub(crate) fn autoexposure_scale(image: &ImageBuf, params: &RuntimeParams) -> f6
     if !params.camera.auto_exposure {
         return 1.0;
     }
-    let rgb_to_xyz = input_colorspace_to_xyz(&params.io.input_color_space);
+    let rgb_to_xyz = spectral::colorspace_to_xyz_f64(&params.io.input_color_space);
     let ae_ev = measure_autoexposure_ev_with_cctf(
         image,
-        &rgb_to_xyz,
+        rgb_to_xyz[1],
         &params.camera.auto_exposure_method,
         params.io.input_cctf(),
     );
-    2.0f64.powf(ae_ev as f64)
+    ae_ev.exp2()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -638,7 +614,16 @@ pub fn process(
     tc_lut: Option<&TcLut>,
 ) -> ImageBuf {
     let ref_illuminant = select_illuminant(&film.info.reference_illuminant);
-    let log_raw = expose(image, film, params, backend, tc_lut, None, ref_illuminant, 1.0);
+    let log_raw = expose(
+        image,
+        film,
+        params,
+        backend,
+        tc_lut,
+        None,
+        ref_illuminant,
+        1.0,
+    );
     develop(&log_raw, film, params, backend)
 }
 
@@ -771,9 +756,7 @@ mod tests {
     /// Every metering pattern matches the upstream `measure_autoexposure_ev`
     /// (`spektrafilm/utils/autoexposure.py`) on the synthetic image, with the
     /// sRGB RGB→XYZ matrix and `apply_cctf_decoding=False`. The reference is
-    /// metered on the ≤256 px `small_preview` downsample — the faithful
-    /// pipeline order (downsample, then meter), which makes our nearest-edge
-    /// mapping bit-exact with `skimage.transform.rescale(order=0)`.
+    /// metered on the ≤256 px `small_preview` downsample.
     #[test]
     fn autoexposure_methods_match_python_reference() {
         let img = synthetic_image();
@@ -792,6 +775,30 @@ mod tests {
             assert!(
                 (ev as f64 - expected).abs() < 1e-5,
                 "method {method}: got {ev}, expected {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn metering_antialiases_float_samples_before_decoding() {
+        let mut checker = ImageBuf::new(512, 384);
+        for (y, row) in checker.data.chunks_exact_mut(512 * 3).enumerate() {
+            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+                let level = if (x + y) % 2 == 0 { 0.02 } else { 0.8 };
+                pixel.fill(from_f64(level));
+            }
+        }
+        let luminance = spectral::colorspace_to_xyz_f64("sRGB")[1];
+        // Python ResizingService.small_preview then measure_autoexposure_ev.
+        for (cctf, expected) in [
+            (colorspace::Cctf::Linear, -0.612999529688),
+            (colorspace::Cctf::Srgb, 1.51519523618),
+        ] {
+            let ev =
+                measure_autoexposure_ev_with_cctf(&checker, luminance, "center_weighted", cctf);
+            assert!(
+                (ev - expected).abs() < 1e-6,
+                "got {ev}, expected {expected}"
             );
         }
     }
