@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/spektrafilm-core",
     "crates/spektrafilm-gpu",
+    "crates/spektrafilm-io",
     "crates/spektrafilm-math",
     "crates/spektrafilm-model",
     "crates/spektrafilm-cli",
@@ -18,6 +19,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 spektrafilm-core = { path = "crates/spektrafilm-core" }
 spektrafilm-gpu = { path = "crates/spektrafilm-gpu" }
+spektrafilm-io = { path = "crates/spektrafilm-io" }
 spektrafilm-math = { path = "crates/spektrafilm-math" }
 spektrafilm-model = { path = "crates/spektrafilm-model" }
 

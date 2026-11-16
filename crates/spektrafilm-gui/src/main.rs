@@ -351,15 +351,14 @@ impl App {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                // PNG, JPEG and RAW loaders return linear sRGB. Preserve
-                // the GUI's linear ProPhoto convention for untagged TIFF.
-                self.params.io.input_color_space =
-                    if matches!(ext.as_str(), "png" | "jpg" | "jpeg") || is_raw_extension(&ext) {
-                        "sRGB"
-                    } else {
-                        "ProPhoto RGB"
-                    }
-                    .into();
+                self.params.io.input_color_space = if spektrafilm_io::raw::is_raw(path) {
+                    spektrafilm_io::raw::INPUT_COLOR_SPACE
+                } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+                    "sRGB"
+                } else {
+                    "ProPhoto RGB"
+                }
+                .into();
                 self.params.io.input_cctf_decoding = false;
                 self.status = format!(
                     "Loaded {} × {} ({:.1} MP) in {:.0} ms",
@@ -1769,8 +1768,8 @@ fn load_image(path: &Path) -> Result<ImageBuf> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if is_raw_extension(&ext) {
-        return load_raw(path);
+    if spektrafilm_io::raw::is_raw(path) {
+        return spektrafilm_io::raw::decode(path);
     }
     // Disable the `image` crate's default 512 MiB allocation cap — a 60 MP
     // 32-bit float TIFF alone needs ~720 MiB and would otherwise be
@@ -1796,128 +1795,6 @@ fn load_image(path: &Path) -> Result<ImageBuf> {
     Ok(ImageBuf::from_data(w, h, scalars))
 }
 
-/// Camera RAW extensions supported via `imagepipe` / `rawloader`. The
-/// underlying decoder handles many proprietary formats; this list is
-/// the dispatch trigger only (we still try the decoder for unknown
-/// extensions).
-fn is_raw_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "dng"
-            | "cr2"
-            | "cr3"
-            | "nef"
-            | "nrw"
-            | "arw"
-            | "srf"
-            | "sr2"
-            | "raf"
-            | "orf"
-            | "rw2"
-            | "pef"
-            | "ptx"
-            | "srw"
-            | "x3f"
-            | "iiq"
-            | "3fr"
-            | "ari"
-            | "bay"
-            | "crw"
-            | "dcr"
-            | "drf"
-            | "erf"
-            | "fff"
-            | "k25"
-            | "kdc"
-            | "mef"
-            | "mos"
-            | "mrw"
-            | "rwl"
-    )
-}
-
-/// Decode a camera RAW file and return a **linear** image in sRGB
-/// primaries. The pipeline runs `rawler` (a modern fork of rawloader
-/// with broader camera coverage — Sony ARW, newer Nikon NEF, recent
-/// DNGs) instead of the older `imagepipe` chain.
-///
-/// `rawler::RawDevelop::default()` already covers rescale → demosaic →
-/// crop → white balance → camera→sRGB matrix. We drop the final
-/// `SRgb` gamma step so we get LINEAR sRGB out (the spektrafilm
-/// pipeline applies its own sRGB encoding at the very end).
-///
-/// Limitations: Lightroom-exported "lossy DNG" (`ljpeg sof.precision 8`)
-/// is not supported by rawler — those files come back as an error,
-/// which we surface in the GUI status bar.
-fn load_raw(path: &Path) -> Result<ImageBuf> {
-    use rawler::{
-        decode_file,
-        imgop::develop::{ProcessingStep, RawDevelop},
-    };
-    let raw = decode_file(path).map_err(|e| anyhow::anyhow!("RAW decode failed: {e:?}"))?;
-    let mut dev = RawDevelop::default();
-    // Drop the sRGB gamma step — we want linear sRGB primaries, the
-    // spektrafilm pipeline applies its own sRGB OETF at the end.
-    dev.steps.retain(|s| !matches!(s, ProcessingStep::SRgb));
-    let intermediate = dev
-        .develop_intermediate(&raw)
-        .map_err(|e| anyhow::anyhow!("RAW develop failed: {e:?}"))?;
-    rawler_intermediate_to_image_buf(intermediate)
-}
-
-fn rawler_intermediate_to_image_buf(
-    intermediate: rawler::imgop::develop::Intermediate,
-) -> Result<ImageBuf> {
-    use rawler::imgop::develop::Intermediate;
-
-    let floor = |v: f32| from_f32(v.max(0.0));
-    match intermediate {
-        Intermediate::Monochrome(pixels) => {
-            let scalars: Vec<Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|&v| {
-                    let v = floor(v);
-                    [v, v, v]
-                })
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-        Intermediate::ThreeColor(pixels) => {
-            let scalars: Vec<Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|px| [floor(px[0]), floor(px[1]), floor(px[2])])
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-        Intermediate::FourColor(pixels) => {
-            let scalars: Vec<Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|px| [floor(px[0]), floor(px[1]), floor(px[2])])
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-    }
-}
-
-/// Write the pipeline's RGB ImageBuf to disk. PNG is 8-bit (matches what
-/// the preview shows); TIFF is 16-bit (more headroom — recommended for
-/// further editing). The writer clips to the integer format's range. The
-/// GUI defaults to sRGB encoding and can also save linear values.
 fn save_image(out: &ImageBuf, path: &Path) -> Result<()> {
     let ext = path
         .extension()

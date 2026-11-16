@@ -2,11 +2,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, bail, ensure};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
+use spektrafilm_io::raw;
 use spektrafilm_math::image::ImageBuf;
 
 #[derive(Parser)]
@@ -44,6 +45,8 @@ enum Commands {
         /// Path to JSON params file for overrides.
         #[arg(long)]
         params: Option<PathBuf>,
+        #[command(flatten)]
+        raw: RawOptions,
         /// Dump the final pipeline buffer as native-endian f64 (HxWx3, row-major,
         /// channel-interleaved) after pipeline color processing and before file quantization.
         #[arg(long)]
@@ -90,6 +93,51 @@ enum Commands {
     },
 }
 
+#[derive(Args)]
+struct RawOptions {
+    /// White balance for camera RAW inputs (defaults to as-shot).
+    #[arg(long, value_enum)]
+    raw_white_balance: Option<RawWhiteBalance>,
+    /// Temperature in kelvin for custom RAW white balance.
+    #[arg(long, requires = "raw_white_balance")]
+    raw_temperature: Option<f64>,
+    /// Green multiplier for custom RAW white balance (defaults to 1).
+    #[arg(long, requires = "raw_temperature")]
+    raw_tint: Option<f64>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RawWhiteBalance {
+    AsShot,
+    Daylight,
+    Tungsten,
+    Custom,
+}
+
+impl RawOptions {
+    fn white_balance(&self, is_raw: bool) -> Result<raw::WhiteBalance> {
+        let Some(balance) = self.raw_white_balance else {
+            return Ok(raw::WhiteBalance::AsShot);
+        };
+        ensure!(is_raw, "--raw-white-balance requires a camera RAW input");
+        ensure!(
+            matches!(balance, RawWhiteBalance::Custom) || self.raw_temperature.is_none(),
+            "--raw-temperature requires --raw-white-balance custom"
+        );
+        Ok(match balance {
+            RawWhiteBalance::AsShot => raw::WhiteBalance::AsShot,
+            RawWhiteBalance::Daylight => raw::WhiteBalance::Daylight,
+            RawWhiteBalance::Tungsten => raw::WhiteBalance::Tungsten,
+            RawWhiteBalance::Custom => raw::WhiteBalance::Custom {
+                kelvin: self
+                    .raw_temperature
+                    .context("custom RAW white balance requires --raw-temperature")?,
+                tint: self.raw_tint.unwrap_or(1.0),
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum LutInputEncoding {
     LinearProphoto,
@@ -124,6 +172,7 @@ fn main() -> Result<()> {
             scan_film,
             timings,
             params: params_file,
+            raw,
             raw_out,
             iters,
             data_dir,
@@ -136,6 +185,7 @@ fn main() -> Result<()> {
                 scan_film,
                 timings,
                 params_file.as_deref(),
+                &raw,
                 raw_out.as_deref(),
                 iters,
                 &data_dir,
@@ -175,6 +225,7 @@ fn cmd_process(
     scan_film: bool,
     show_timings: bool,
     params_file: Option<&Path>,
+    raw_options: &RawOptions,
     raw_out: Option<&Path>,
     iters: usize,
     data_dir: &Path,
@@ -218,49 +269,23 @@ fn cmd_process(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if matches!(ext.as_str(), "png" | "jpg" | "jpeg")
-        || matches!(
-            ext.as_str(),
-            "dng"
-                | "cr2"
-                | "cr3"
-                | "nef"
-                | "nrw"
-                | "arw"
-                | "srf"
-                | "sr2"
-                | "raf"
-                | "orf"
-                | "rw2"
-                | "pef"
-                | "srw"
-                | "x3f"
-                | "iiq"
-                | "3fr"
-                | "crw"
-                | "rwl"
-                | "mrw"
-                | "mef"
-                | "kdc"
-                | "ari"
-                | "bay"
-                | "dcr"
-                | "drf"
-                | "erf"
-                | "fff"
-                | "k25"
-                | "mos"
-                | "ptx"
-        )
-    {
-        // PNG, JPEG and RAW loaders already return linear sRGB.
-        params.io.input_color_space = "sRGB".to_string();
+    let is_raw = raw::is_raw(input);
+    let white_balance = raw_options.white_balance(is_raw)?;
+    if is_raw {
+        params.io.input_color_space = raw::INPUT_COLOR_SPACE.into();
+        params.io.input_cctf_decoding = false;
+    } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+        params.io.input_color_space = "sRGB".into();
         params.io.input_cctf_decoding = false;
     }
 
     // Load image
     let t = Instant::now();
-    let image = load_image(input)?;
+    let image = if is_raw {
+        raw::decode_with_white_balance(input, white_balance)?
+    } else {
+        load_image(input)?
+    };
     eprintln!(
         "Image loaded: {}x{} ({} MP), {} ms",
         image.width,
@@ -482,91 +507,10 @@ fn load_image(path: &Path) -> Result<ImageBuf> {
     match ext.as_str() {
         "tif" | "tiff" => load_tiff(path),
         "png" | "jpg" | "jpeg" => load_srgb_raster(path),
-        // Camera RAW formats — same set as the GUI's loader.
-        "dng" | "cr2" | "cr3" | "nef" | "nrw" | "arw" | "srf" | "sr2" | "raf" | "orf" | "rw2"
-        | "pef" | "srw" | "x3f" | "iiq" | "3fr" | "crw" | "rwl" | "mrw" | "mef" | "kdc" | "ari"
-        | "bay" | "dcr" | "drf" | "erf" | "fff" | "k25" | "mos" | "ptx" => load_raw(path),
-        _ => bail!("unsupported image format: .{ext} (supported: tiff, png, jpeg, raw)"),
+        _ => bail!("unsupported image format: .{ext} (supported: tiff, png, jpeg, camera RAW)"),
     }
 }
 
-/// Decode a camera RAW file via `rawler` — same code path the GUI uses
-/// (`crates/spektrafilm-gui/src/main.rs::load_raw`). Earlier versions
-/// used `imagepipe`+`rawloader` which produces DIFFERENT pixel values
-/// for the same ORF (different demosaic algorithm, different camera
-/// matrix), giving the f64 CPU export a visible warm/magenta cast vs
-/// the GUI preview. They must share a decoder for the export to match
-/// the preview byte-for-byte at the input boundary.
-fn load_raw(path: &Path) -> Result<ImageBuf> {
-    use rawler::{
-        decode_file,
-        imgop::develop::{ProcessingStep, RawDevelop},
-    };
-    let raw = decode_file(path).map_err(|e| anyhow::anyhow!("RAW decode failed: {e:?}"))?;
-    let mut dev = RawDevelop::default();
-    // Drop the sRGB gamma step — we want linear sRGB primaries; the
-    // spektrafilm pipeline applies its own sRGB OETF at the very end.
-    dev.steps.retain(|s| !matches!(s, ProcessingStep::SRgb));
-    let intermediate = dev
-        .develop_intermediate(&raw)
-        .map_err(|e| anyhow::anyhow!("RAW develop failed: {e:?}"))?;
-    rawler_intermediate_to_image_buf(intermediate)
-}
-
-fn rawler_intermediate_to_image_buf(
-    intermediate: rawler::imgop::develop::Intermediate,
-) -> Result<ImageBuf> {
-    use rayon::prelude::*;
-    use rawler::imgop::develop::Intermediate;
-
-    let floor = |v: f32| spektrafilm_math::precision::from_f32(v.max(0.0));
-    match intermediate {
-        Intermediate::Monochrome(pixels) => {
-            let scalars: Vec<spektrafilm_math::precision::Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|&v| {
-                    let v = floor(v);
-                    [v, v, v]
-                })
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-        Intermediate::ThreeColor(pixels) => {
-            let scalars: Vec<spektrafilm_math::precision::Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|px| [floor(px[0]), floor(px[1]), floor(px[2])])
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-        Intermediate::FourColor(pixels) => {
-            let scalars: Vec<spektrafilm_math::precision::Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|px| [floor(px[0]), floor(px[1]), floor(px[2])])
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-    }
-}
-
-/// Decode an image with the decoder's memory limits disabled. The
-/// `image` crate caps allocation at 512 MiB by default, which rejects
-/// large float TIFFs (a 60 MP 32-bit RGB frame alone is ~720 MiB). We
-/// trust local files, so lift the cap.
 fn decode_no_limits(path: &Path) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::open(path)
         .with_context(|| format!("opening image: {}", path.display()))?
