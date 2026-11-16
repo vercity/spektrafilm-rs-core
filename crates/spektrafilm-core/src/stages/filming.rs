@@ -300,7 +300,7 @@ fn decode_input_in_place(image: &mut ImageBuf, io: &crate::params::IoParams) {
 #[allow(clippy::too_many_arguments)]
 pub fn expose(
     image: &ImageBuf,
-    _film: &Profile,
+    film: &Profile,
     params: &RuntimeParams,
     backend: &dyn ComputeBackend,
     tc_lut: Option<&TcLut>,
@@ -311,6 +311,7 @@ pub fn expose(
     let pix_um = pixel_size_um(params.camera.film_format_mm, image.width, image.height);
     expose_working(
         image,
+        film,
         params,
         backend,
         tc_lut,
@@ -339,6 +340,7 @@ pub(crate) fn autoexposure_scale(image: &ImageBuf, params: &RuntimeParams) -> f6
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expose_working(
     image: &ImageBuf,
+    film: &Profile,
     params: &RuntimeParams,
     backend: &dyn ComputeBackend,
     tc_lut: Option<&TcLut>,
@@ -425,6 +427,7 @@ pub(crate) fn expose_working(
     // Halation (on linear raw)
     let halation = &params.film_render.halation;
     if halation.active {
+        let (strength, sigma_um) = halation.strength_and_sigma(film);
         raw = spektrafilm_model::diffusion::apply_halation_um(
             &raw,
             pix_um,
@@ -435,8 +438,8 @@ pub(crate) fn expose_working(
             halation.scatter_tail_weight,
             halation.halation_amount,
             halation.halation_spatial_scale,
-            halation.halation_strength,
-            halation.halation_first_sigma_um,
+            strength,
+            sigma_um,
             halation.halation_n_bounces,
             halation.halation_bounce_decay,
             halation.halation_renormalize,

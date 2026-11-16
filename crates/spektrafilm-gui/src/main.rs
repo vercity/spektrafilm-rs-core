@@ -1711,6 +1711,8 @@ fn preview_pipeline_cache_key(
     serde_json::json!({
         "film": film_name,
         "print": print_name,
+        "camera_filter_uv": params.camera.filter_uv,
+        "camera_filter_ir": params.camera.filter_ir,
         "film_dev": params.film_render.development_time,
         "print_dev": params.print_render.development_time,
         "scan_film": params.io.scan_film,

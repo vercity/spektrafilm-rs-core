@@ -361,6 +361,60 @@ fn pairwise_sum_f64(xs: &[f64]) -> f64 {
     }
 }
 
+/// Apply the camera filters while preserving each channel's response to the
+/// film's reference illuminant.
+pub(crate) fn apply_camera_bandpass(
+    sensitivity: &mut [[f64; 3]],
+    illuminant: &[f64],
+    uv: [f32; 3],
+    ir: [f32; 3],
+) {
+    if uv[0] <= 0.0 && ir[0] <= 0.0 {
+        return;
+    }
+    let transmission = |wavelength: f64, [strength, center, width]: [f32; 3], direction: f64| {
+        let strength = f64::from(strength).clamp(0.0, 1.0);
+        if strength == 0.0 {
+            return 1.0;
+        }
+        let offset = direction * (wavelength - f64::from(center));
+        let edge = if width == 0.0 && offset == 0.0 {
+            0.5
+        } else {
+            0.5 + 0.5 * erf(offset / f64::from(width))
+        };
+        1.0 - strength + strength * edge
+    };
+
+    let bandpass: [f64; N_WAVELENGTHS] = std::array::from_fn(|i| {
+        let wavelength =
+            f64::from(spectral::WAVELENGTH_MIN) + i as f64 * f64::from(spectral::WAVELENGTH_STEP);
+        transmission(wavelength, uv, 1.0) * transmission(wavelength, ir, -1.0)
+    });
+    let mut unfiltered = [0.0; 3];
+    let mut filtered = [0.0; 3];
+    for ((row, &light), &pass) in sensitivity.iter().zip(illuminant).zip(&bandpass) {
+        for c in 0..3 {
+            unfiltered[c] += row[c] * light;
+            filtered[c] += row[c] * pass * light;
+        }
+    }
+
+    // An empty channel or completely blocked pass cannot be normalized.
+    let scale: [f64; 3] = std::array::from_fn(|c| {
+        if filtered[c] > 0.0 {
+            unfiltered[c] / filtered[c]
+        } else {
+            1.0
+        }
+    });
+    for (row, &pass) in sensitivity.iter_mut().zip(&bandpass) {
+        for c in 0..3 {
+            row[c] *= pass * scale[c];
+        }
+    }
+}
+
 /// Evaluate the erf4 spectral bandpass window.
 /// params: (c_uv, sigma_uv, c_ir, sigma_ir)
 /// Returns [81][3] window values (same for all 3 channels in erf4 model).
@@ -386,4 +440,40 @@ fn eval_erf4_bandpass(params: &[f64]) -> Vec<[f64; 3]> {
 #[inline]
 fn erf(x: f64) -> f64 {
     libm::erf(x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_bandpass_preserves_each_reference_illuminant_response() {
+        let illuminant = &spectral::ILLUMINANT_D55_F64;
+        let sensitivity: [[f64; 3]; N_WAVELENGTHS] =
+            std::array::from_fn(|i| [(i + 1) as f64, (N_WAVELENGTHS - i) as f64, 0.0]);
+        let response = |s: &[[f64; 3]]| -> [f64; 3] {
+            std::array::from_fn(|c| {
+                s.iter()
+                    .zip(illuminant)
+                    .map(|(r, light)| r[c] * light)
+                    .sum()
+            })
+        };
+
+        let mut filtered = sensitivity;
+        apply_camera_bandpass(
+            &mut filtered,
+            illuminant,
+            [0.9, 430.0, 8.0],
+            [0.75, 650.0, 15.0],
+        );
+        let before = response(&sensitivity);
+        let after = response(&filtered);
+        for (before, after) in before.into_iter().zip(after) {
+            assert!((after - before).abs() < 1e-12 * before.max(1.0));
+        }
+        assert!(filtered[0][0] < sensitivity[0][0]);
+        assert!(filtered[N_WAVELENGTHS - 1][0] < sensitivity[N_WAVELENGTHS - 1][0]);
+        assert!(filtered[N_WAVELENGTHS / 2][0] > sensitivity[N_WAVELENGTHS / 2][0]);
+    }
 }

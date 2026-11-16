@@ -65,11 +65,9 @@ fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
         g.density_min = [g.density_min[0]; 3];
         g.uniformity = [g.uniformity[0]; 3];
         let h = &mut params.film_render.halation;
-        h.halation_strength = [h.halation_strength[0]; 3];
         h.scatter_core_um = [h.scatter_core_um[0]; 3];
         h.scatter_tail_um = [h.scatter_tail_um[0]; 3];
         h.scatter_tail_weight = [h.scatter_tail_weight[0]; 3];
-        h.halation_first_sigma_um = [h.halation_first_sigma_um[0]; 3];
     }
 }
 
@@ -206,7 +204,7 @@ impl Pipeline {
 
         // Film sensitivity: Python `sensitivity = np.nan_to_num(10 ** log_sensitivity)` — f64.
         let log_sens = film.log_sensitivity_f64();
-        let sensitivity: Vec<[f64; 3]> = log_sens
+        let mut sensitivity: Vec<[f64; 3]> = log_sens
             .iter()
             .map(|row| {
                 let mut out = [0.0f64; 3];
@@ -220,6 +218,12 @@ impl Pipeline {
 
         let ref_illuminant = select_illuminant(&film.info.reference_illuminant);
         let ref_illuminant_f64 = select_illuminant_f64(&film.info.reference_illuminant);
+        spectral_service::apply_camera_bandpass(
+            &mut sensitivity,
+            ref_illuminant_f64,
+            params.camera.filter_uv,
+            params.camera.filter_ir,
+        );
         let mut front_illuminant = film.info.reference_illuminant.clone();
 
         // RGB → film raw upsampler. Default `hanatos2025` builds the spectral tc
@@ -480,6 +484,7 @@ impl Pipeline {
         let t = Instant::now();
         let log_raw = stages::filming::expose_working(
             &image,
+            &self.film,
             &self.params,
             backend,
             self.tc_lut.as_ref(),
@@ -581,11 +586,67 @@ impl Pipeline {
     fn can_render_resident(&self, backend: &dyn ComputeBackend) -> bool {
         // The resident path consumes linear input and runs direct spectral
         // integration. Staged rendering handles other requested modes.
-        backend.is_gpu()
-            && (self.tc_lut.is_some() || self.mallett_core.is_some())
-            && self.params.io.input_cctf() == spektrafilm_math::colorspace::Cctf::Linear
-            && !self.params.settings.use_scanner_lut
-            && (self.params.io.scan_film || !self.params.settings.use_enlarger_lut)
+        if !backend.is_gpu()
+            || (self.tc_lut.is_none() && self.mallett_core.is_none())
+            || self.params.io.input_cctf() != spektrafilm_math::colorspace::Cctf::Linear
+            || self.params.settings.use_scanner_lut
+            || (!self.params.io.scan_film && self.params.settings.use_enlarger_lut)
+        {
+            return false;
+        }
+        let halation = &self.params.film_render.halation;
+        if halation.active && halation.halation_n_bounces > 0 {
+            let (strength, sigma) = halation.strength_and_sigma(&self.film);
+            let has_positive_strength =
+                strength.iter().any(|&s| s * halation.halation_amount > 0.0);
+            let has_radius = sigma.map(|s| s * halation.halation_spatial_scale > 0.0);
+            // The resident kernel uses one radius for every channel. Mixed
+            // zero/positive radii need the staged per-channel implementation.
+            if has_positive_strength && !has_radius.iter().all(|&r| r == has_radius[0]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn resident_halation_params(&self, pix_um: f32) -> Option<spektrafilm_gpu::HalationGpuParams> {
+        let h = &self.params.film_render.halation;
+        if !h.active {
+            return None;
+        }
+        // The resident kernels use averaged radii and per-channel strengths.
+        let avg = |radii: [f64; 3]| radii.iter().sum::<f64>() / 3.0;
+        let (strength, sigma_um) = h.strength_and_sigma(&self.film);
+        let a_tot = strength.map(|s| s * h.halation_amount);
+        let halation_sigma_px = avg(sigma_um) * h.halation_spatial_scale / pix_um as f64;
+        let halation_n_bounces = if halation_sigma_px > 0.0 && a_tot.iter().any(|&a| a > 0.0) {
+            h.halation_n_bounces
+        } else {
+            0
+        };
+        let scatter_core_px = avg(h.scatter_core_um) * h.scatter_spatial_scale / pix_um as f64;
+        let scatter_tail_px = avg(h.scatter_tail_um) * h.scatter_spatial_scale / pix_um as f64;
+        let scatter_amount = if scatter_core_px > 0.0 || scatter_tail_px > 0.0 {
+            h.scatter_amount.max(0.0)
+        } else {
+            0.0
+        };
+        if scatter_amount == 0.0 && halation_n_bounces == 0 {
+            return None;
+        }
+        Some(spektrafilm_gpu::HalationGpuParams {
+            scatter_amount: scatter_amount as f32,
+            scatter_core_px: scatter_core_px as f32,
+            scatter_tail_px: scatter_tail_px as f32,
+            scatter_tail_weight: h.scatter_tail_weight.map(|w| w as f32),
+            halation_amount: h.halation_amount as f32,
+            halation_strength_avg: avg(a_tot) as f32,
+            halation_a_tot: a_tot.map(|a| a as f32),
+            halation_first_sigma_px: halation_sigma_px as f32,
+            halation_n_bounces,
+            halation_bounce_decay: h.halation_bounce_decay as f32,
+            halation_renormalize: h.halation_renormalize,
+        })
     }
 
     fn pixel_size_um(&self, image: &ImageBuf) -> f32 {
@@ -838,44 +899,7 @@ impl Pipeline {
             self.params.enlarger.print_exposure as f64 * color_ref.printing_exposure_correction;
         let print_norm_factor = self.print_exposure_factor * print_exposure_scale;
 
-        // Halation in the resident chain — only built when the halation
-        // stage is active. Mirrors `apply_halation_um`: averages the
-        // per-channel µm sigmas, converts to pixel space, and passes the
-        // resulting scalars to the shaders.
-        let halation = if self.params.film_render.halation.active {
-            let h = &self.params.film_render.halation;
-            // GPU shaders take f32 — narrow at the boundary.
-            let avg_f64 = |a: [f64; 3]| (a[0] + a[1] + a[2]) / 3.0;
-            let strength_avg = (avg_f64(h.halation_strength) * h.halation_amount) as f32;
-            let a_tot = [
-                (h.halation_strength[0] * h.halation_amount) as f32,
-                (h.halation_strength[1] * h.halation_amount) as f32,
-                (h.halation_strength[2] * h.halation_amount) as f32,
-            ];
-            Some(spektrafilm_gpu::HalationGpuParams {
-                scatter_amount: h.scatter_amount as f32,
-                scatter_core_px: (avg_f64(h.scatter_core_um) * h.scatter_spatial_scale
-                    / pix_um as f64) as f32,
-                scatter_tail_px: (avg_f64(h.scatter_tail_um) * h.scatter_spatial_scale
-                    / pix_um as f64) as f32,
-                scatter_tail_weight: [
-                    h.scatter_tail_weight[0] as f32,
-                    h.scatter_tail_weight[1] as f32,
-                    h.scatter_tail_weight[2] as f32,
-                ],
-                halation_amount: h.halation_amount as f32,
-                halation_strength_avg: strength_avg,
-                halation_a_tot: a_tot,
-                halation_first_sigma_px: (avg_f64(h.halation_first_sigma_um)
-                    * h.halation_spatial_scale
-                    / pix_um as f64) as f32,
-                halation_n_bounces: h.halation_n_bounces,
-                halation_bounce_decay: h.halation_bounce_decay as f32,
-                halation_renormalize: h.halation_renormalize,
-            })
-        } else {
-            None
-        };
+        let halation = self.resident_halation_params(pix_um);
 
         // DIR couplers in the resident chain. Mirrors CPU
         // `apply_density_correction`: build the scaled couplers matrix and
@@ -1157,4 +1181,158 @@ fn select_illuminant_f64(name: &str) -> &'static [f64] {
     use spektrafilm_math::spectral;
     spectral::named_illuminant(name)
         .map_or(&spectral::ILLUMINANT_D55_F64, |illum| illum.samples_f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spektrafilm_gpu::cpu_backend::CpuBackend;
+    use spektrafilm_math::precision::from_f64;
+
+    fn data_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")
+    }
+
+    #[test]
+    fn cached_pipeline_uses_stock_halation_and_explicit_overrides() {
+        let data = data_dir();
+        let print = crate::profile::load_profile_by_name(&data, "kodak_portra_endura").unwrap();
+        let mut input = ImageBuf::new(7, 7);
+        input.set(3, 3, [from_f64(1.0); 3]);
+
+        for (name, strength, sigma) in [
+            ("kodak_gold_200", [0.08, 0.02, 0.0], 65.0),
+            ("kodak_vision3_500t", [0.015, 0.005, 0.0], 50.0),
+        ] {
+            let film = crate::profile::load_profile_by_name(&data, name).unwrap();
+            let mut params = RuntimeParams::default();
+            params.camera.auto_exposure = false;
+            params.camera.film_format_mm = 0.35;
+            params.film_render.halation.scatter_amount = 0.0;
+
+            let cached = Pipeline::new(film.clone(), print.clone(), params.clone());
+            let pipeline = cached.clone().with_params(params);
+            let gpu = pipeline.resident_halation_params(50.0).unwrap();
+            assert_eq!(gpu.halation_a_tot, strength.map(|s| s as f32));
+            assert_eq!(gpu.halation_first_sigma_px, (sigma / 50.0) as f32);
+
+            let expose = |pipeline: &Pipeline| {
+                stages::filming::expose(
+                    &input,
+                    &film,
+                    &pipeline.params,
+                    &CpuBackend,
+                    None,
+                    None,
+                    &[],
+                    1.0,
+                )
+            };
+            let mut explicit = pipeline.params.clone();
+            explicit.film_render.halation.halation_strength = Some(strength);
+            explicit.film_render.halation.halation_first_sigma_um = Some([sigma; 3]);
+            assert_eq!(
+                expose(&pipeline).data,
+                expose(&cached.clone().with_params(explicit)).data
+            );
+
+            let mut overridden = pipeline.params.clone();
+            overridden.film_render.halation = serde_json::from_value(serde_json::json!({
+                "scatter_amount": 0.0,
+                "halation_strength": [0.05, 0.015, 0.0],
+            }))
+            .unwrap();
+            let overridden = cached.clone().with_params(overridden);
+            let gpu = overridden.resident_halation_params(50.0).unwrap();
+            assert_eq!(gpu.halation_a_tot, [0.05, 0.015, 0.0]);
+            assert_eq!(gpu.halation_first_sigma_px, (sigma / 50.0) as f32);
+            assert_ne!(expose(&pipeline).data, expose(&overridden).data);
+
+            let mut disabled = pipeline.params.clone();
+            disabled.film_render.halation = serde_json::from_value(serde_json::json!({
+                "scatter_amount": 0.0,
+                "halation_first_sigma_um": [0.0, 0.0, 0.0],
+            }))
+            .unwrap();
+            let no_radius = cached.clone().with_params(disabled.clone());
+            assert!(no_radius.resident_halation_params(50.0).is_none());
+            disabled.film_render.halation.active = false;
+            assert_eq!(
+                expose(&no_radius).data,
+                expose(&cached.clone().with_params(disabled)).data
+            );
+
+            let mut scatter = no_radius.params.clone();
+            scatter.film_render.halation.scatter_amount = 1.0;
+            let gpu = cached
+                .with_params(scatter)
+                .resident_halation_params(50.0)
+                .unwrap();
+            assert_eq!(gpu.halation_n_bounces, 0);
+            assert_eq!(gpu.scatter_amount, 1.0);
+        }
+    }
+
+    #[test]
+    fn calibrated_hanatos_and_mallett_use_filtered_sensitivity() {
+        let data = data_dir();
+        let film = crate::profile::load_profile_by_name(&data, "kodak_gold_200").unwrap();
+        let print = crate::profile::load_profile_by_name(&data, "kodak_portra_endura").unwrap();
+        let input = ImageBuf::from_data(1, 1, [0.02, 0.03, 0.8].map(from_f64).to_vec());
+        let mut params = RuntimeParams::default();
+        params.camera.auto_exposure = false;
+        params.film_render.halation.active = false;
+        params.enlarger.print_exposure_compensation = false;
+
+        for method in ["hanatos2025", "mallett2019"] {
+            params.settings.rgb_to_raw_method = method.into();
+            let build = |params| {
+                Pipeline::new_with_spectral(film.clone(), print.clone(), params, &data).unwrap()
+            };
+            let expose = |pipeline: &Pipeline| {
+                stages::filming::expose(
+                    &input,
+                    &pipeline.film,
+                    &pipeline.params,
+                    &CpuBackend,
+                    pipeline.tc_lut(),
+                    pipeline.mallett_core.as_ref(),
+                    select_illuminant(&pipeline.front_illuminant),
+                    1.0,
+                )
+            };
+            let baseline = build(params.clone());
+
+            let mut filters = params.clone();
+            filters.camera.filter_uv = [0.0, 460.0, 8.0];
+            filters.camera.filter_ir = [0.0, 605.0, 15.0];
+            let inactive = build(filters.clone());
+            assert_eq!(expose(&baseline).data, expose(&inactive).data, "{method}");
+            assert_eq!(
+                baseline.print_exposure_factor(),
+                inactive.print_exposure_factor(),
+                "{method}"
+            );
+
+            filters.camera.filter_uv[0] = 0.9;
+            filters.camera.filter_ir[0] = 0.8;
+            let filtered = build(filters);
+            if method == "hanatos2025" {
+                assert!(
+                    (baseline.print_exposure_factor() - filtered.print_exposure_factor()).abs()
+                        > 1e-6
+                );
+            }
+            let baseline_raw = expose(&baseline);
+            let filtered_raw = expose(&filtered);
+            assert!(
+                baseline_raw
+                    .data
+                    .iter()
+                    .zip(filtered_raw.data)
+                    .any(|(&a, b)| (a - b).abs() > from_f64(1e-3)),
+                "{method}"
+            );
+        }
+    }
 }

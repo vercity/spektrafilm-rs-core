@@ -128,7 +128,11 @@ pub fn apply_halation_um(
         halation_strength[2] * halation_amount,
     ];
 
-    if halation_n_bounces >= 1 && (a_tot[0] > 0.0 || a_tot[1] > 0.0 || a_tot[2] > 0.0) {
+    let sigma_first_px = halation_first_sigma_um.map(|s| s * halation_spatial_scale / pix_um_f64);
+    if halation_n_bounces >= 1
+        && a_tot.iter().any(|&a| a > 0.0)
+        && sigma_first_px.iter().any(|&s| s > 0.0)
+    {
         let n_bounces = halation_n_bounces as usize;
         // Decay computed in f64 to match Python's `rho ** (k - 1)` and
         // subsequent normalize-by-sum at full f64 precision.
@@ -145,31 +149,31 @@ pub fn apply_halation_um(
             if a_tot[c] == 0.0 {
                 continue;
             }
-            let sigma_first_px_f64 =
-                halation_first_sigma_um[c] * halation_spatial_scale / pix_um_f64;
-            if sigma_first_px_f64 <= 0.0 {
+            let a_c = from_f64(a_tot[c]);
+            let denom = from_f64(1.0) + a_c;
+            if sigma_first_px[c] <= 0.0 {
+                // A zero-radius bounce contributes the unblurred channel.
+                if !halation_renormalize {
+                    for v in &mut channels[c] {
+                        *v *= denom;
+                    }
+                }
                 continue;
             }
             let mut hb = vec![ZERO; n_pix];
             for (k, &wk) in decay.iter().enumerate() {
-                let sigma_k = (sigma_first_px_f64 * ((k as f64) + 1.0).sqrt()).max(1e-6) as f32;
+                let sigma_k = (sigma_first_px[c] * ((k as f64) + 1.0).sqrt()).max(1e-6) as f32;
                 let blurred = gaussian_blur_channel(&channels[c], w, h, sigma_k);
                 let wk_s = from_f64(wk);
                 for i in 0..n_pix {
                     hb[i] += wk_s * blurred[i];
                 }
             }
-            let a_c = from_f64(a_tot[c]);
             for i in 0..n_pix {
                 channels[c][i] += a_c * hb[i];
             }
-        }
-
-        if halation_renormalize {
-            let one = from_f64(1.0);
-            for c in 0..3 {
-                let denom = one + from_f64(a_tot[c]);
-                for v in channels[c].iter_mut() {
+            if halation_renormalize {
+                for v in &mut channels[c] {
                     *v /= denom;
                 }
             }
@@ -902,4 +906,76 @@ pub fn apply_diffusion_filter_blur(
             *o = from_f64((1.0 - p_s) * (orig as f64) + p_s * s);
         });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_halation_um;
+    use spektrafilm_gpu::cpu_backend::CpuBackend;
+    use spektrafilm_math::image::ImageBuf;
+    use spektrafilm_math::precision::from_f64;
+
+    fn impulse() -> ImageBuf {
+        let mut image = ImageBuf::new(7, 7);
+        image.set(3, 3, [from_f64(1.0); 3]);
+        image
+    }
+
+    fn apply(
+        raw: &ImageBuf,
+        scatter: f64,
+        strength: [f64; 3],
+        radius: [f64; 3],
+        spatial_scale: f64,
+        renormalize: bool,
+    ) -> ImageBuf {
+        apply_halation_um(
+            raw,
+            1.0,
+            scatter,
+            1.0,
+            [1.0; 3],
+            [2.0; 3],
+            [0.7; 3],
+            1.0,
+            spatial_scale,
+            strength,
+            radius,
+            3,
+            0.5,
+            renormalize,
+            &CpuBackend,
+        )
+    }
+
+    #[test]
+    fn all_zero_halation_radii_are_noop_and_preserve_independent_scatter() {
+        let raw = impulse();
+        for renormalize in [false, true] {
+            let result = apply(&raw, 0.0, [0.25; 3], [0.0; 3], 1.0, renormalize);
+            assert_eq!(result.data, raw.data);
+        }
+        let scatter_only = apply(&raw, 1.0, [0.0; 3], [2.0; 3], 1.0, true);
+        assert_ne!(scatter_only.data, raw.data);
+        for (radius, scale) in [([0.0; 3], 1.0), ([2.0; 3], 0.0)] {
+            let result = apply(&raw, 1.0, [0.25; 3], radius, scale, true);
+            assert_eq!(result.data, scatter_only.data);
+        }
+    }
+
+    #[test]
+    fn zero_radius_channels_keep_energy_when_other_channels_blur() {
+        let raw = impulse();
+        let radius = [0.0, 2.0, 0.0];
+        let result = apply(&raw, 0.0, [0.25; 3], radius, 1.0, true);
+        for c in [0, 2] {
+            assert_eq!(result.extract_channel(c), raw.extract_channel(c));
+        }
+        assert!(result.get(3, 3)[1] < raw.get(3, 3)[1]);
+        assert!(result.get(3, 2)[1] > raw.get(3, 2)[1]);
+
+        let result = apply(&raw, 0.0, [0.25; 3], radius, 1.0, false);
+        assert_eq!(result.get(3, 3)[0], from_f64(1.25));
+        assert_eq!(result.get(3, 3)[2], from_f64(1.25));
+    }
 }

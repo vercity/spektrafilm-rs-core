@@ -79,8 +79,10 @@ pub struct CameraParams {
     pub lens_blur_um: f32,
     #[serde(default = "default_35")]
     pub film_format_mm: f32,
+    /// UV cutoff as [strength, center in nanometers, transition width in nanometers].
     #[serde(default = "default_filter_uv")]
     pub filter_uv: [f32; 3],
+    /// IR cutoff as [strength, center in nanometers, transition width in nanometers].
     #[serde(default = "default_filter_ir")]
     pub filter_ir: [f32; 3],
     #[serde(default)]
@@ -280,10 +282,12 @@ pub struct HalationParams {
     pub boost_range: f32,
     #[serde(default = "default_4")]
     pub protect_ev: f32,
-    #[serde(default = "default_halation_strength_f64")]
-    pub halation_strength: [f64; 3],
-    #[serde(default = "default_halation_sigma_f64")]
-    pub halation_first_sigma_um: [f64; 3],
+    /// Override the film stock's back-reflection strength.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halation_strength: Option<[f64; 3]>,
+    /// Override the film stock's first-bounce radius in micrometers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halation_first_sigma_um: Option<[f64; 3]>,
     #[serde(default = "default_3i")]
     pub halation_n_bounces: u32,
     #[serde(default = "default_half_f64")]
@@ -307,11 +311,31 @@ fn default_scatter_tail_f64() -> [f64; 3] {
 fn default_scatter_tail_weight_f64() -> [f64; 3] {
     [0.78, 0.65, 0.67]
 }
-fn default_halation_strength_f64() -> [f64; 3] {
-    [0.05, 0.015, 0.0]
-}
-fn default_halation_sigma_f64() -> [f64; 3] {
-    [65.0, 65.0, 65.0]
+impl HalationParams {
+    pub(crate) fn strength_and_sigma(
+        &self,
+        film: &crate::profile::Profile,
+    ) -> ([f64; 3], [f64; 3]) {
+        let preset = match (film.info.usage.as_str(), film.info.antihalation.as_str()) {
+            (usage @ ("still" | "cine"), layer @ ("strong" | "weak" | "no")) if film.is_film() => {
+                let sigma = if usage == "cine" { 50.0 } else { 65.0 };
+                let strength = match layer {
+                    "strong" => [0.015, 0.005, 0.0],
+                    "weak" => [0.08, 0.02, 0.0],
+                    _ => [0.30, 0.10, 0.015],
+                };
+                (strength, [sigma; 3])
+            }
+            _ => ([0.05, 0.015, 0.0], [65.0; 3]),
+        };
+        let strength = self.halation_strength.unwrap_or(preset.0);
+        let sigma = self.halation_first_sigma_um.unwrap_or(preset.1);
+        if film.is_bw() {
+            ([strength[0]; 3], [sigma[0]; 3])
+        } else {
+            (strength, sigma)
+        }
+    }
 }
 
 impl Default for HalationParams {
@@ -328,8 +352,8 @@ impl Default for HalationParams {
             boost_ev: 0.0,
             boost_range: 0.3,
             protect_ev: 4.0,
-            halation_strength: [0.05, 0.015, 0.0],
-            halation_first_sigma_um: [65.0, 65.0, 65.0],
+            halation_strength: None,
+            halation_first_sigma_um: None,
             halation_n_bounces: 3,
             halation_bounce_decay: 0.5,
             halation_renormalize: true,
