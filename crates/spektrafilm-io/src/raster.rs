@@ -270,6 +270,9 @@ fn write_png(
     {
         encoder.add_itxt_chunk("XML:com.adobe.xmp".into(), text.into())?;
     }
+    if let Some(profile) = metadata.png_iptc_text() {
+        encoder.add_ztxt_chunk("Raw profile type iptc".into(), profile)?;
+    }
     let mut output = encoder.write_header()?;
     if depth == 8 {
         output.write_image_data(&quantize8(image))?;

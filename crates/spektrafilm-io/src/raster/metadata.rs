@@ -27,6 +27,7 @@ const EXIF_IFD: u16 = 0x8769;
 const GPS_IFD: u16 = 0x8825;
 const XMP_TAG: u16 = 700;
 const PHOTOSHOP_TAG: u16 = 34377;
+const IPTC_NAA_TAG: u16 = 33723;
 
 type Tags = Vec<(u16, Value)>;
 
@@ -73,9 +74,16 @@ impl RasterMetadata {
         if metadata.xmp.is_none() {
             metadata.xmp = decoder.xmp_metadata().ok().flatten();
         }
-        if format == Some(ImageFormat::Jpeg) {
-            metadata.photoshop = decoder.iptc_metadata().ok().flatten();
-        }
+        metadata.photoshop = match format {
+            Some(ImageFormat::Jpeg) => decoder.iptc_metadata().ok().flatten(),
+            Some(ImageFormat::Png) => decoder
+                .iptc_metadata()
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(decode_png_iptc),
+            _ => metadata.photoshop,
+        };
         metadata
     }
 
@@ -86,6 +94,32 @@ impl RasterMetadata {
             Value::Byte(bytes) | Value::Undefined(bytes) => Some(bytes.clone()),
             _ => None,
         };
+        let mut photoshop = packet(PHOTOSHOP_TAG);
+        if photoshop.as_deref().and_then(iptc_resource).is_none() {
+            if let Some(value) = root.entries().get(&IPTC_NAA_TAG) {
+                let iim = match &value.value {
+                    // TIFF stores IIM in a LONG array. Restore the bytes in
+                    // the file's order without reversing individual words.
+                    Value::Long(words) => Some(
+                        words
+                            .iter()
+                            .flat_map(|&word| {
+                                if decoder.little_endian() {
+                                    word.to_le_bytes()
+                                } else {
+                                    word.to_be_bytes()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Value::Byte(bytes) | Value::Undefined(bytes) => Some(bytes.clone()),
+                    _ => None,
+                };
+                if let Some(resource) = iim.as_deref().and_then(wrap_iim) {
+                    photoshop.get_or_insert_with(Vec::new).extend(resource);
+                }
+            }
+        }
         Some(Self {
             // Descriptive IFD0 entries only. File layout offsets belong to the
             // new encoder, as do orientation, software and pixel dimensions.
@@ -100,7 +134,7 @@ impl RasterMetadata {
             gps: copy_tags(root.get_sub_ifd(GPS_IFD), |_| true),
             xmp: packet(XMP_TAG),
             icc: packet(34675),
-            photoshop: packet(PHOTOSHOP_TAG),
+            photoshop,
         })
     }
 
@@ -204,6 +238,20 @@ impl RasterMetadata {
         Ok(())
     }
 
+    pub(super) fn png_iptc_text(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        let data = iptc_resource(self.photoshop.as_deref()?)?;
+        let mut text = format!("\niptc\n{:>8}\n", data.len());
+        for line in data.chunks(36) {
+            for byte in line {
+                write!(&mut text, "{byte:02x}").ok()?;
+            }
+            text.push('\n');
+        }
+        Some(text)
+    }
+
     pub(super) fn write_jpeg_packets(&self, file: &mut impl Write) -> Result<()> {
         if let Some(bytes) = &self.xmp {
             write_jpeg_packet(file, 0xe1, b"http://ns.adobe.com/xap/1.0/\0", bytes)?;
@@ -304,6 +352,72 @@ impl TiffValue for Undefined<'_> {
     }
 }
 
+// Adobe image resource 0x0404 wraps the IPTC Information Interchange Model.
+fn wrap_iim(data: &[u8]) -> Option<Vec<u8>> {
+    if !data.starts_with(&[0x1c]) {
+        return None;
+    }
+    let size = u32::try_from(data.len()).ok()?;
+    let mut resource = b"8BIM\x04\x04\0\0".to_vec();
+    resource.extend_from_slice(&size.to_be_bytes());
+    resource.extend_from_slice(data);
+    if size % 2 != 0 {
+        resource.push(0);
+    }
+    Some(resource)
+}
+
+fn iptc_resource(mut resources: &[u8]) -> Option<&[u8]> {
+    while resources.starts_with(b"8BIM") {
+        // The Pascal name and payload each occupy an even number of bytes.
+        let name_bytes = (1 + usize::from(*resources.get(6)?)).next_multiple_of(2);
+        let length_start = 6 + name_bytes;
+        let size = u32::from_be_bytes(
+            resources
+                .get(length_start..length_start + 4)?
+                .try_into()
+                .ok()?,
+        );
+        let end = (length_start + 4)
+            .checked_add(usize::try_from(size).ok()?)?
+            .checked_add(usize::from(size % 2 != 0))?;
+        if resources.get(4..6)? == b"\x04\x04" {
+            return resources.get(..end);
+        }
+        resources = resources.get(end..)?;
+    }
+    None
+}
+
+fn decode_png_iptc(text: &[u8]) -> Option<Vec<u8>> {
+    // Exiv2 and ImageMagick store IPTC as a hex-encoded PNG text profile.
+    let mut tokens = std::str::from_utf8(text).ok()?.split_ascii_whitespace();
+    if !matches!(tokens.next()?, "iptc" | "8bim") {
+        return None;
+    }
+    let len: usize = tokens.next()?.parse().ok()?;
+    if len > text.len() / 2 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len);
+    for line in tokens {
+        for pair in line.as_bytes().chunks(2) {
+            if pair.len() != 2 {
+                return None;
+            }
+            bytes.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+        }
+    }
+    if bytes.len() != len {
+        return None;
+    }
+    if iptc_resource(&bytes).is_some() {
+        Some(bytes)
+    } else {
+        wrap_iim(&bytes)
+    }
+}
+
 fn write_jpeg_packet(file: &mut impl Write, marker: u8, prefix: &[u8], data: &[u8]) -> Result<()> {
     if let Ok(length) = u16::try_from(2 + prefix.len() + data.len()) {
         file.write_all(&[0xff, marker])?;
@@ -312,4 +426,41 @@ fn write_jpeg_packet(file: &mut impl Write, marker: u8, prefix: &[u8], data: &[u
         file.write_all(data)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retains_long_iptc_in_tiff_and_png_text_profile() -> Result<()> {
+        let mut bytes = Cursor::new(Vec::new());
+        let mut encoder = TiffEncoder::new(&mut bytes)?;
+        let mut frame = encoder.new_image::<tiff::encoder::colortype::RGB8>(1, 1)?;
+        // IIM caption dataset (2:120), three bytes of text. The tag
+        // stores the eight bytes as native-endian 32-bit words.
+        let iim = b"\x1c\x02\x78\x00\x03abc";
+        let words = [
+            u32::from_ne_bytes([iim[0], iim[1], iim[2], iim[3]]),
+            u32::from_ne_bytes([iim[4], iim[5], iim[6], iim[7]]),
+        ];
+        frame
+            .encoder()
+            .write_tag(Tag::Unknown(IPTC_NAA_TAG), &words[..])?;
+        frame.write_data(&[0, 0, 0])?;
+        bytes.set_position(0);
+
+        let metadata = RasterMetadata::from_tiff(&mut bytes).unwrap();
+        let resource = wrap_iim(iim).unwrap();
+        assert_eq!(metadata.photoshop.as_deref(), Some(resource.as_slice()));
+        let png_text = metadata.png_iptc_text().unwrap();
+        assert_eq!(decode_png_iptc(png_text.as_bytes()), Some(resource));
+
+        let mut jpeg_packet = Vec::new();
+        metadata.write_jpeg_packets(&mut jpeg_packet)?;
+        assert_eq!(&jpeg_packet[..2], &[0xff, 0xed]);
+        assert_eq!(&jpeg_packet[4..18], b"Photoshop 3.0\0");
+        assert_eq!(&jpeg_packet[30..], iim);
+        Ok(())
+    }
 }
