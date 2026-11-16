@@ -5,6 +5,7 @@
 ///   2. Process virtual gray card through filming to get midgray spectral density
 ///   3. Compute print exposure normalization factor from midgray spectral density
 ///   4. Pass all calibration data to the pipeline stages
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
@@ -564,7 +565,10 @@ impl Pipeline {
         {
             return None;
         }
-        tracing::info!(backend = backend.name(), "pipeline: borrowed resident start");
+        tracing::info!(
+            backend = backend.name(),
+            "pipeline: borrowed resident start"
+        );
         let color_ref = crate::color_reference::ColorReference::compute_with_preflash(
             &self.film,
             &self.print,
@@ -584,11 +588,10 @@ impl Pipeline {
     }
 
     fn can_render_resident(&self, backend: &dyn ComputeBackend) -> bool {
-        // The resident path consumes linear input and runs direct spectral
-        // integration. Staged rendering handles other requested modes.
+        // The resident path runs direct spectral integration. Staged
+        // rendering handles the internal print and scan LUTs.
         if !backend.is_gpu()
             || (self.tc_lut.is_none() && self.mallett_core.is_none())
-            || self.params.io.input_cctf() != spektrafilm_math::colorspace::Cctf::Linear
             || self.params.settings.use_scanner_lut
             || (!self.params.io.scan_film && self.params.settings.use_enlarger_lut)
         {
@@ -691,14 +694,35 @@ impl Pipeline {
         pix_um: f32,
         autoexposure_scale: f64,
     ) -> Option<ImageBuf> {
-        // Bake the exposure scale (auto-exposure × manual EV compensation)
+        // Match staged rendering for encoded raster inputs. The metered
+        // factor applies before decoding, then manual EV applies in linear RGB.
+        let input_cctf = self.params.io.input_cctf();
+        let (image, mut exposure_scale_f64) =
+            if input_cctf == spektrafilm_math::colorspace::Cctf::Linear {
+                (Cow::Borrowed(image), autoexposure_scale)
+            } else {
+                use rayon::prelude::*;
+                use spektrafilm_math::precision::from_f64;
+
+                let scale = from_f64(autoexposure_scale);
+                let linear = image
+                    .data
+                    .par_iter()
+                    .map(|&value| input_cctf.decode(value * scale))
+                    .collect();
+                (
+                    Cow::Owned(ImageBuf::from_data(image.width, image.height, linear)),
+                    1.0,
+                )
+            };
+
+        // Bake the remaining exposure scale
         // into the front-pass matrix. Both upsamplers (hanatos and mallett)
         // are homogeneous in the input RGB, so scaling the matrix is
         // equivalent to scaling the input — saves a separate "scale" compute
         // pass at the head of the chain. Auto-exposure metering itself stays
         // on CPU (~30 ms at 6 MP after the per-row rayon parallelization);
         // the result is a single float that's cheap to roll into the matrix.
-        let mut exposure_scale_f64 = autoexposure_scale;
         if self.params.camera.exposure_compensation_ev != 0.0 {
             exposure_scale_f64 *= 2.0f64.powf(self.params.camera.exposure_compensation_ev as f64);
         }
@@ -1099,7 +1123,7 @@ impl Pipeline {
             };
 
         let params = spektrafilm_gpu::FilmChainParams {
-            image,
+            image: &image,
             front,
             film_log_exposure: &film_log_exp,
             film_density_curves_normalized: &film_curves_norm,

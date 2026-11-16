@@ -37,7 +37,7 @@ pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
 /// Python samples a Gaussian-prefiltered image at up to 256 px on the long
 /// edge, then decodes the sample values and meters luminance Y.
 ///
-////// `method` selects the metering pattern: `average`, `median`,
+/// `method` selects the metering pattern: `average`, `median`,
 /// `center_weighted`, `partial`, `matrix`, `multi_zone`,
 /// `highlight_weighted`. Anything else meters a flat 1.0 (0 EV), matching
 /// the Python `else` branch.

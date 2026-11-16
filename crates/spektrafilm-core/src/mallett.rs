@@ -715,33 +715,45 @@ mod parity_tests {
             .collect();
         let img = ImageBuf::from_data(w, h, data);
 
-        let out_gpu = pipeline.process(img.clone(), &gpu);
-        let out_cpu = pipeline.process(img, &spektrafilm_gpu::cpu_backend::CpuBackend);
-
-        let mut max_diff = 0.0f64;
-        let mut max_at = (0usize, 0.0f64, 0.0f64);
-        let mut sum_diff = 0.0f64;
-        for (i, (g, c)) in out_gpu.data.iter().zip(out_cpu.data.iter()).enumerate() {
-            let d = (*g as f64 - *c as f64).abs();
-            if d > max_diff {
-                max_diff = d;
-                max_at = (i, *g as f64, *c as f64);
+        for encoded in [false, true] {
+            let mut params = pipeline.params.clone();
+            // Exercise metering before decoding on encoded inputs.
+            if encoded {
+                params.io.input_color_space = "sRGB".into();
+                params.io.input_cctf_decoding = true;
+                params.camera.auto_exposure = true;
             }
-            sum_diff += d;
+            let pipeline = pipeline.clone().with_params(params);
+            let out_gpu = pipeline
+                .process_resident_borrowed(&img, &gpu)
+                .expect("resident path for encoded and linear input");
+            let out_cpu = pipeline.process(img.clone(), &spektrafilm_gpu::cpu_backend::CpuBackend);
+
+            let mut max_diff = 0.0f64;
+            let mut max_at = (0usize, 0.0f64, 0.0f64);
+            let mut sum_diff = 0.0f64;
+            for (i, (g, c)) in out_gpu.data.iter().zip(out_cpu.data.iter()).enumerate() {
+                let d = (*g as f64 - *c as f64).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    max_at = (i, *g as f64, *c as f64);
+                }
+                sum_diff += d;
+            }
+            let mean_diff = sum_diff / out_cpu.data.len() as f64;
+            // Same budget as the hanatos resident chain on this input (measured
+            // mean 1.3e-3 / max 1.3e-2 vs mallett's 2.1e-3 / 2.6e-2): per-pixel
+            // outliers come from f32 density-curve interpolation, not the front
+            // pass. A wrong matrix would blow the mean by orders of magnitude.
+            assert!(mean_diff < 5e-3, "mean GPU↔CPU divergence: {mean_diff}");
+            assert!(
+                max_diff < 5e-2,
+                "max GPU↔CPU divergence: {max_diff} at idx {} (gpu {} vs cpu {})",
+                max_at.0,
+                max_at.1,
+                max_at.2
+            );
         }
-        let mean_diff = sum_diff / out_cpu.data.len() as f64;
-        // Same budget as the hanatos resident chain on this input (measured
-        // mean 1.3e-3 / max 1.3e-2 vs mallett's 2.1e-3 / 2.6e-2): per-pixel
-        // outliers come from f32 density-curve interpolation, not the front
-        // pass. A wrong matrix would blow the mean by orders of magnitude.
-        assert!(mean_diff < 5e-3, "mean GPU↔CPU divergence: {mean_diff}");
-        assert!(
-            max_diff < 5e-2,
-            "max GPU↔CPU divergence: {max_diff} at idx {} (gpu {} vs cpu {})",
-            max_at.0,
-            max_at.1,
-            max_at.2
-        );
     }
 
     /// An unknown upsampler method is rejected at calibration (mirrors upstream).
