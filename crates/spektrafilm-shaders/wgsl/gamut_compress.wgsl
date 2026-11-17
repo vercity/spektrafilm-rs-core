@@ -78,8 +78,12 @@ fn mv(r0: vec3<f32>, r1: vec3<f32>, r2: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(r0, v), dot(r1, v), dot(r2, v));
 }
 
+fn signed_pow(x: f32, exponent: f32) -> f32 {
+    return sign(x) * pow(abs(x), exponent);
+}
+
 fn cbrt(x: f32) -> f32 {
-    return sign(x) * pow(abs(x), 1.0 / 3.0);
+    return signed_pow(x, 1.0 / 3.0);
 }
 
 // Smooth Reinhard knee: identity below threshold, asymptotic at limit.
@@ -134,7 +138,7 @@ fn cam16_padc_forward(rgb: vec3<f32>) -> vec3<f32> {
 fn cam16_padc_inverse(rgb: vec3<f32>) -> vec3<f32> {
     let d = rgb - 0.1;
     let base = (27.13 * abs(d)) / (400.0 - abs(d));
-    return sign(d) * 100.0 / CAM16_F_L * pow(base, vec3<f32>(1.0 / 0.42));
+    return sign(d) * 100.0 / CAM16_F_L * sign(base) * pow(abs(base), vec3<f32>(1.0 / 0.42));
 }
 
 // XYZ (Y=1) → CAM16-UCS (Jp, ap, bp).
@@ -146,16 +150,21 @@ fn xyz_to_cam16ucs(xyz: vec3<f32>) -> vec3<f32> {
     let h = atan2_deg(b, a);
     let e_t = 0.25 * (cos(2.0 + radians(h)) + 3.8);
     let a_resp = (2.0 * p.x + p.y + p.z / 20.0 - 0.305) * CAM16_N_BB;
-    let jj = 100.0 * pow(max(a_resp, 0.0) / params.cam16_white.w, CAM16_CZ);
+    let jj = 100.0 * signed_pow(a_resp / params.cam16_white.w, CAM16_CZ);
     let denom = p.x + p.y + 21.0 * p.z / 20.0;
     var t = 0.0;
     if denom != 0.0 {
         t = CAM16_ECC * (e_t * sqrt(a * a + b * b)) / denom;
     }
-    let cc = pow(t, 0.9) * sqrt(jj / 100.0) * CAM16_CC_F;
+    let cc = signed_pow(t, 0.9) * signed_pow(jj / 100.0, 0.5) * CAM16_CC_F;
     let m = cc * CAM16_F_L_4;
     let jp = (1.0 + 100.0 * UCS_C1) * jj / (1.0 + UCS_C1 * jj);
-    let mp = (1.0 / UCS_C2) * log(1.0 + UCS_C2 * m);
+    // Undefined logarithmic chroma reconstructs with signed lightness alone.
+    var mp = 0.0;
+    let chroma_log = UCS_C2 * m;
+    if chroma_log > -1.0 {
+        mp = log(1.0 + chroma_log) / UCS_C2;
+    }
     let hr = radians(h);
     return vec3<f32>(jp, mp * cos(hr), mp * sin(hr));
 }
@@ -171,7 +180,7 @@ fn cam16ucs_to_xyz(jab: vec3<f32>) -> vec3<f32> {
     let j_prime = max(jj, 2.22044605e-16);
     let t = pow(cc / (sqrt(j_prime / 100.0) * CAM16_CC_F), 1.0 / 0.9);
     let e_t = 0.25 * (cos(2.0 + radians(h)) + 3.8);
-    let a_resp = params.cam16_white.w * pow(jj / 100.0, 1.0 / CAM16_CZ);
+    let a_resp = params.cam16_white.w * signed_pow(jj / 100.0, 1.0 / CAM16_CZ);
     var p1 = 0.0;
     if t != 0.0 {
         p1 = CAM16_ECC * e_t / t;

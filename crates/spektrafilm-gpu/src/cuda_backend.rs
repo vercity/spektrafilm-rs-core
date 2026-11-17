@@ -910,7 +910,11 @@ __device__ float3 mul_matrix_g(const float* m, float3 v) {
         make_float3(m[3], m[4], m[5]), make_float3(m[6], m[7], m[8]), v);
 }
 __device__ float sign_g(float x) { return (x > 0.0f) - (x < 0.0f); }
-__device__ float cbrt_signed_g(float x) { return sign_g(x) * powf(fabsf(x), 1.0f / 3.0f); }
+__device__ float signed_pow_g(float x, float p) {
+    return copysignf(powf(fabsf(x), p), x);
+}
+
+__device__ float cbrt_signed_g(float x) { return signed_pow_g(x, 1.0f / 3.0f); }
 __device__ float len2_g(float x, float y) { return sqrtf(x*x + y*y); }
 __device__ float radians_g(float d) { return d * 0.01745329251994329577f; }
 __device__ float degrees_g(float r) { return r * 57.295779513082320876f; }
@@ -986,9 +990,9 @@ __device__ float3 cam16_padc_inverse_g(float3 rgb) {
     float by = (27.13f * fabsf(d.y)) / (400.0f - fabsf(d.y));
     float bz = (27.13f * fabsf(d.z)) / (400.0f - fabsf(d.z));
     return make_float3(
-        sign_g(d.x) * 100.0f / fl * powf(bx, 1.0f / 0.42f),
-        sign_g(d.y) * 100.0f / fl * powf(by, 1.0f / 0.42f),
-        sign_g(d.z) * 100.0f / fl * powf(bz, 1.0f / 0.42f));
+        sign_g(d.x) * 100.0f / fl * signed_pow_g(bx, 1.0f / 0.42f),
+        sign_g(d.y) * 100.0f / fl * signed_pow_g(by, 1.0f / 0.42f),
+        sign_g(d.z) * 100.0f / fl * signed_pow_g(bz, 1.0f / 0.42f));
 }
 
 __device__ float3 xyz_to_cam16ucs_g(float3 xyz, const float* white) {
@@ -1004,13 +1008,16 @@ __device__ float3 xyz_to_cam16ucs_g(float3 xyz, const float* white) {
     float h = atan2_deg_g(b, a);
     float e_t = 0.25f * (cosf(2.0f + radians_g(h)) + 3.8f);
     float a_resp = (2.0f * p.x + p.y + p.z / 20.0f - 0.305f) * 1.0003040046f;
-    float jj = 100.0f * powf(fmaxf(a_resp, 0.0f) / white[3], 0.69f * 1.9272135955f);
+    float jj = 100.0f * signed_pow_g(a_resp / white[3], 0.69f * 1.9272135955f);
     float denom = p.x + p.y + 21.0f * p.z / 20.0f;
     float t = denom != 0.0f ? 3846.1538461538f * 1.0003040046f * (e_t * sqrtf(a*a + b*b)) / denom : 0.0f;
-    float cc = powf(t, 0.9f) * sqrtf(jj / 100.0f) * powf(1.64f - powf(0.29f, 0.2f), 0.73f);
+    float cc = signed_pow_g(t, 0.9f) * signed_pow_g(jj / 100.0f, 0.5f)
+        * powf(1.64f - powf(0.29f, 0.2f), 0.73f);
     float m = cc * powf(0.6839903846f, 0.25f);
     float jp = (1.0f + 100.0f * 0.007f) * jj / (1.0f + 0.007f * jj);
-    float mp = (1.0f / 0.0228f) * logf(1.0f + 0.0228f * m);
+    // Undefined logarithmic chroma reconstructs with signed lightness alone.
+    float chroma_log = 0.0228f * m;
+    float mp = chroma_log > -1.0f ? log1pf(chroma_log) / 0.0228f : 0.0f;
     float hr = radians_g(h);
     return make_float3(jp, mp * cosf(hr), mp * sinf(hr));
 }
@@ -1020,12 +1027,12 @@ __device__ float3 cam16ucs_to_xyz_g(float3 jab, const float* white) {
     float mp = len2_g(jab.y, jab.z);
     float h = atan2_deg_g(jab.z, jab.y);
     float jj = jp / ((1.0f + 100.0f * 0.007f) - 0.007f * jp);
-    float m = (expf(0.0228f * mp) - 1.0f) / 0.0228f;
+    float m = expm1f(0.0228f * mp) / 0.0228f;
     float cc = m / powf(0.6839903846f, 0.25f);
     float j_prime = fmaxf(jj, 2.22044605e-16f);
     float t = powf(cc / (sqrtf(j_prime / 100.0f) * powf(1.64f - powf(0.29f, 0.2f), 0.73f)), 1.0f / 0.9f);
     float e_t = 0.25f * (cosf(2.0f + radians_g(h)) + 3.8f);
-    float a_resp = white[3] * powf(jj / 100.0f, 1.0f / (0.69f * 1.9272135955f));
+    float a_resp = white[3] * signed_pow_g(jj / 100.0f, 1.0f / (0.69f * 1.9272135955f));
     float p1 = t != 0.0f ? 3846.1538461538f * 1.0003040046f * e_t / t : 0.0f;
     float p2 = a_resp / 1.0003040046f + 0.305f;
     float hr = radians_g(h);
@@ -1064,10 +1071,6 @@ __device__ constexpr float JZ_C2 = 2413.0f / 128.0f;
 __device__ constexpr float JZ_C3 = 2392.0f / 128.0f;
 __device__ constexpr float JZ_M1 = 2610.0f / 16384.0f;
 __device__ constexpr float JZ_M2 = 1.7f * 2523.0f / 32.0f;
-
-__device__ float signed_pow_g(float x, float p) {
-    return copysignf(powf(fabsf(x), p), x);
-}
 
 __device__ float jz_pq_forward_g(float lms) {
     float powered = signed_pow_g(lms / 100.0f, JZ_M1);

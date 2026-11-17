@@ -594,7 +594,7 @@ fn cam16_padc_inverse(rgb: [f64; 3]) -> [f64; 3] {
     for i in 0..3 {
         let d = rgb[i] - 0.1;
         let base = (27.13 * d.abs()) / (400.0 - d.abs());
-        out[i] = d.signum() * 100.0 / CAM16_F_L * base.powf(1.0 / 0.42);
+        out[i] = d.signum() * 100.0 / CAM16_F_L * signed_pow(base, 1.0 / 0.42);
     }
     out
 }
@@ -614,17 +614,26 @@ fn xyz_to_cam16ucs(xyz: [f64; 3], white: Cam16White) -> [f64; 3] {
     let h = atan2_deg(b, a);
     let e_t = 0.25 * ((2.0 + h * std::f64::consts::PI / 180.0).cos() + 3.8);
     let a_resp = (2.0 * ra + ga + ba / 20.0 - 0.305) * CAM16_N_BB;
-    let jj = 100.0 * (a_resp / white.response).powf(CAM16_C * CAM16_Z);
+    let jj = 100.0 * signed_pow(a_resp / white.response, CAM16_C * CAM16_Z);
     let denom = ra + ga + 21.0 * ba / 20.0;
     let t = if denom != 0.0 {
         (50000.0 / 13.0) * CAM16_N_C * CAM16_N_CB * (e_t * (a * a + b * b).sqrt()) / denom
     } else {
         0.0
     };
-    let cc = t.powf(0.9) * (jj / 100.0).powf(0.5) * (1.64 - 0.29f64.powf(CAM16_N)).powf(0.73);
+    let cc = signed_pow(t, 0.9)
+        * signed_pow(jj / 100.0, 0.5)
+        * (1.64 - 0.29f64.powf(CAM16_N)).powf(0.73);
     let m = cc * CAM16_F_L.powf(0.25);
     let jp = (1.0 + 100.0 * UCS_C1) * jj / (1.0 + UCS_C1 * jj);
-    let mp = (1.0 / UCS_C2) * (1.0 + UCS_C2 * m).ln();
+    // Colour's inverse keeps only the achromatic response when the
+    // logarithmic chroma of an extended-range pixel is undefined.
+    let chroma_log = UCS_C2 * m;
+    let mp = if chroma_log > -1.0 {
+        chroma_log.ln_1p() / UCS_C2
+    } else {
+        0.0
+    };
     let hr = h * std::f64::consts::PI / 180.0;
     [jp, mp * hr.cos(), mp * hr.sin()]
 }
@@ -635,13 +644,13 @@ fn cam16ucs_to_xyz(jab: [f64; 3], white: Cam16White) -> [f64; 3] {
     let mp = (ap * ap + bp * bp).sqrt();
     let h = atan2_deg(bp, ap);
     let jj = jp / ((1.0 + 100.0 * UCS_C1) - UCS_C1 * jp);
-    let m = ((UCS_C2 * mp).exp() - 1.0) / UCS_C2;
+    let m = (UCS_C2 * mp).exp_m1() / UCS_C2;
     let cc = m / CAM16_F_L.powf(0.25);
     let j_prime = jj.max(f64::EPSILON);
     let t = (cc / ((j_prime / 100.0).sqrt() * (1.64 - 0.29f64.powf(CAM16_N)).powf(0.73)))
         .powf(1.0 / 0.9);
     let e_t = 0.25 * ((2.0 + h * std::f64::consts::PI / 180.0).cos() + 3.8);
-    let a_resp = white.response * (jj / 100.0).powf(1.0 / (CAM16_C * CAM16_Z));
+    let a_resp = white.response * signed_pow(jj / 100.0, 1.0 / (CAM16_C * CAM16_Z));
     let p1 = if t != 0.0 {
         (50000.0 / 13.0) * CAM16_N_C * CAM16_N_CB * e_t / t
     } else {
@@ -853,6 +862,31 @@ mod tests {
             let gpu = comp.gpu_params().unwrap();
             assert_eq!(gpu.mode, spektrafilm_gpu::GamutMode::Cam16ucs);
             assert_eq!(gpu.target.name(), target);
+        }
+    }
+
+    #[test]
+    fn cam16ucs_preserves_signed_lightness_below_black() {
+        let params = OutputGamutCompressParams::default();
+        for (target, expected) in [
+            (
+                "DCI-P3",
+                [-0.008_287_031_476, -0.008_042_001_813, -0.008_137_953_822],
+            ),
+            (
+                "Display P3",
+                [-0.007_540_716_123, -0.007_409_805_518, -0.007_378_748_681],
+            ),
+            (
+                "ProPhoto RGB",
+                [-0.078_304_226_014, -0.077_950_152_323, -0.079_298_662_671],
+            ),
+        ] {
+            let comp = OutputGamutCompress::build(&params, target);
+            let rgb = comp.compress([-0.25, 0.0, 0.5]);
+            for (actual, expected) in rgb.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6, "{target}: {rgb:?}");
+            }
         }
     }
 
