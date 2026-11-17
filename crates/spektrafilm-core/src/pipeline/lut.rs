@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use super::Pipeline;
 use crate::color_reference::ColorReference;
-use crate::params::RuntimeParams;
+use crate::params::{InputGamutCompressParams, RuntimeParams};
 use crate::profile::Profile;
 use crate::stages::{filming, printing, scanning};
 
@@ -130,6 +130,14 @@ impl LutPipeline {
         params.scanner.lens_blur = 0.0;
         params.scanner.unsharp_mask = [0.0, 0.0];
         Pipeline::new_with_spectral(film, print, params, data_dir).map(Self)
+    }
+
+    /// Input compression settings and the film's reference illuminant for LUT QA.
+    pub fn input_gamut_qa(&self) -> (&InputGamutCompressParams, &str) {
+        (
+            &self.0.params.io.input_gamut_compress,
+            &self.0.film.info.reference_illuminant,
+        )
     }
 
     /// Collect `log_e_film` from `rgb_in`.

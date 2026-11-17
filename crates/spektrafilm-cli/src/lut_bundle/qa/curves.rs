@@ -102,8 +102,10 @@ pub(super) fn planckian(cube: &Cube, frame: Frame) -> Planckian {
         let [x, y] = white_xy(cct);
         let rgb = mat_vec(from_xyz, [x / y, 1.0, (1.0 - x - y) / y]);
         let peak = rgb.into_iter().fold(1e-6_f64, f64::max);
-        let code = rgb
-            .map(|v| f64::from(frame.input.encode((v / peak).clamp(0.0, 1.0) / frame.gain) as f32));
+        let code = frame
+            .input
+            .encode(rgb.map(|v| (v / peak).clamp(0.0, 1.0) / frame.gain))
+            .map(|value| f64::from(value as f32));
         chromaticity(to_xyz_qa(cube.trilinear(code), frame.output))
     });
     let max_bend_angle_deg = output_xy

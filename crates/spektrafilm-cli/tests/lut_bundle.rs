@@ -220,6 +220,15 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
     assert_eq!(qa_report["planckian_sweep"]["cct_range_k"], "2700-10000");
     assert_eq!(qa_report["spectral_locus_envelope"]["cube_cells"], 125);
     assert!(qa_report["spectral_locus_envelope"]["near_locus_fraction"].is_number());
+    let compression = &qa_report["input_gamut_compression"];
+    assert_eq!(
+        compression["input_gamut_compression_preview"]["reference_illuminant"],
+        "D55"
+    );
+    assert_eq!(
+        compression["input_gamut_compression_smoothness"]["probe_samples"],
+        720
+    );
     assert_eq!(html.matches("data:image/png;base64,").count(), 9);
     assert!(html.contains("Noise sensitivity"));
     assert!(html.contains("Dynamic range usage"));

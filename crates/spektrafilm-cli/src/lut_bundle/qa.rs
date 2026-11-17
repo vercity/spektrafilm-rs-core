@@ -15,6 +15,7 @@ use super::transport::Encoding;
 mod curves;
 mod diagnostics;
 mod gamut_edge;
+mod input_gamut;
 mod model_usage;
 mod report;
 mod spectral_envelope;
@@ -220,6 +221,8 @@ pub(super) struct Metrics {
     spectral_locus_envelope: spectral_envelope::Envelope,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_gamut_edge_stress: Option<gamut_edge::Outcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_gamut_compression: Option<input_gamut::Outcome>,
 }
 
 #[derive(Clone, Copy)]
@@ -302,15 +305,24 @@ pub(super) fn evaluate(
         rg_plane_slices: model_usage::rg_planes(&effective, frame)?,
         spectral_locus_envelope: spectral_envelope::evaluate(&effective, frame)?,
         output_gamut_edge_stress: None,
+        input_gamut_compression: None,
     })
 }
 
 impl Metrics {
-    pub(super) fn gamut_edge_stress(
+    pub(super) fn gamut_diagnostics(
         &mut self,
         frame: Frame,
         pipeline: &spektrafilm_core::pipeline::LutPipeline,
     ) {
+        self.input_gamut_compression = Some(
+            match input_gamut::evaluate(self.rg_plane_slices.cube_resolution, frame, pipeline) {
+                Ok(reports) => input_gamut::Outcome::Reports(Box::new(reports)),
+                Err(error) => input_gamut::Outcome::Error {
+                    error: format!("{error:#}"),
+                },
+            },
+        );
         self.output_gamut_edge_stress = Some(match gamut_edge::evaluate(frame, pipeline) {
             Ok(panels) => gamut_edge::Outcome::Panels(panels),
             Err(error) => gamut_edge::Outcome::Error {

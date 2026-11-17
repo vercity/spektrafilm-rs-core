@@ -116,6 +116,7 @@ figcaption{{font-size:.92em}}section+section{{margin-top:2.5rem}}
     }
     model_usage(&mut html, metrics)?;
     spectral_envelope(&mut html, metrics)?;
+    input_gamut(&mut html, metrics)?;
     html.push_str("</main></html>\n");
     fs::write(directory.join("report.html"), html)
         .with_context(|| format!("writing QA report in {}", directory.display()))
@@ -280,7 +281,7 @@ fn spectral_envelope(html: &mut String, metrics: &Metrics) -> Result<()> {
         r##"<figure><svg viewBox="0 0 {SIDE} {SIDE}" role="img" aria-label="Output chromaticity map with reference gamut and spectral locus" style="max-width:32rem"><image width="{SIDE}" height="{SIDE}" href="data:image/png;base64,{}"/><polygon fill="none" stroke="#aaa" opacity=".6" points=""##,
         STANDARD.encode(&envelope.png)
     )?;
-    for xy in envelope.locus {
+    for &xy in envelope.locus {
         let [x, y] = project(xy);
         write!(html, "{x:.2} {y:.2} ")?;
     }
@@ -295,6 +296,105 @@ fn spectral_envelope(html: &mut String, metrics: &Metrics) -> Result<()> {
         html,
         r##"<circle cx="{x:.2}" cy="{y:.2}" r="2.5" fill="#eee"><title>Output white point</title></circle></svg><figcaption>The white triangle marks the output gamut. The marked point is its reference white.</figcaption></figure></section>"##
     )?;
+    Ok(())
+}
+
+fn input_gamut(html: &mut String, metrics: &Metrics) -> Result<()> {
+    use super::{
+        input_gamut::Outcome,
+        spectral_envelope::{SIDE, project},
+    };
+    use spektrafilm_core::input_gamut::spectral_locus_xy;
+
+    let Some(outcome) = &metrics.input_gamut_compression else {
+        return Ok(());
+    };
+    html.push_str("<section><h2>Input gamut compression</h2>");
+    let reports = match outcome {
+        Outcome::Reports(reports) => reports,
+        Outcome::Error { error } => {
+            write!(html, "<p>{}</p></section>", escape(error))?;
+            return Ok(());
+        }
+    };
+
+    let open_plot = |html: &mut String, label: &str| -> Result<()> {
+        write!(
+            html,
+            r##"<figure><svg viewBox="0 0 {SIDE} {SIDE}" role="img" aria-label="{label}" style="max-width:32rem;background:#0a0a0a">"##
+        )?;
+        xy_shape(html, spectral_locus_xy(), "polygon", "#bbb", 0.7)?;
+        xy_shape(html, &reports.primaries, "polygon", "#ffef68", 0.7)?;
+        let [x, y] = project(reports.white);
+        write!(
+            html,
+            r##"<circle cx="{x:.2}" cy="{y:.2}" r="3" fill="#ddd"><title>Film reference illuminant</title></circle>"##
+        )?;
+        Ok(())
+    };
+    html.push_str("<h3>Compression preview</h3><p>Sampled LUT inputs projected into the film reference frame. Red dots are outside the visible spectral locus. Orange lines connect a selection of moved points to their cyan destinations.</p>");
+    metric_table(html, &serde_json::to_value(&reports.preview)?)?;
+    open_plot(
+        html,
+        "Original and compressed locations of LUT inputs in CIE xy",
+    )?;
+    for sample in &reports.preview.samples {
+        let [x, y] = project(sample.original);
+        let [cx, cy] = project(sample.compressed);
+        let dot = if sample.in_locus {
+            "#60dd9a"
+        } else {
+            "#ff6262"
+        };
+        let alpha = if sample.in_locus { 0.32 } else { 0.65 };
+        write!(
+            html,
+            r#"<circle cx="{x:.2}" cy="{y:.2}" r="1.4" fill="{dot}" opacity="{alpha}"/>"#
+        )?;
+        if (cx - x).hypot(cy - y) > 0.55 {
+            write!(
+                html,
+                r##"<path d="M{x:.2} {y:.2} L{cx:.2} {cy:.2}" stroke="#fa5" opacity=".34"/><circle cx="{cx:.2}" cy="{cy:.2}" r="1.4" fill="#6df" opacity=".8"/>"##
+            )?;
+        }
+    }
+    html.push_str("</svg></figure>");
+
+    html.push_str("<h3>Circumferential smoothness</h3><p>The hue-colored points show the compressed path of a ring about the film reference white. Closely or unevenly spaced points show where compression changes speed.</p>");
+    metric_table(html, &serde_json::to_value(&reports.smoothness)?)?;
+    open_plot(
+        html,
+        "Chromaticity ring before and after input gamut compression",
+    )?;
+    xy_shape(html, &reports.smoothness.original, "polygon", "#888", 0.6)?;
+    for (i, &xy) in reports.smoothness.compressed.iter().enumerate() {
+        let [x, y] = project(xy);
+        let hue = i as f64 * 360.0 / reports.smoothness.compressed.len() as f64;
+        write!(
+            html,
+            r#"<circle cx="{x:.2}" cy="{y:.2}" r="1.7" fill="hsl({hue:.1} 100% 65%)"/>"#
+        )?;
+    }
+    html.push_str("</svg></figure></section>");
+    Ok(())
+}
+
+fn xy_shape(
+    html: &mut String,
+    points: &[[f64; 2]],
+    element: &str,
+    stroke: &str,
+    opacity: f64,
+) -> Result<()> {
+    write!(
+        html,
+        r#"<{element} fill="none" stroke="{stroke}" opacity="{opacity}" points=""#
+    )?;
+    for &xy in points {
+        let [x, y] = super::spectral_envelope::project(xy);
+        write!(html, "{x:.2} {y:.2} ")?;
+    }
+    html.push_str(r#""/>"#);
     Ok(())
 }
 

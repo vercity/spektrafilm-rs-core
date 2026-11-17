@@ -577,7 +577,7 @@ impl BundleWriter<'_> {
             gain: self.baker.gain,
         };
         let mut metrics = qa::evaluate(self.directory, &paths, samples, &live, frame)?;
-        metrics.gamut_edge_stress(frame, pipeline);
+        metrics.gamut_diagnostics(frame, pipeline);
         Ok(metrics)
     }
 }

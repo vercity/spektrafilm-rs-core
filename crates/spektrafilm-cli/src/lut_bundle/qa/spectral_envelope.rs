@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Serialize;
-use spektrafilm_math::spectral::{CMF_X_F64, CMF_Y_F64, CMF_Z_F64};
+use spektrafilm_core::input_gamut::spectral_locus_xy;
 
 use super::{Cube, Frame, curves::chromaticity, gamut_edge::encode_png, to_xyz_qa};
 
@@ -14,7 +14,7 @@ pub(super) struct Envelope {
     inside_output_gamut_fraction: f64,
     near_locus_fraction: f64,
     #[serde(skip)]
-    pub(super) locus: [[f64; 2]; 65],
+    pub(super) locus: &'static [[f64; 2]],
     #[serde(skip)]
     pub(super) primaries: [[f64; 2]; 3],
     #[serde(skip)]
@@ -28,11 +28,10 @@ pub(super) fn project([x, y]: [f64; 2]) -> [f64; 2] {
     [(x + 0.05) / 0.90 * side, (0.95 - y) * side]
 }
 
-fn inside_triangle([x, y]: [f64; 2], tri: [[f64; 2]; 3]) -> bool {
+pub(super) fn inside_polygon([x, y]: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     let mut inside = false;
-    for i in 0..3 {
-        let [xx, yy] = tri[i];
-        let [xn, yn] = tri[(i + 1) % 3];
+    for (i, &[xx, yy]) in polygon.iter().enumerate() {
+        let [xn, yn] = polygon[(i + 1) % polygon.len()];
         // Count intersections of a ray toward positive x. This uses the
         // half-open interval convention of the report's Python path.
         if (yy >= y) != (yn >= y) && x <= xx + (xn - xx) * (y - yy) / (yn - yy) {
@@ -46,8 +45,7 @@ pub(super) fn evaluate(cube: &Cube, frame: Frame) -> Result<Envelope> {
     // Python spectral_locus_xy uses 380 to 700 nm at 5 nm. The end of
     // the purple line belongs to the drawn polygon but the metric only
     // measures distance to the sampled loci.
-    let locus: [[f64; 2]; 65] =
-        std::array::from_fn(|i| chromaticity([CMF_X_F64[i], CMF_Y_F64[i], CMF_Z_F64[i]]));
+    let locus = spectral_locus_xy();
     let space = frame.output.space();
     let primaries = space.primaries();
     let white = space.white_xy();
@@ -62,7 +60,7 @@ pub(super) fn evaluate(cube: &Cube, frame: Frame) -> Result<Envelope> {
             continue;
         }
         valid_cells += 1;
-        inside += usize::from(inside_triangle([x, y], primaries));
+        inside += usize::from(inside_polygon([x, y], &primaries));
         near += usize::from(locus.iter().any(|&[lx, ly]| (lx - x).hypot(ly - y) < 0.02));
 
         let projected = project([x, y]);

@@ -20,7 +20,7 @@ use crate::gamut_compression::{
 /// CIE 1931 2° visible spectral locus as a closed xy polygon, sampled at 5 nm
 /// from 380 to 700 nm (65 vertices + the first repeated). Mirrors upstream
 /// `spectral_locus_xy()`; the CMFs are the same colour-science values.
-fn spectral_locus_xy() -> &'static [[f64; 2]] {
+pub fn spectral_locus_xy() -> &'static [[f64; 2]] {
     // Wavelengths 380..=700 step 5 → indices 0..65 of the 380..780 grid.
     const VERTICES: usize = 65;
     static LOCUS: OnceLock<[[f64; 2]; VERTICES + 1]> = OnceLock::new();
@@ -200,6 +200,15 @@ impl InputGamutCompress {
         !matches!(self.algorithm, Algorithm::Off)
     }
 
+    /// Apply this compressor in the film's CIE xy frame before LUT resampling.
+    pub fn compress_xy(&self, xy: [f64; 2], ref_xy: [f64; 2]) -> [f64; 2] {
+        match self.algorithm {
+            Algorithm::Off => xy,
+            Algorithm::Xy => compress_xy_radial(xy, ref_xy, self.knee, spectral_locus_xy()),
+            Algorithm::Oklch => compress_oklch_chroma(xy, self.knee),
+        }
+    }
+
     /// Bake the compression into a freshly resampled copy of `lut`. For each
     /// LUT cell we decode its tc index to CIE xy, compress, re-encode to tc,
     /// and bilinearly sample the original LUT there (clamp-to-edge boundary,
@@ -219,13 +228,7 @@ impl InputGamutCompress {
                 // Step 1: tc cell → CIE xy.
                 let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
                 // Step 2: compress.
-                let cxy = match self.algorithm {
-                    Algorithm::Off => [x, y],
-                    Algorithm::Xy => {
-                        compress_xy_radial([x, y], ref_xy, self.knee, spectral_locus_xy())
-                    }
-                    Algorithm::Oklch => compress_oklch_chroma([x, y], self.knee),
-                };
+                let cxy = self.compress_xy([x, y], ref_xy);
                 // Step 3: compressed xy → tc.
                 let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
                 // Step 4: bilinear sample original LUT at (tx, ty) grid coords.
