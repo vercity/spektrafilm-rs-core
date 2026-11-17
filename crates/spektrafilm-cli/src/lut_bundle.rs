@@ -18,6 +18,7 @@ use spektrafilm_math::{
     precision::{from_f32, to_f64},
 };
 
+mod camera_curves;
 mod delivery;
 mod qa;
 mod transport;
@@ -46,7 +47,7 @@ pub(crate) struct BundleOptions {
     /// Color space and transfer of the encoded input.
     #[arg(long, value_enum, default_value = "srgb")]
     input_encoding: Encoding,
-    /// Color space and transfer of the output. V-Log is an input format.
+    /// Color space and transfer of the output. Camera log encodings are input-only.
     #[arg(long, value_enum, default_value = "srgb")]
     output_encoding: Encoding,
     /// Headroom for input code 1.0. Accepts native, auto, or a numeric stop count.
@@ -319,7 +320,9 @@ impl Baker {
         if tap == Tap::RgbIn {
             let data = grid
                 .flat_map(|rgb| {
-                    rgb.map(|value| from_f32((self.input.decode(value) * self.gain) as f32))
+                    self.input
+                        .decode(rgb)
+                        .map(|value| from_f32((value * self.gain) as f32))
                 })
                 .collect();
             return Ok(Samples::Input(ImageBuf::from_data(width, height, data)));
@@ -348,9 +351,9 @@ impl Baker {
             let gain = self.output.output_gain();
             values
                 .map(|pixel| {
-                    std::array::from_fn(|c| {
-                        self.output.encode(to_f64(pixel[c]) * gain).clamp(0.0, 1.0)
-                    })
+                    self.output
+                        .encode(std::array::from_fn(|c| to_f64(pixel[c]) * gain))
+                        .map(|code| code.clamp(0.0, 1.0))
                 })
                 .collect()
         } else {
@@ -607,8 +610,9 @@ pub(crate) fn export(options: BundleOptions) -> Result<()> {
         );
     }
     ensure!(
-        options.output_encoding != Encoding::VLog,
-        "V-Log is a bundle input encoding"
+        options.output_encoding.supports_output(),
+        "{} is an input-only bundle encoding",
+        options.output_encoding.name()
     );
     delivery::validate_target(
         &options.delivery,

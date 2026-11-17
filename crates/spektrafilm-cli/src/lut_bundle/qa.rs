@@ -327,38 +327,15 @@ pub(super) fn write_report(directory: &Path, prints: Vec<(String, Metrics)>) -> 
 
 const D65: [f64; 3] = [0.950_455_927_051_671_6, 1.0, 1.089_057_750_759_878_4];
 
-// colour-science uses distinct published matrices for sRGB and BT.709,
-// although their primaries match. The runtime shares sRGB's working space.
-const BT709_TO_XYZ: [[f64; 3]; 3] = [
-    [
-        0.412_390_799_265_959_34,
-        0.357_584_339_383_877_96,
-        0.180_480_788_401_834_32,
-    ],
-    [
-        0.212_639_005_871_510_3,
-        0.715_168_678_767_755_9,
-        0.072_192_315_360_733_73,
-    ],
-    [
-        0.019_330_818_715_591_825,
-        0.119_194_779_794_625_95,
-        0.950_532_152_249_660_8,
-    ],
-];
-
 fn mat_vec(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
     matrix.map(|row| row.iter().zip(vector).map(|(a, b)| a * b).sum())
 }
 
 fn to_xyz_qa(code: [f64; 3], output: Encoding) -> [f64; 3] {
-    let linear = code.map(|c| output.decode(c) / output.output_gain());
-    let matrix = if output == Encoding::Rec709 {
-        BT709_TO_XYZ
-    } else {
-        output.space().to_xyz()
-    };
-    mat_vec(matrix, linear)
+    let linear = output
+        .decode(code)
+        .map(|value| value / output.output_gain());
+    mat_vec(output.space().to_xyz(), linear)
 }
 
 struct QaCoordinates {

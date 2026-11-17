@@ -20,7 +20,7 @@ pub struct RasterColor {
 
 impl RasterColor {
     pub fn new(name: &str, encoded: bool) -> Option<Self> {
-        let space = RgbSpace::from_name(name)?;
+        let space = RgbSpace::from_name(name).filter(|space| RgbSpace::ALL.contains(space))?;
         Some(Self {
             color_space: space.name(),
             cctf_encoding: encoded && space.transfer() != Cctf::Linear,
@@ -34,6 +34,10 @@ fn profile(space: RgbSpace) -> ColorProfile {
         RgbSpace::ProPhoto => ColorProfile::new_pro_photo_rgb(),
         RgbSpace::Rec2020 => ColorProfile::new_bt2020(),
         RgbSpace::Aces2065 => ColorProfile::new_aces_aces_2065_1_linear(),
+        RgbSpace::Rec709 => ColorProfile::new_srgb(),
+        RgbSpace::DisplayP3 => ColorProfile::new_display_p3(),
+        RgbSpace::DciP3 => ColorProfile::new_dci_p3(),
+        RgbSpace::AdobeRgb => ColorProfile::new_adobe_rgb(),
         RgbSpace::VGamut => {
             // Both spaces use D65, so reuse the same Bradford adaptation to
             // the ICC D50 connection space when building the colorants.
@@ -49,6 +53,7 @@ fn profile(space: RgbSpace) -> ColorProfile {
             profile.blue_colorant = colorant(2);
             profile
         }
+        _ => unreachable!("runtime-only RGB space cannot be a RasterColor"),
     }
 }
 
@@ -62,6 +67,8 @@ pub(super) fn make_icc(color: RasterColor) -> Result<Option<Vec<u8>>> {
     let mut profile = profile(space);
     let curve = if color.cctf_encoding {
         match color.color_space {
+            "ITU-R BT.709" => Some(ToneReprCurve::Parametric(vec![2.4])),
+            "Adobe RGB (1998)" => Some(ToneReprCurve::Parametric(vec![2.2])),
             "ProPhoto RGB" => Some(ToneReprCurve::Parametric(vec![
                 1.8,
                 1.0,
@@ -86,6 +93,17 @@ pub(super) fn make_icc(color: RasterColor) -> Result<Option<Vec<u8>>> {
         )));
         Some(ToneReprCurve::Lut(Vec::new()))
     };
+    if matches!(
+        space,
+        RgbSpace::Rec709 | RgbSpace::DciP3 | RgbSpace::AdobeRgb
+    ) {
+        profile.cicp = None;
+        profile.description = Some(ProfileText::PlainString(format!(
+            "{}{}",
+            space.name(),
+            if color.cctf_encoding { "" } else { " (linear)" },
+        )));
+    }
     if let Some(curve) = curve {
         profile.red_trc = Some(curve.clone());
         profile.green_trc = Some(curve.clone());
@@ -147,6 +165,10 @@ pub(super) fn set_exr_color(attributes: &mut ImageAttributes, color: Option<Rast
     if let Some(color) = color {
         let space = RgbSpace::from_name(color.color_space).expect("known RGB space");
         attributes.chromaticities = Some(chromaticities(space));
+        attributes.other.insert(
+            Text::from("spektrafilmRgbSpace"),
+            AttributeValue::Text(Text::from(space.name())),
+        );
         let transfer = if color.cctf_encoding {
             "encoded"
         } else {
@@ -169,19 +191,34 @@ pub(super) fn identify_exr(
     };
     let near =
         |a: Vec2<f32>, b: Vec2<f32>| (a.0 - b.0).abs() < 0.0005 && (a.1 - b.1).abs() < 0.0005;
+    let encoding = attributes
+        .other
+        .get(&Text::from(EXR_TRANSFER))
+        .or_else(|| layer.other.get(&Text::from(EXR_TRANSFER)));
     let encoded = matches!(
-        attributes.other.get(&Text::from(EXR_TRANSFER))
-            .or_else(|| layer.other.get(&Text::from(EXR_TRANSFER))),
+        encoding,
         Some(AttributeValue::Text(value)) if value.as_slice() == b"encoded"
     );
-    for space in RgbSpace::ALL {
+    let space_tag = Text::from("spektrafilmRgbSpace");
+    let tagged_space = attributes
+        .other
+        .get(&space_tag)
+        .or_else(|| layer.other.get(&space_tag))
+        .and_then(|attribute| match attribute {
+            AttributeValue::Text(value) => std::str::from_utf8(value.as_slice()).ok(),
+            _ => None,
+        })
+        .and_then(RgbSpace::from_name);
+    for space in tagged_space.into_iter().chain(RgbSpace::ALL) {
         let expected = chromaticities(space);
         if near(actual.red, expected.red)
             && near(actual.green, expected.green)
             && near(actual.blue, expected.blue)
             && near(actual.white, expected.white)
         {
-            return RasterColor::new(space.name(), encoded);
+            if let Some(color) = RasterColor::new(space.name(), encoded) {
+                return Some(color);
+            }
         }
     }
     None

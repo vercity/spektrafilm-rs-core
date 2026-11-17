@@ -149,8 +149,11 @@ pub(super) fn prepare_bundle(dir: &Path, options: &DeliveryOptions) -> Result<()
             write_sidecars(dir, &meta, format)?;
         }
         if options.ocio_config {
-            fs::write(dir.join("config.ocio"), ocio::generate(&meta)?)
-                .context("writing OpenColorIO configuration")?;
+            match ocio::validate_endpoints(&meta) {
+                Ok(()) => fs::write(dir.join("config.ocio"), ocio::generate(&meta)?)
+                    .context("writing OpenColorIO configuration")?,
+                Err(error) => eprintln!("Skipping config.ocio: {error}"),
+            }
         }
     }
     Ok(())

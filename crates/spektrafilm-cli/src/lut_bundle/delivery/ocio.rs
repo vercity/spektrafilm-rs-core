@@ -56,6 +56,57 @@ fn supported_space(space: &ColorSpace) -> Result<OcioSpace> {
             "DISPLAY - CIE-XYZ-D65_to_REC.2100-HLG-1000nit",
             true,
         ),
+        ("DCI-P3", true) => (
+            "sdr-video",
+            "DCI-P3 - Display",
+            "DISPLAY - CIE-XYZ-D65_to_G2.6-P3-DCI-BFD",
+            true,
+        ),
+        ("P3-D65 PQ", true) => (
+            "log",
+            "ST2084 P3-D65 - Display",
+            "DISPLAY - CIE-XYZ-D65_to_ST2084-P3-D65",
+            true,
+        ),
+        ("ACEScc", true) => ("log", "ACEScc", "ACEScc_to_ACES2065-1", false),
+        ("ACEScct", true) => ("log", "ACEScct", "ACEScct_to_ACES2065-1", false),
+        ("ARRI LogC3 (EI800)", true) => (
+            "log",
+            "ARRI LogC3 (EI800) - AWG3",
+            "ARRI_ALEXA-LOGC-EI800-AWG_to_ACES2065-1",
+            false,
+        ),
+        ("ARRI LogC4", true) => (
+            "log",
+            "ARRI LogC4 - AWG4",
+            "ARRI_LOGC4_to_ACES2065-1",
+            false,
+        ),
+        ("Sony S-Log3", true) => (
+            "log",
+            "Sony S-Log3 - S-Gamut3",
+            "SONY_SLOG3-SGAMUT3_to_ACES2065-1",
+            false,
+        ),
+        ("Sony S-Log3 (S-Gamut3.Cine)", true) => (
+            "log",
+            "Sony S-Log3 - S-Gamut3.Cine",
+            "SONY_SLOG3-SGAMUT3.CINE_to_ACES2065-1",
+            false,
+        ),
+        ("Apple Log", true) => ("log", "Apple Log", "APPLE_LOG_to_ACES2065-1", false),
+        ("Canon Log 3", true) => (
+            "log",
+            "Canon Log 3 - Cinema Gamut",
+            "CANON_CLOG3-CGAMUT_to_ACES2065-1",
+            false,
+        ),
+        ("RED Log3G10", true) => (
+            "log",
+            "RED Log3G10 - REDWideGamutRGB",
+            "RED_LOG3G10-RWG_to_ACES2065-1",
+            false,
+        ),
         ("Panasonic V-Log", true) => (
             "log",
             "Panasonic V-Log - V-Gamut",
@@ -137,7 +188,9 @@ fn write_endpoint(
         return Ok(());
     }
     write_colorspace(out, &spec.name, family, mapping.encoding, "")?;
-    writeln!(out, "    aliases: [{}]", yaml(mapping.alias))?;
+    if spec.name != mapping.alias {
+        writeln!(out, "    aliases: [{}]", yaml(mapping.alias))?;
+    }
     writeln!(
         out,
         "    from_scene_reference: !<GroupTransform>\n      children:"
@@ -203,6 +256,12 @@ fn wire_description(meta: &BundleMeta, tap: &str) -> Result<String> {
             wire["min"], wire["max"],
         ))
     }
+}
+
+pub(super) fn validate_endpoints(meta: &BundleMeta) -> Result<()> {
+    supported_space(&meta.color_spaces.input)?;
+    supported_space(&meta.color_spaces.output)?;
+    Ok(())
 }
 
 pub(super) fn generate(meta: &BundleMeta) -> Result<String> {
