@@ -212,8 +212,14 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
     assert_eq!(reports.len(), 1);
     let html = fs::read_to_string(reports[0].as_ref().unwrap().path().join("report.html")).unwrap();
     assert!(html.contains("kodak_2383"));
-    assert_eq!(html.matches("data:image/png;base64,").count(), 3);
+    let qa_report = &prints["kodak_2383"];
+    assert!(qa_report["dynamic_range_usage"]["midgray_offset_stops"].is_number());
+    assert!(qa_report["hue_twist_oklab"]["max_hue_rotation_deg"].is_number());
+    assert_eq!(qa_report["rg_plane_slices"]["n_slices"], 5);
+    assert_eq!(html.matches("data:image/png;base64,").count(), 8);
     assert!(html.contains("Noise sensitivity"));
+    assert!(html.contains("Dynamic range usage"));
+    assert!(html.contains("Red–green plane slices"));
 
     let invalid = temp.path().join("invalid-index");
     let rejected = export("2lut", &invalid, &["--qa", "--qa-print-index", "2"]);

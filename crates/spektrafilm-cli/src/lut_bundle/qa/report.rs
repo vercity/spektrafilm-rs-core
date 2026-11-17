@@ -114,9 +114,61 @@ figcaption{{font-size:.92em}}section+section{{margin-top:2.5rem}}
         }
         html.push_str("</section>\n");
     }
+    model_usage(&mut html, metrics)?;
     html.push_str("</main></html>\n");
     fs::write(directory.join("report.html"), html)
         .with_context(|| format!("writing QA report in {}", directory.display()))
+}
+
+fn model_usage(html: &mut String, metrics: &Metrics) -> Result<()> {
+    html.push_str("<section><h2>Rendering diagnostics</h2><h3>Dynamic range usage</h3><p>Gray ramp anchored at the input encoding’s native 18% gray. Active stops have a density slope above 0.10 per stop.</p>");
+    metric_table(html, &serde_json::to_value(&metrics.dynamic_range_usage)?)?;
+    let ramp = &metrics.dynamic_range_usage.ramp;
+    let first = ramp[0].stops;
+    let last = ramp[ramp.len() - 1].stops;
+    let project_stops = |stops: f64| (stops - first) / (last - first) * 478.0 + 1.0;
+    let gray = project_stops(0.0);
+    write!(
+        html,
+        r#"<figure><svg viewBox="0 0 480 144" role="img" aria-label="Output density across exposure stops"><path d="M1 1 V129 H479 M{gray:.2} 1 V129" fill="none" stroke="currentColor" opacity=".4"/><polyline fill="none" stroke="currentColor" points=""#
+    )?;
+    let min_y = ramp.iter().map(|s| s.y.log10()).fold(0.0_f64, f64::min);
+    let max_y = ramp.iter().map(|s| s.y.log10()).fold(0.0_f64, f64::max);
+    let y_scale = 120.0 / (max_y - min_y).max(1e-3);
+    let density_screen = |value: f64| 4.0 + (value.log10() - min_y) * y_scale;
+    for sample in ramp {
+        write!(
+            html,
+            "{:.2} {:.2} ",
+            project_stops(sample.stops),
+            density_screen(sample.y)
+        )?;
+    }
+    html.push_str(r#""/>"#);
+    for sample in ramp.iter().filter(|s| s.clipped).step_by(4) {
+        write!(
+            html,
+            r##"<circle cx="{:.2}" cy="{:.2}" r="2" fill="#da514b"/>"##,
+            project_stops(sample.stops),
+            density_screen(sample.y)
+        )?;
+    }
+    html.push_str("</svg><figcaption>Higher density is higher on the chart. The vertical line marks 0 EV and red dots mark input encoding clipping.</figcaption></figure>");
+    html.push_str("<h3>OkLab hue twist</h3><p>Largest input-to-output hue changes in four input chroma bands. Inputs above 0.6 OkLab chroma are outside the test’s visible-color envelope.</p>");
+    metric_table(html, &serde_json::to_value(&metrics.hue_twist_oklab)?)?;
+    html.push_str("</section>\n<section><h2>Red–green plane slices</h2><p>Red increases left to right and green bottom to top. Each panel fixes the input blue value and shows the output on an sRGB display.</p>");
+    html.push_str(r#"<div class="panels">"#);
+    let size = metrics.rg_plane_slices.cube_resolution;
+    for plane in &metrics.rg_plane_slices.images {
+        let blue = plane.blue;
+        write!(
+            html,
+            r#"<figure><img width="{size}" height="{size}" alt="Red–green plane at input blue {blue:.2}" src="data:image/png;base64,{}"><figcaption>B = {blue:.2}</figcaption></figure>"#,
+            STANDARD.encode(&plane.png)
+        )?;
+    }
+    html.push_str("</div></section>");
+    Ok(())
 }
 
 fn error_rows(html: &mut String, method: &str, metrics: &InterpolationMetrics) -> Result<()> {

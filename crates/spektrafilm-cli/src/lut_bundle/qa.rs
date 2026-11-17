@@ -14,6 +14,7 @@ use super::transport::Encoding;
 
 mod diagnostics;
 mod gamut_edge;
+mod model_usage;
 mod report;
 
 const SAMPLE_COUNT: usize = 50_000;
@@ -209,6 +210,9 @@ pub(super) struct Metrics {
     sequential: InterpolationMetrics,
     resampled: InterpolationMetrics,
     diagnostics: diagnostics::Diagnostics,
+    dynamic_range_usage: model_usage::DynamicRange,
+    hue_twist_oklab: model_usage::HueTwist,
+    rg_plane_slices: model_usage::RgPlanes,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_gamut_edge_stress: Option<gamut_edge::Outcome>,
 }
@@ -286,6 +290,9 @@ pub(super) fn evaluate(
         sequential,
         resampled,
         diagnostics: diagnostics::evaluate(&effective, frame),
+        dynamic_range_usage: model_usage::dynamic_range(&effective, frame),
+        hue_twist_oklab: model_usage::hue_twist(&effective, frame),
+        rg_plane_slices: model_usage::rg_planes(&effective, frame)?,
         output_gamut_edge_stress: None,
     })
 }

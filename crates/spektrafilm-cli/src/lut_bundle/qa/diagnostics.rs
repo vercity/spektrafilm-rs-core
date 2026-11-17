@@ -269,7 +269,7 @@ fn face_folds(cube: &Cube) -> GamutFolds {
     }
 }
 
-fn to_oklab(xyz: [f64; 3]) -> [f64; 3] {
+pub(super) fn to_oklab(xyz: [f64; 3]) -> [f64; 3] {
     let lms = mat_vec(
         [
             [0.8189330101, 0.3618667424, -0.1288597137],

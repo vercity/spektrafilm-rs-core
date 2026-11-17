@@ -37,13 +37,7 @@ struct Target {
 }
 
 pub(super) fn evaluate(frame: Frame, pipeline: &LutPipeline) -> Result<Vec<Panel>> {
-    let srgb = Encoding::Srgb;
-    let display_matrix = rgb_matrix(
-        to_xyz_matrix(frame.output),
-        frame.output.space().white_xyz(),
-        from_xyz_matrix(srgb),
-        srgb.space().white_xyz(),
-    );
+    let display_matrix = display_matrix(frame.output);
     let target = |encoding: Encoding| Target {
         name: encoding.name(),
         to_xyz: to_xyz_matrix(encoding),
@@ -62,6 +56,28 @@ pub(super) fn evaluate(frame: Frame, pipeline: &LutPipeline) -> Result<Vec<Panel
         .into_iter()
         .map(|target| panel(target, frame.input, pipeline, display_matrix))
         .collect()
+}
+
+pub(super) fn display_matrix(output: Encoding) -> [[f64; 3]; 3] {
+    let srgb = Encoding::Srgb;
+    rgb_matrix(
+        to_xyz_matrix(output),
+        output.space().white_xyz(),
+        from_xyz_matrix(srgb),
+        srgb.space().white_xyz(),
+    )
+}
+
+pub(super) fn encode_display(matrix: [[f64; 3]; 3], linear: [f64; 3]) -> [u8; 3] {
+    Encoding::Srgb
+        .encode(mat_vec(matrix, linear).map(|value| value.clamp(0.0, 1.0)))
+        .map(|code| (code * 255.0).round() as u8)
+}
+
+pub(super) fn encode_png(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png).write_image(pixels, width, height, ExtendedColorType::Rgb8)?;
+    Ok(png)
 }
 
 fn rgb_matrix(
@@ -127,23 +143,15 @@ fn panel(
     let output = pipeline.process(&ImageBuf::from_data(WIDTH * HEIGHT, 1, input))?;
     let mut pixels = Vec::with_capacity((WIDTH * HEIGHT * 3) as usize);
     for pixel in output.pixels() {
-        let rgb = mat_vec(
-            display_matrix,
-            [to_f64(pixel[0]), to_f64(pixel[1]), to_f64(pixel[2])],
-        );
+        let linear = [to_f64(pixel[0]), to_f64(pixel[1]), to_f64(pixel[2])];
         ensure!(
-            rgb.iter().all(|c| c.is_finite()),
+            linear.iter().all(|c| c.is_finite()),
             "non-finite stress chart for {}",
             target.name
         );
-        pixels.extend(
-            Encoding::Srgb
-                .encode(rgb.map(|value| value.clamp(0.0, 1.0)))
-                .map(|code| (code * 255.0).round() as u8),
-        );
+        pixels.extend(encode_display(display_matrix, linear));
     }
-    let mut image_png = Vec::new();
-    PngEncoder::new(&mut image_png).write_image(&pixels, WIDTH, HEIGHT, ExtendedColorType::Rgb8)?;
+    let image_png = encode_png(&pixels, WIDTH, HEIGHT)?;
     Ok(Panel {
         target: target.name,
         oog_fraction_total: f64::from(oog_total) / f64::from(WIDTH * HEIGHT),
