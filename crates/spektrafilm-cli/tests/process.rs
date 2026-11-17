@@ -101,6 +101,42 @@ fn scan_mode_is_resolved_before_requiring_a_paper() {
 }
 
 #[test]
+fn manual_input_interpretation_and_saving_transform_are_independent() {
+    use spektrafilm_io::{raster::RasterColor, raw::DevelopOptions, read_image};
+
+    let fixture = ProcessFixture::new();
+    let original = fixture.process(true, "mallett2019", &[]);
+    assert!(original.status.success(), "{original:?}");
+    let original_pixels = fs::read(fixture.0.join("pixels.bin")).unwrap();
+    let override_and_convert = fixture.process(
+        true,
+        "mallett2019",
+        &[
+            "--use-params-input-color",
+            "--save-color-space",
+            "ITU-R BT.2020",
+            "--save-cctf-encoding",
+            "false",
+        ],
+    );
+    assert!(
+        override_and_convert.status.success(),
+        "{override_and_convert:?}"
+    );
+    let overridden_pixels = fs::read(fixture.0.join("pixels.bin")).unwrap();
+    assert_ne!(original_pixels, overridden_pixels);
+    let saved = read_image(&fixture.0.join("output.png"), DevelopOptions::default()).unwrap();
+    assert_eq!(saved.color, RasterColor::new("ITU-R BT.2020", false));
+
+    let override_only = fixture.process(true, "mallett2019", &["--use-params-input-color"]);
+    assert!(override_only.status.success(), "{override_only:?}");
+    assert_eq!(
+        overridden_pixels,
+        fs::read(fixture.0.join("pixels.bin")).unwrap()
+    );
+}
+
+#[test]
 fn spectral_initialization_failure_returns_an_error_without_outputs() {
     let fixture = ProcessFixture::new();
     for (method, cause) in [

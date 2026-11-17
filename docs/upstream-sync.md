@@ -298,14 +298,14 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 
 | 项目 | 验收条件和当前进度 |
 |---|---|
-| GUI 色彩和 RAW 开发 | 对照带标签及无标签 TIFF、宽色域色块、Bayer 与 X-Trans。预览采用显示变换，Scan／Save／f64 Export 保留各自的像素和色彩标签。对照白平衡、Lensfun、旋转和重新开发，保护源图快照及原子替换。进行中。 |
+| GUI 色彩和 RAW 开发 | 输入解释、模拟空间、显示和保存转换已通过 macOS 验收。无标签 V-Log TIFF 显式按 V-Gamut 读取，f64 以 ProPhoto 模拟并导出线性 Rec.2020 TIFF32，ICC 正确，对照原版 colour-science 最大误差 `1.29e-8`。独立切换保存空间时模拟缓冲逐位一致。RAW 白平衡、Lensfun、旋转及重新开发与 Windows 显示 ICC 仍待验收。 |
 | GUI 预设、默认片纸和交互 | 对照原版 JSON、启动默认值、恢复出厂设置、记忆目录、负片与正片切换、预览采样、颗粒控件和图层／相纸动画。待验收。 |
 | LUT 编码和命令 | 对照原版启用的输入／输出注册表、Rec.709 原色、HDR 增益、OCIO 处理器以及 TOML、参数覆盖、默认拓扑和列表命令。进行中。 |
 | LUT QA | D65 ΔE00、ΔITP、P95 和 `--qa-print-index` 已验收。同一 17³ V-Log→ProPhoto 4-LUT 文件和 50,000 个固定采样点，两端各统计值最大差分别为 `3.40e-6`／`2.37e-6`。Index 1 只生成第二张相纸的报告，包保留两张相纸。后续单调性、色域与噪声等诊断以及 HTML 输出仍在进行。 |
 | 4-LUT 画质 | 对照两端逐段与重采样结果。65³ Ektar 100／Ultra Endura V-Log→sRGB 三线性／四面体逐段最大 ΔE00 为 6.65／6.28，两端一致，样本仍超出最大值 2.0 的门槛。 |
 | 运行时阶段接口 | 已验收。普通渲染公开 `process_with_taps`，包含 `rgb_pre`、`cmy_print` 等边界，返回工作像素尺寸供从中途继续。Portra 400／Portra Endura 与 Provia 直扫启用全图测光、裁切、1.5× 缩放、空间效果与黑白校正，从每个可达阶段续跑与 Rust 一次渲染逐位一致。Python f64 对照同为 14×9，六个阶段从 `rgb_pre` 到 `rgb_out` 的最大差依次为 `2.22e-15`、`4.34e-9`、`1.66e-7`、`1.05e-7`、`1.70e-7`、`1.59e-7`。 |
 | 自定义 profile 保存 | 已验收。公共 `save_profile` 写回片纸 JSON，保留许可信息、波段空值和黑白片多显影时间，替换前先完整写入同目录暂存文件。Portra 400、Portra Endura 由 Python 原版读取并通过验证，光谱及密度数组形状、空值位置一致，有限数值的最大差为 `1.78e-15`。Rust 额外覆盖 Double-X 与保存失败后保留原件。 |
-| RAW 与其他文件细节 | 对照 LibRaw 的去马赛克、高光和非直线镜头校正，以及 MakerNote、内嵌缩略图与通用 EXR 元数据。待验收。 |
+| RAW 与其他文件细节 | 对照 LibRaw 的去马赛克、高光和非直线镜头校正，以及 MakerNote 和内嵌缩略图。源码复核确认 Python 对 EXR 跳过 Exiv2 元数据写入，因此 EXR 通用元数据透传属于扩展。 |
 | GPU 和发布验证 | 对照 Metal／wgpu 的色域压缩、散射和颗粒。另需 CUDA、Lumix 和 Windows 文件取消／替换实测。待验收。 |
 
 ### 审阅验证范围

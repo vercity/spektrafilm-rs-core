@@ -2,6 +2,7 @@
 
 mod color;
 mod metadata;
+mod transform;
 
 use std::{
     borrow::Cow,
@@ -27,6 +28,7 @@ use tiff::{
 
 pub use color::RasterColor;
 pub use metadata::RasterMetadata;
+pub use transform::ColorTransform;
 
 pub struct RasterImage {
     pub image: ImageBuf,

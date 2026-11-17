@@ -20,12 +20,15 @@ use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_io::{
-    raster::{RasterColor, RasterMetadata, RasterWriteOptions},
+    raster::{ColorTransform, RasterColor, RasterMetadata, RasterWriteOptions},
     raw::DevelopOptions,
     read_image,
 };
-use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{from_f32, srgb_encode, to_f32};
+use spektrafilm_math::precision::{from_f32, to_f32};
+use spektrafilm_math::{
+    colorspace::{Cctf, RgbSpace},
+    image::ImageBuf,
+};
 
 mod export_output;
 mod source_snapshot;
@@ -232,6 +235,49 @@ fn depth_control(ui: &mut egui::Ui, label: &str, current: &mut u8, choices: &[u8
         });
 }
 
+const SRGB_DISPLAY: RasterColor = RasterColor {
+    color_space: "sRGB",
+    cctf_encoding: true,
+};
+const UNTAGGED_INPUT: RasterColor = RasterColor {
+    color_space: "ProPhoto RGB",
+    cctf_encoding: false,
+};
+
+fn simulation_color(params: &RuntimeParams) -> RasterColor {
+    RasterColor::new(
+        &params.io.output_color_space,
+        params.io.output_cctf_encoding,
+    )
+    .unwrap_or(SRGB_DISPLAY)
+}
+
+fn color_control(ui: &mut egui::Ui, label: &str, color: &mut RasterColor) -> bool {
+    let mut space = RgbSpace::from_name(color.color_space).expect("known RGB space");
+    let mut changed = false;
+    egui::ComboBox::from_label(label)
+        .selected_text(space.name())
+        .show_ui(ui, |ui| {
+            for choice in RgbSpace::ALL {
+                changed |= ui
+                    .selectable_value(&mut space, choice, choice.name())
+                    .changed();
+            }
+        });
+    let encoded = &mut color.cctf_encoding;
+    if space.transfer() == Cctf::Linear {
+        *encoded = false;
+    }
+    changed |= ui
+        .add_enabled(
+            space.transfer() != Cctf::Linear,
+            egui::Checkbox::new(encoded, "Apply transfer function"),
+        )
+        .changed();
+    color.color_space = space.name();
+    changed
+}
+
 fn has_hanatos_surface(film: &profile::Profile) -> bool {
     let params = &film.data.hanatos2025_adaptation_surface_params;
     params.len() == 3 && params.iter().all(|channel| channel.len() == 15)
@@ -256,6 +302,11 @@ struct App {
     source: Option<Arc<source_snapshot::SourceSnapshot>>,
     image: Option<Arc<ImageBuf>>,
     source_metadata: RasterMetadata,
+    detected_input_color: Option<RasterColor>,
+    override_input_color: bool,
+    manual_input_color: RasterColor,
+    saving_color: RasterColor,
+    display_transform: bool,
     output_depths: OutputDepths,
     /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
@@ -342,6 +393,7 @@ struct RenderReply {
 struct RenderResult {
     output: ImageBuf,
     preview: PreviewTextureData,
+    display_transform: bool,
     input_clone_ms: f32,
     pipeline_build_ms: f32,
     render_ms: f32,
@@ -408,6 +460,11 @@ impl App {
             source: None,
             image: None,
             source_metadata: RasterMetadata::default(),
+            detected_input_color: None,
+            override_input_color: false,
+            manual_input_color: UNTAGGED_INPUT,
+            saving_color: SRGB_DISPLAY,
+            display_transform: true,
             output_depths: OutputDepths::default(),
             output_image: None,
             output_tex: None,
@@ -448,12 +505,8 @@ impl App {
             .with_context(|| format!("loading {}", path.display()));
         match captured {
             Ok((loaded, source)) => {
-                let color = loaded.color.unwrap_or(RasterColor {
-                    color_space: "ProPhoto RGB",
-                    cctf_encoding: false,
-                });
-                self.params.io.input_color_space = color.color_space.into();
-                self.params.io.input_cctf_decoding = color.cctf_encoding;
+                self.detected_input_color = loaded.color;
+                self.sync_input_color();
                 self.source_metadata = loaded.metadata;
                 let img = loaded.image;
                 self.status = format!(
@@ -472,6 +525,16 @@ impl App {
                 self.status = format!("Load error: {e:#}");
             }
         }
+    }
+
+    fn sync_input_color(&mut self) {
+        let color = if self.override_input_color {
+            self.manual_input_color
+        } else {
+            self.detected_input_color.unwrap_or(UNTAGGED_INPUT)
+        };
+        self.params.io.input_color_space = color.color_space.into();
+        self.params.io.input_cctf_decoding = color.cctf_encoding;
     }
 
     fn request_render(&mut self) {
@@ -525,6 +588,7 @@ impl App {
         let print_name = self.print_name.clone();
         let data_dir = self.data_dir.clone();
         let params = self.params.clone();
+        let display_transform = self.display_transform;
         let mut pipeline_cache = self.pipeline_cache.take();
         let backend = self.backend.clone();
         let (tx, rx) = mpsc::channel();
@@ -557,13 +621,15 @@ impl App {
                     };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     let t_preview = Instant::now();
-                    let preview =
-                        make_preview_texture_data(&output, pipeline.params.io.output_cctf_encoding);
+                    let preview_color =
+                        display_transform.then(|| simulation_color(&pipeline.params));
+                    let preview = make_preview_texture_data(&output, preview_color);
                     let preview_ms = t_preview.elapsed().as_secs_f32() * 1000.0;
                     let worker_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
                     Ok(RenderResult {
                         output,
                         preview,
+                        display_transform,
                         input_clone_ms,
                         pipeline_build_ms,
                         render_ms,
@@ -708,7 +774,16 @@ impl App {
                 self.last_render_ms = r.render_ms;
                 self.last_preview_ms = r.preview_ms;
                 self.last_worker_total_ms = r.worker_total_ms;
-                self.output_tex = Some(make_texture(ctx, r.preview));
+                let preview = if r.display_transform == self.display_transform {
+                    r.preview
+                } else {
+                    make_preview_texture_data(
+                        &r.output,
+                        self.display_transform
+                            .then(|| simulation_color(&self.params)),
+                    )
+                };
+                self.output_tex = Some(make_texture(ctx, preview));
                 self.status = format!(
                     "{} {} × {} ({:.1} MP)",
                     mode.label(),
@@ -727,10 +802,10 @@ impl App {
 
     /// Save the rendered output for the current input and film selection.
     fn save_dialog(&mut self) {
-        let Some(out) = self.output_image.as_ref() else {
+        if self.output_image.is_none() {
             self.status = "Run Preview or Scan before saving.".into();
             return;
-        };
+        }
         let default_name = match self.source.as_ref().map(|source| source.original_path()) {
             Some(p) => {
                 let stem = p
@@ -752,16 +827,7 @@ impl App {
         if path.extension().is_none() {
             path.set_extension("png");
         }
-        match write_preview_output(
-            &path,
-            out,
-            &RasterWriteOptions {
-                bit_depth: self.bit_depth_for(&path),
-                color_space: Some(&self.params.io.output_color_space),
-                cctf_encoding: self.params.io.output_cctf_encoding,
-                source_metadata: Some(&self.source_metadata),
-            },
-        ) {
+        match self.save_to_path(&path) {
             Ok(()) => {
                 self.status = format!(
                     "Saved {} in {:.0} ms",
@@ -775,6 +841,29 @@ impl App {
                 self.status = format!("Save error: {e:#}");
             }
         }
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<()> {
+        let rendered = self
+            .output_image
+            .as_ref()
+            .context("run Preview or Scan before saving")?;
+        let source = simulation_color(&self.params);
+        let converted = (source != self.saving_color).then(|| {
+            let mut image = rendered.clone();
+            ColorTransform::new(source, self.saving_color).apply_image(&mut image);
+            image
+        });
+        write_preview_output(
+            path,
+            converted.as_ref().unwrap_or(rendered),
+            &RasterWriteOptions {
+                bit_depth: self.bit_depth_for(path),
+                color_space: Some(self.saving_color.color_space),
+                cctf_encoding: self.saving_color.cctf_encoding,
+                source_metadata: Some(&self.source_metadata),
+            },
+        )
     }
 
     fn bit_depth_for(&self, path: &Path) -> Option<u8> {
@@ -842,6 +931,10 @@ impl App {
         params.settings.use_enlarger_lut = true;
         params.settings.use_scanner_lut = true;
         let bit_depth = self.bit_depth_for(&out_path);
+        let color_options = ExportColorOptions {
+            use_params_input_color: self.override_input_color,
+            saving_color: Some(self.saving_color),
+        };
         let data_dir = self.data_dir.clone();
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
@@ -860,6 +953,7 @@ impl App {
                     &paper,
                     &params,
                     &data_dir,
+                    color_options,
                     &cancel_for_worker,
                 );
                 let name = out_path
@@ -1437,8 +1531,36 @@ impl App {
         egui::CollapsingHeader::new("Color management")
             .default_open(false)
             .show(ui, |ui| {
+                let tag = self.detected_input_color;
+                ui.label(match tag {
+                    Some(color) if color.cctf_encoding => {
+                        format!("Detected input: {} (encoded)", color.color_space)
+                    }
+                    Some(color) => format!("Detected input: {} (linear)", color.color_space),
+                    None => "Untagged input: assume linear ProPhoto RGB".to_string(),
+                });
+                let changed_input_mode = ui
+                    .checkbox(
+                        &mut self.override_input_color,
+                        "Override input interpretation",
+                    )
+                    .changed();
+                let changed_input_color = self.override_input_color
+                    && color_control(ui, "Input color space", &mut self.manual_input_color);
+                if changed_input_mode || changed_input_color {
+                    self.sync_input_color();
+                    self.request_render();
+                }
+                ui.separator();
+                let mut simulation = simulation_color(&self.params);
+                let changed_simulation =
+                    color_control(ui, "Simulation output color space", &mut simulation);
+                if changed_simulation {
+                    self.params.io.output_color_space = simulation.color_space.into();
+                    self.params.io.output_cctf_encoding = simulation.cctf_encoding;
+                }
                 let algo = &mut self.params.io.output_gamut_compress.algorithm;
-                let mut changed = false;
+                let mut changed = changed_simulation;
                 egui::ComboBox::from_label("Output gamut compression")
                     .selected_text(algo.clone())
                     .show_ui(ui, |ui| {
@@ -1633,15 +1755,25 @@ impl App {
                     )
                     .on_hover_text("1.0 retains the full resolution of the cropped image.")
                     .changed();
-                changed |= ui
-                    .checkbox(&mut io.output_cctf_encoding, "Output sRGB encoded")
-                    .changed();
+                color_control(ui, "Saving color space", &mut self.saving_color);
                 if changed {
                     self.request_render();
                 }
             });
 
         egui::CollapsingHeader::new("Preview display").show(ui, |ui| {
+            if ui
+                .checkbox(&mut self.display_transform, "Convert colors for display")
+                .changed()
+            {
+                if let Some(output) = self.output_image.as_ref() {
+                    let color = self
+                        .display_transform
+                        .then(|| simulation_color(&self.params));
+                    self.output_tex =
+                        Some(make_texture(ctx, make_preview_texture_data(output, color)));
+                }
+            }
             ui.checkbox(&mut self.gray_canvas, "18% gray canvas");
             ui.add(egui::Slider::new(&mut self.white_border, 0.0..=1.0).text("White border"))
                 .on_hover_text("Displayed border width as a fraction of the image long edge.");
@@ -2043,7 +2175,13 @@ fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
 /// Convert the pipeline's RGB output into a display-encoded RGBA preview.
 /// The full output remains available for saving, but the interactive texture is
 /// capped so a large RAW does not force a full-size upload into egui every pass.
-fn make_preview_texture_data(out: &ImageBuf, output_encoded: bool) -> PreviewTextureData {
+fn make_preview_texture_data(
+    out: &ImageBuf,
+    source_color: Option<RasterColor>,
+) -> PreviewTextureData {
+    let transform = source_color
+        .filter(|&color| color != SRGB_DISPLAY)
+        .map(|color| ColorTransform::new(color, SRGB_DISPLAY));
     let src_w = out.width as usize;
     let src_h = out.height as usize;
     let max_src_dim = src_w.max(src_h).max(1);
@@ -2078,18 +2216,20 @@ fn make_preview_texture_data(out: &ImageBuf, output_encoded: bool) -> PreviewTex
                 let p11 = (y1 * src_w + x1) * 3;
                 let dst = x * 4;
 
-                for c in 0..3 {
+                let sample = std::array::from_fn(|c| {
                     let v00 = to_f32(out.data[p00 + c]);
                     let v10 = to_f32(out.data[p10 + c]);
                     let v01 = to_f32(out.data[p01 + c]);
                     let v11 = to_f32(out.data[p11 + c]);
                     let top = v00 + (v10 - v00) * tx;
                     let bot = v01 + (v11 - v01) * tx;
-                    let mut sample = top + (bot - top) * ty;
-                    if !output_encoded {
-                        sample = to_f32(srgb_encode(from_f32(sample)));
-                    }
-                    row[dst + c] = (sample.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    from_f32(top + (bot - top) * ty)
+                });
+                let rgb = transform
+                    .as_ref()
+                    .map_or(sample, |transform| transform.apply(sample));
+                for (c, sample) in rgb.into_iter().map(to_f32).enumerate() {
+                    row[dst + c] = (sample.clamp(0.0, 1.0) * 255.0) as u8;
                 }
                 row[dst + 3] = 255;
             }
@@ -2192,6 +2332,12 @@ impl Drop for TempPath {
     }
 }
 
+#[derive(Default)]
+struct ExportColorOptions {
+    use_params_input_color: bool,
+    saving_color: Option<RasterColor>,
+}
+
 /// Run the f64 CLI against a staged output and publish after it exits
 /// successfully. Capture stderr and reap the child on cancellation.
 fn run_f64_export(
@@ -2203,6 +2349,7 @@ fn run_f64_export(
     paper: &str,
     params: &spektrafilm_core::params::RuntimeParams,
     data_dir: &Path,
+    color: ExportColorOptions,
     cancel: &AtomicBool,
 ) -> Result<()> {
     anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
@@ -2247,6 +2394,15 @@ fn run_f64_export(
 
     if let Some(bit_depth) = bit_depth {
         cmd.arg("--bit-depth").arg(bit_depth.to_string());
+    }
+    if color.use_params_input_color {
+        cmd.arg("--use-params-input-color");
+    }
+    if let Some(saving_color) = color.saving_color {
+        cmd.arg("--save-color-space")
+            .arg(saving_color.color_space)
+            .arg("--save-cctf-encoding")
+            .arg(saving_color.cctf_encoding.to_string());
     }
 
     anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
@@ -2328,6 +2484,7 @@ mod f64_export_tests {
             "paper",
             &RuntimeParams::default(),
             Path::new("."),
+            ExportColorOptions::default(),
             cancel,
         )
     }
@@ -2575,6 +2732,80 @@ mod preview_tests {
         assert_eq!(std::fs::read(png).unwrap()[24], 16);
     }
 
+    #[test]
+    fn manual_color_overrides_tags_and_auto_mode_resolves_each_new_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("tagged.png");
+        let tiff = directory.path().join("untagged.tiff");
+        let image = ImageBuf::from_data(1, 1, vec![0.25; 3]);
+        for (path, color) in [(&png, Some("sRGB")), (&tiff, None)] {
+            spektrafilm_io::raster::write_raster(
+                path,
+                &image,
+                &RasterWriteOptions {
+                    color_space: color,
+                    cctf_encoding: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let mut app = App::new(Arc::new(CpuBackend), Some(png.clone()));
+        assert_eq!(app.params.io.input_color_space, "sRGB");
+        assert!(app.params.io.input_cctf_decoding);
+        app.load_image_from_path(&tiff);
+        assert_eq!(app.params.io.input_color_space, "ProPhoto RGB");
+        assert!(!app.params.io.input_cctf_decoding);
+
+        app.manual_input_color = RasterColor::new("V-Gamut", true).unwrap();
+        app.override_input_color = true;
+        app.sync_input_color();
+        app.load_image_from_path(&png);
+        assert_eq!(app.params.io.input_color_space, "V-Gamut");
+        assert!(app.params.io.input_cctf_decoding);
+
+        app.override_input_color = false;
+        app.sync_input_color();
+        assert_eq!(app.params.io.input_color_space, "sRGB");
+    }
+
+    #[test]
+    fn display_conversion_does_not_quantize_or_relabel_the_saved_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let tiff = directory.path().join("converted.tiff");
+        let exr = directory.path().join("converted.exr");
+        let image = ImageBuf::from_data(1, 1, vec![0.71, 0.12, -0.03]);
+        let mut app = App::new(Arc::new(CpuBackend), None);
+        app.params.io.output_color_space = "ProPhoto RGB".into();
+        app.params.io.output_cctf_encoding = false;
+        app.saving_color = SRGB_DISPLAY;
+        app.output_image = Some(image.clone());
+        app.output_depths.tiff = 32;
+        app.output_depths.exr = 32;
+
+        let managed = make_preview_texture_data(&image, Some(simulation_color(&app.params)));
+        let unmanaged = make_preview_texture_data(&image, None);
+        assert_eq!(managed.rgba, [255, 0, 0, 255]);
+        assert_eq!(unmanaged.rgba, [181, 30, 0, 255]);
+
+        app.save_to_path(&tiff).unwrap();
+        app.display_transform = false;
+        app.save_to_path(&exr).unwrap();
+        for path in [&tiff, &exr] {
+            let read = read_image(path, DevelopOptions::default()).unwrap();
+            assert_eq!(read.color, Some(SRGB_DISPLAY));
+            for (actual, expected) in read.image.data.iter().map(|&value| to_f32(value)).zip([
+                1.146545,
+                -0.17519957,
+                -0.74973375,
+            ]) {
+                assert!((actual - expected).abs() < 5e-6);
+            }
+        }
+        assert_eq!(app.output_image.as_ref().unwrap().data, image.data);
+    }
+
     fn fixture_path(name: &str) -> TempPath {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2607,10 +2838,11 @@ mod preview_tests {
 
     fn rendered_pixel(red: f32) -> RenderResult {
         let output = ImageBuf::from_data(1, 1, vec![from_f32(red), from_f32(0.0), from_f32(0.0)]);
-        let preview = make_preview_texture_data(&output, true);
+        let preview = make_preview_texture_data(&output, Some(SRGB_DISPLAY));
         RenderResult {
             output,
             preview,
+            display_transform: true,
             input_clone_ms: 0.0,
             pipeline_build_ms: 0.0,
             render_ms: 0.0,
@@ -2820,6 +3052,7 @@ exit 23
                 "paper",
                 &RuntimeParams::default(),
                 Path::new("."),
+                ExportColorOptions::default(),
                 cancel,
             );
             done.send(()).ok();

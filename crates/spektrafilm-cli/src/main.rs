@@ -9,7 +9,7 @@ use spektrafilm_core::pipeline::{LutPipeline, Pipeline};
 use spektrafilm_core::profile;
 use spektrafilm_io::raw;
 use spektrafilm_io::{
-    raster::{RasterWriteOptions, write_raster},
+    raster::{ColorTransform, RasterColor, RasterWriteOptions, write_raster},
     read_image,
 };
 use spektrafilm_math::image::ImageBuf;
@@ -56,6 +56,8 @@ enum Commands {
         params: Option<PathBuf>,
         #[command(flatten)]
         raw: RawOptions,
+        #[command(flatten)]
+        color: ImageColorOptions,
         /// Dump the final pipeline buffer as native-endian f64 (HxWx3, row-major,
         /// channel-interleaved) after pipeline color processing and before file quantization.
         #[arg(long)]
@@ -102,6 +104,19 @@ enum Commands {
     },
     /// Export a film and one or more papers as a CUBE LUT bundle.
     ExportLutBundle(lut_bundle::BundleOptions),
+}
+
+#[derive(Args)]
+struct ImageColorOptions {
+    /// Interpret input samples using the color space and transfer supplied in --params.
+    #[arg(long)]
+    use_params_input_color: bool,
+    /// Save in a different color space from the simulation output.
+    #[arg(long)]
+    save_color_space: Option<String>,
+    /// Apply the saving color space's transfer. Specify false to save linear samples.
+    #[arg(long, requires = "save_color_space")]
+    save_cctf_encoding: Option<bool>,
 }
 
 #[derive(Args)]
@@ -203,6 +218,7 @@ fn main() -> Result<()> {
             timings,
             params: params_file,
             raw,
+            color,
             raw_out,
             iters,
             data_dir,
@@ -217,6 +233,7 @@ fn main() -> Result<()> {
                 timings,
                 params_file.as_deref(),
                 &raw,
+                &color,
                 raw_out.as_deref(),
                 iters,
                 &data_dir,
@@ -259,6 +276,7 @@ fn cmd_process(
     show_timings: bool,
     params_file: Option<&Path>,
     raw_options: &RawOptions,
+    color_options: &ImageColorOptions,
     raw_out: Option<&Path>,
     iters: usize,
     data_dir: &Path,
@@ -298,7 +316,10 @@ fn cmd_process(
 
     let t = Instant::now();
     let loaded = read_image(input, raw_options.decode_options(raw::is_raw(input))?)?;
-    if let Some(color) = loaded.color {
+    if let Some(color) = loaded
+        .color
+        .filter(|_| !color_options.use_params_input_color)
+    {
         params.io.input_color_space = color.color_space.into();
         params.io.input_cctf_decoding = color.cctf_encoding;
     }
@@ -347,15 +368,34 @@ fn cmd_process(
 
     // Save output
     let t = Instant::now();
+    let mut write_options = RasterWriteOptions {
+        bit_depth,
+        color_space: Some(&pipeline.params.io.output_color_space),
+        cctf_encoding: pipeline.params.io.output_cctf_encoding,
+        source_metadata: Some(&loaded.metadata),
+    };
+    let converted = if let Some(name) = &color_options.save_color_space {
+        let source = RasterColor::new(
+            &pipeline.params.io.output_color_space,
+            pipeline.params.io.output_cctf_encoding,
+        )
+        .context("unknown simulation output color space")?;
+        let destination = RasterColor::new(name, color_options.save_cctf_encoding.unwrap_or(true))
+            .with_context(|| format!("unknown saving color space: {name}"))?;
+        write_options.color_space = Some(destination.color_space);
+        write_options.cctf_encoding = destination.cctf_encoding;
+        (source != destination).then(|| {
+            let mut converted = result.clone();
+            ColorTransform::new(source, destination).apply_image(&mut converted);
+            converted
+        })
+    } else {
+        None
+    };
     write_raster(
         output,
-        &result,
-        &RasterWriteOptions {
-            bit_depth,
-            color_space: Some(&pipeline.params.io.output_color_space),
-            cctf_encoding: pipeline.params.io.output_cctf_encoding,
-            source_metadata: Some(&loaded.metadata),
-        },
+        converted.as_ref().unwrap_or(&result),
+        &write_options,
     )?;
     eprintln!(
         "Saved: {} ({}x{}), {} ms",
