@@ -207,15 +207,38 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 
 ### P1 补齐 GUI 日常工作流
 
-1. **独立的低分辨率预览与全尺寸 Scan。** Rust 默认用原图处理预览，Working resolution 有意同时控制预览和导出。CLI 已验证 0.5× 会把 128×96 的输出缩到 64×48。Python 保留原图，另建有长边上限的抗锯齿预览图，并支持手动 Preview、Scan 与自动预览。分开预览长边上限和用户主动选择的导出尺寸，首轮把发生在主线程的管线初始化移到预览 worker。验收在同一张大图上验证预览有上限、Scan 保持裁切后的指定全尺寸、相同裁切几何和曝光规则、连续修改时最新请求生效。已有 Crop 数值控件、旧结果防护和取消机制可复用。出处见 [Rust 预览](../crates/spektrafilm-gui/src/main.rs#L425)、[Working resolution](../crates/spektrafilm-gui/src/main.rs#L1439) 及 Python `spektrafilm_gui/controller.py:274,489,683` 和 `spektrafilm/utils/preview.py`。
+1. **独立的低分辨率预览与全尺寸 Scan（已完成）。** 修复前 Rust 默认用原图处理预览，Working resolution 同时控制预览和导出。Python 保留原图，另建有长边上限的抗锯齿预览图，并支持手动 Preview、Scan 与自动预览。实现与验证见本节下方。
 2. **补输入色彩、显示与 RAW 开发选项。** GUI 已识别图像标签并在每次加载时重置回退值。无标签 V-Log TIFF 目前按线性 ProPhoto 处理，GUI 缺少空间／解码覆盖、目标输出空间选择，预览纹理按 sRGB 显示。原版具有输入解释、模拟输出、保存色彩空间和显示变换的独立语义。先复用 Rust 已有的色彩定义、RAW 白平衡与 Lensfun 实现，再接 GUI 控件、手动旋转和重新开发，将显示变换与写出的浮点数据及标签分开。验收覆盖带标签和无标签 V-Log、ProPhoto／Rec.2020 色块、带方向的 Bayer／X-Trans RAW、非默认 WB／Lensfun 及 TIFF32／EXR32 的保存读回。出处见 [Rust 输入](../crates/spektrafilm-gui/src/main.rs#L354)、[显示纹理](../crates/spektrafilm-gui/src/main.rs#L1802)、[RAW 开发选项](../crates/spektrafilm-io/src/raw.rs#L41) 及 Python `spektrafilm_gui/controller_runtime.py:137,158`、`controller.py:186,237,321`。
 3. **可恢复的参数会话。** 原版支持启动默认、保存／载入 GUI JSON、恢复出厂设置和记住目录。Rust 当前从内置参数启动，导出 JSON 仅用于子进程。在渲染请求参数稳定之后加带版本的本机设置和可携带预设，区分渲染参数与窗口／路径状态。明确首次启动和换片纸规则。Python 默认 Gold 200／Supra Endura，Rust 默认 Gold 200 的 profile 目标 Portra Endura，同一配置换纸有可见影响。验收覆盖重启、旧 JSON 缺字段、损坏 JSON、切换负片／正片和恢复默认。出处见 [Rust 启动](../crates/spektrafilm-gui/src/main.rs#L289)、[片纸切换](../crates/spektrafilm-gui/src/main.rs#L881) 及 Python `spektrafilm_gui/persistence.py:45,57,75,94`、`state.py:351`。
 
+#### Preview 与 Scan 验收
+
+分支 `codex/gui-preview-lut-stages` 基于 `e86c342`，仍以下载的 Python 0.3.4（`3bb2c2d`）为对照。手动 Preview 和默认开启的 Auto preview 用 **Preview max size**，手动 Scan 和 f64 Export 用 **Scan / export scale**，默认 `1.0` 保留裁切后的全尺寸。管线创建和缓存复用移到 worker。队列保留最新请求，旧代次的结果和错误不覆盖当前状态，保存使用当前代次已完成的图。P0 的源图副本及原子替换路径继续用于导出。出处见 [GUI 请求](../crates/spektrafilm-gui/src/main.rs#L428)、[分模式参数](../crates/spektrafilm-gui/src/main.rs#L1836) 及 Python `spektrafilm_gui/controller.py:274,489,683`。
+
+- 1024×768 的亮外围／暗裁切区域测试，预览上限 128 时得到 64×32，Scan 为 512×256。Scan 比例改为 0.5 时得到 256×128，写入 TIFF32 并读回尺寸一致，预览缓冲逐值一致。关闭 Auto preview 后，改参会立即使旧输出失效，仍可手动排队。
+- 1440×960 的线性 ProPhoto TIFF32 测试中，预览上限 480，中心裁切 720×360，Preview 为 240×120，Scan 为 720×360。真实 f64 Export 在比例 1.0／0.5 时分别为 720×360／360×180。Preview 和 Scan 继续以原图测光，保持同一裁切和物理像素尺度。原版在该样本上的全图中位数测光为 `−1.96829 EV`，只测裁切区为 `+1.03171 EV`。Preview 与 Scan 的首个线性 RGB 样本一致，与 Python 按全图曝光渲染的该样本最大差约 `1.2e-9`。
+- Python GUI 先用抗锯齿双线性生成预览源图，再测光和裁切。Rust Preview 用全图测光和原坐标裁切，然后沿用现有抗锯齿三次样条缩放。1024×768 测试在两端使用相同顺序时，CPU f64 RGB 最大误差为 `5.03e-17`。以 Python GUI 的原顺序对照时，边界和测光差异带来的最大误差为 `0.00244`，平均 `6.08e-5`。Preview 使用原版的轻量效果配置，关闭颗粒、DIR 扩散、镜头模糊和扫描锐化，保留晕光等效果。
+
 ### P1 先让 2-LUT 可构建、可复跑
 
-1. **建立可注入和收集的确定性阶段接口。** Python 可通过 `SimulationPipeline.process(inject=…, collect=…)` 运行子链。Rust 已有阶段实现和只读转储，公开的 `Pipeline::process` 仍运行整条链。复用曝光／显影、印相、扫描和 `new_with_spectral`。首轮公开 `rgb_in → cmy_film` 与 `cmy_film → rgb_out`，并验证以底雾为基准的物理 CMY、每张相纸的中性滤片、预闪和曝光归一化、扫描参考值。LUT 模式保留逐像素 DIR，关闭空间、随机和全图相关操作，包括扫描黑白校正。验收先对照未量化阶段，再对照连接后的线性 RGB，分别验证单点、调序、拆批结果一致，以及换相纸只改变下游。出处见 [Rust 管线](../crates/spektrafilm-core/src/pipeline.rs#L454)、[印相](../crates/spektrafilm-core/src/stages/printing.rs#L153)、[扫描](../crates/spektrafilm-core/src/stages/scanning.rs#L145) 及 Python `spektrafilm/runtime/pipeline.py:101,174`、`params_builder.py:99`。
+1. **建立可注入和收集的确定性阶段接口（已完成）。** Python 可通过 `SimulationPipeline.process(inject=…, collect=…)` 运行子链。Rust 复用曝光／显影、印相、扫描和完整光谱标定，公开 `rgb_in → cmy_film` 与 `cmy_film → rgb_out`。实现与验证见本节下方。
 2. **把传递函数与曝光作为包契约。** 现有 Rust `export-lut` 为一张相纸生成一个 SDR sRGB CUBE，输入支持线性 ProPhoto、sRGB 和 V-Log。实测 `--topology 2lut` 返回参数错误。新包显式保存 `native` 和 Python `auto` 的有效曝光、输入／输出原色和传递函数。输入增益在解码之后，且中间值范围的探针和实际烘焙用相同增益。Python 的 sRGB `auto` 为中灰以上 4 档、增益 2.88，V-Log 原生约 8 档、增益约 1。Ektar 100／Ultra Endura 的 17³ sRGB 单 CUBE 对照 Python `auto`，最大代码值差为 `0.44246`，两边改用原生曝光后为 `6.73e-5`。旧单 CUBE 的原生默认应保持可用。出处见 [现有单 CUBE](../crates/spektrafilm-cli/src/main.rs#L414) 及 Python `spektrafilm_lut_creator/color_spaces.py:560,611`、`builders.py:879`。
 3. **交付一卷胶片、两张相纸的 CUBE 目录。** 2-LUT 是一个共享胶片 CUBE 加每张相纸各一个 CUBE。按 Python 以 9³ 编码采样探测胶片 CMY 上界，解码后施加增益并转 float32，三通道 `d_min=-0.2`，`d_max` 取观测峰值×1.05 后向上取四位小数。记录 schema v1 `bundle.json` 的版本、片纸、有效配置、传递函数、中间值范围和每个 LUT 的角色／路径／范围，附 README 和许可证。验收三个 CUBE 的计数、红轴最快的网格、两张相纸输出有区分、同一胶片段实际共享、文件读回复合与 Python 同设定链的对照。首个画质用例可用 Ektar 100／Ultra Endura、33³ sRGB→sRGB、`auto`，上游实际链的三线性 ΔE00 P99／最大值为 `0.267／0.863`，四面体为 `0.264／0.837`。出处见 Python `spektrafilm_lut_creator/builders.py:443,797`、`wires.py` 和 `metadata.py:102,137,176`。
+
+#### 2-LUT 阶段接口验收
+
+`LutPipeline::collect_film_cmy` 从 RGB 收集以底雾为基准的物理胶片密度，`inject_film_cmy` 从 `FilmCmy` 进入下游。CMY 支持负值余量，校验缓冲尺寸及有限值。CPU 采样复用每张相纸的中性滤片、预闪和曝光归一化，保留逐像素 DIR，关闭测光、裁切／缩放、空间／随机效果及扫描黑白校正。RGB 使用调用方设定的空间和传递函数，做 Python builder 对照时关闭两侧 CCTF 即可取得物理线性边界。现有 CLI 单 CUBE 通过 `process` 组合这两阶段。出处见 [LutPipeline](../crates/spektrafilm-core/src/pipeline/lut.rs)、[单 CUBE 接入](../crates/spektrafilm-cli/src/main.rs#L414) 及 Python `spektrafilm/runtime/pipeline.py:101,174`、`params_builder.py:99`。
+
+| CPU f64 用例 | 胶片 CMY 最大误差 | 合成线性 RGB 最大误差 | 负 CMY 注入后 RGB 最大误差 |
+|---|---:|---:|---:|
+| Ektar 100／Ultra Endura | `8.73e-8` | `1.56e-8` | `1.48e-9` |
+| Ektar 100／2393 | `8.73e-8` | `3.72e-8` | `3.92e-9` |
+| Portra 400／Portra Endura | `1.01e-7` | `4.69e-8` | `4.56e-13` |
+| Portra 400／2393 | `1.01e-7` | `8.60e-8` | — |
+
+误差均相对 Python 0.3.4 的未量化阶段。Ektar 输入为 4×3 线性 ProPhoto，独立注入 CMY 最低为 −0.2，预闪 0.0625，M/Y 偏移 +8/−4。Portra 使用 3×2 线性 sRGB，逐像素 DIR 和预闪开启。两组换纸时胶片 CMY 逐值一致，后半段输出不同。Ektar 分段合成与同形状一次调用逐值一致，拆成单点或调序后在 `2e-12` 内一致。Portra 的 f32／f64 定向回归还覆盖无效尺寸和非有限样本。以 Ektar／Ultra Endura 生成的 17³ 线性 ProPhoto、sRGB、V-Log 输入单 CUBE 与 `e86c342` 逐字节一致。2-LUT 包格式和曝光选项仍在本节后续清单。
+
+默认及 f64 工作区在 macOS 各通过 124 项测试，其中各有 14 项 GUI 回归。GUI 验收使用无窗口 worker 和真实 f64 导出子进程。
 
 ### P2 复用阶段与包结构推进 3／4-LUT
 

@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use spektrafilm_core::params::RuntimeParams;
-use spektrafilm_core::pipeline::Pipeline;
+use spektrafilm_core::pipeline::{LutPipeline, Pipeline};
 use spektrafilm_core::profile;
 use spektrafilm_io::raw;
 use spektrafilm_io::{
@@ -432,13 +432,15 @@ fn cmd_export_lut(
     let print = profile::load_profile_by_name(data_dir, &print_stock)
         .with_context(|| format!("loading print profile: {print_stock}"))?;
 
-    let params = lut_runtime_params(input_encoding);
-    let pipeline = Pipeline::new_with_spectral(film, print, params, data_dir)
+    let mut params = RuntimeParams::default();
+    params.io.input_color_space = input_encoding.color_space().name().into();
+    // Native V-Log code 1.0 has eight stops of headroom above 18% gray.
+    params.io.input_cctf_decoding = !matches!(input_encoding, LutInputEncoding::LinearProphoto);
+    let pipeline = LutPipeline::new(film, print, params, data_dir)
         .map_err(anyhow::Error::msg)
         .with_context(|| {
             format!("initializing calibrated LUT pipeline for {film_name} / {print_stock}")
         })?;
-    let backend = spektrafilm_gpu::cpu_backend::CpuBackend;
 
     // Flatten the cube as a 2D image with red as the fastest-varying axis.
     // The LUT mode disables spatial and image-dependent effects.
@@ -454,10 +456,7 @@ fn cmd_export_lut(
     }
     eprintln!("Generating {size}x{size}x{size} CUBE LUT...");
     let grid = ImageBuf::from_data(size, size * size, grid);
-    let rendered = pipeline.process(grid, &backend);
-    if rendered.data.iter().any(|value| !value.is_finite()) {
-        bail!("calibrated LUT render returned a non-finite sample");
-    }
+    let rendered = pipeline.process(&grid).context("sampling calibrated LUT")?;
 
     let transfer = match input_encoding {
         LutInputEncoding::LinearProphoto => "linear",
@@ -487,35 +486,4 @@ fn cmd_export_lut(
         .with_context(|| format!("writing CUBE file: {}", output.display()))?;
     eprintln!("LUT saved: {}", output.display());
     Ok(())
-}
-
-fn lut_runtime_params(input_encoding: LutInputEncoding) -> RuntimeParams {
-    let mut params = RuntimeParams::default();
-    params.io.input_color_space = input_encoding.color_space().name().into();
-    // Sample the native code domain. V-Log's code 1.0 has eight stops
-    // of headroom above 18% gray, giving unit gain with the upstream auto setting.
-    params.io.input_cctf_decoding = !matches!(input_encoding, LutInputEncoding::LinearProphoto);
-
-    // Match Python's per-pixel LUT mode. Optical, stochastic and image-wise
-    // operations are disabled, while pointwise DIR stays enabled.
-    params.camera.auto_exposure = false;
-    params.camera.exposure_compensation_ev = 0.0;
-    params.camera.lens_blur_um = 0.0;
-    params.camera.diffusion_filter.active = false;
-    params.enlarger.print_exposure = 1.0;
-    params.enlarger.print_exposure_compensation = false;
-    params.enlarger.lens_blur = 0.0;
-    params.enlarger.diffusion_filter.active = false;
-    params.film_render.halation.active = false;
-    params.film_render.halation.boost_ev = 0.0;
-    params.film_render.grain.active = false;
-    params.film_render.glare.active = false;
-    params.film_render.dir_couplers.diffusion_size_um = 0.0;
-    params.film_render.dir_couplers.diffusion_tail_um = 0.0;
-    params.print_render.glare.active = false;
-    params.scanner.white_correction = false;
-    params.scanner.black_correction = false;
-    params.scanner.lens_blur = 0.0;
-    params.scanner.unsharp_mask = [0.0, 0.0];
-    params
 }

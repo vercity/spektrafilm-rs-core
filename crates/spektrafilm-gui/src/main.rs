@@ -216,8 +216,7 @@ struct App {
     /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
-    pipeline_cache_key: Option<String>,
-    pipeline_cache: Option<Pipeline>,
+    pipeline_cache: Option<PipelineCache>,
     last_render_ms: f32,
     last_pipeline_build_ms: f32,
     last_input_clone_ms: f32,
@@ -226,8 +225,9 @@ struct App {
     status: String,
     /// The generation of the current inputs. Edits invalidate in-flight results.
     render_generation: u64,
-    /// First request since the previous dispatch. Multiple edits share one render.
-    render_requested_at: Option<Instant>,
+    auto_preview: bool,
+    /// Only the newest render request is queued while a render runs.
+    render_request: Option<RenderRequest>,
     /// Current preview zoom multiplier on top of the fit-to-panel
     /// scale (1.0 = fit). Mouse wheel adjusts it around the cursor,
     /// drag pans, double-click resets.
@@ -253,13 +253,44 @@ struct App {
     export_job: Option<ExportJob>,
 }
 
-/// One in-flight preview render. The worker owns a Pipeline + the
-/// ImageBuf clone and, when it finishes, sends back the output buffer
-/// plus the two timings the status bar shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderMode {
+    Preview,
+    Scan,
+}
+
+impl RenderMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "Preview",
+            Self::Scan => "Scan",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RenderRequest {
+    mode: RenderMode,
+    automatic: bool,
+    ready_at: Instant,
+}
+
+struct PipelineCache {
+    key: String,
+    pipeline: Pipeline,
+}
+
+/// An in-flight render owns the cache while the UI remains responsive.
 struct RenderJob {
     generation: u64,
-    rx: mpsc::Receiver<Result<RenderResult, String>>,
+    mode: RenderMode,
+    rx: mpsc::Receiver<RenderReply>,
     handle: Option<JoinHandle<()>>,
+}
+
+struct RenderReply {
+    pipeline_cache: Option<PipelineCache>,
+    result: Result<RenderResult, String>,
 }
 
 struct RenderResult {
@@ -333,7 +364,6 @@ impl App {
             output_bit_depth: 16,
             output_image: None,
             output_tex: None,
-            pipeline_cache_key: None,
             pipeline_cache: None,
             last_render_ms: 0.0,
             last_pipeline_build_ms: 0.0,
@@ -341,7 +371,8 @@ impl App {
             last_preview_ms: 0.0,
             last_worker_total_ms: 0.0,
             render_generation: 0,
-            render_requested_at: None,
+            auto_preview: true,
+            render_request: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             render_job: None,
@@ -394,49 +425,48 @@ impl App {
         }
     }
 
-    fn preview_pipeline(
-        &mut self,
-        film_name: &str,
-        print_name: &str,
-        params: &RuntimeParams,
-    ) -> Result<(Pipeline, f32), String> {
-        let t = Instant::now();
-        let key = preview_pipeline_cache_key(film_name, print_name, params);
-        if self.pipeline_cache_key.as_deref() == Some(key.as_str())
-            && let Some(pipeline) = self.pipeline_cache.as_ref()
-        {
-            return Ok((
-                pipeline.clone().with_params(params.clone()),
-                t.elapsed().as_secs_f32() * 1000.0,
-            ));
-        }
-
-        let film = profile::load_profile_by_name(&self.data_dir, film_name)
-            .map_err(|e| format!("film profile '{film_name}': {e}"))?;
-        let effective_print_name = if params.io.scan_film {
-            film_name
-        } else {
-            print_name
-        };
-        let print = profile::load_profile_by_name(&self.data_dir, effective_print_name)
-            .map_err(|e| format!("print profile '{effective_print_name}': {e}"))?;
-        let pipeline = Pipeline::new_with_spectral(film, print, params.clone(), &self.data_dir)
-            .map_err(|e| format!("pipeline build: {e}"))?;
-        self.pipeline_cache_key = Some(key);
-        self.pipeline_cache = Some(pipeline.clone());
-        Ok((pipeline, t.elapsed().as_secs_f32() * 1000.0))
-    }
-
     fn request_render(&mut self) {
         self.render_generation += 1;
         self.output_image = None;
-        if self.image.is_some() {
-            self.render_requested_at.get_or_insert_with(Instant::now);
+        if self.auto_preview && self.image.is_some() {
+            let ready_at = self
+                .render_request
+                .filter(|request| request.automatic)
+                .map_or_else(
+                    || Instant::now() + PREVIEW_DEBOUNCE,
+                    |request| request.ready_at,
+                );
+            self.render_request = Some(RenderRequest {
+                mode: RenderMode::Preview,
+                automatic: true,
+                ready_at,
+            });
+        } else {
+            self.render_request = None;
         }
     }
 
-    /// Run a queued preview off the UI thread using a snapshot of the inputs.
-    fn dispatch_render(&mut self, ctx: &egui::Context) {
+    fn request_render_mode(&mut self, mode: RenderMode) {
+        self.render_generation += 1;
+        self.output_image = None;
+        self.render_request = Some(RenderRequest {
+            mode,
+            automatic: false,
+            ready_at: Instant::now(),
+        });
+    }
+
+    fn set_auto_preview(&mut self, enabled: bool) {
+        self.auto_preview = enabled;
+        if enabled {
+            self.request_render();
+        } else if self.render_request.is_some_and(|request| request.automatic) {
+            self.render_request = None;
+        }
+    }
+
+    /// Run a queued render off the UI thread using a snapshot of the inputs.
+    fn dispatch_render(&mut self, ctx: &egui::Context, mode: RenderMode) {
         let t_clone = Instant::now();
         let Some(image) = self.image.as_ref().cloned() else {
             return;
@@ -444,19 +474,13 @@ impl App {
         let input_clone_ms = t_clone.elapsed().as_secs_f32() * 1000.0;
         let film_name = self.film_name.clone();
         let print_name = self.print_name.clone();
+        let data_dir = self.data_dir.clone();
         let params = self.params.clone();
-        let (pipeline, pipeline_build_ms) =
-            match self.preview_pipeline(&film_name, &print_name, &params) {
-                Ok(p) => p,
-                Err(msg) => {
-                    eprintln!("[spektrafilm] render error: {msg}");
-                    self.status = format!("Render error: {msg}");
-                    return;
-                }
-            };
+        let mut pipeline_cache = self.pipeline_cache.take();
         let backend = self.backend.clone();
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
+        self.status = format!("Rendering {}…", mode.label().to_lowercase());
         let handle = std::thread::Builder::new()
             .name("spektrafilm-render".into())
             .spawn(move || {
@@ -465,6 +489,15 @@ impl App {
                 // and the user gets a uselessly vague status line.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t_total = Instant::now();
+                    let params = render_params(params, mode, &image);
+                    let pipeline = render_pipeline(
+                        &mut pipeline_cache,
+                        &data_dir,
+                        &film_name,
+                        &print_name,
+                        params,
+                    )?;
+                    let pipeline_build_ms = t_total.elapsed().as_secs_f32() * 1000.0;
                     let t = Instant::now();
                     let output = if pipeline.params.io.scan_film && pipeline.film.is_positive() {
                         pipeline.process((*image).clone(), backend.as_ref())
@@ -490,12 +523,16 @@ impl App {
                     })
                 }))
                 .unwrap_or_else(|panic| Err(panic_message(&panic)));
-                let _ = tx.send(result);
+                let _ = tx.send(RenderReply {
+                    pipeline_cache,
+                    result,
+                });
                 ctx_for_worker.request_repaint();
             })
             .expect("OS thread spawn");
         self.render_job = Some(RenderJob {
             generation: self.render_generation,
+            mode,
             rx,
             handle: Some(handle),
         });
@@ -587,20 +624,25 @@ impl App {
         let Some(job) = self.render_job.as_mut() else {
             return;
         };
-        let result = match job.rx.try_recv() {
+        let reply = match job.rx.try_recv() {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err("worker thread vanished".into()),
+            Err(mpsc::TryRecvError::Disconnected) => RenderReply {
+                pipeline_cache: None,
+                result: Err("worker thread vanished".into()),
+            },
         };
         let generation = job.generation;
+        let mode = job.mode;
         if let Some(h) = job.handle.take() {
             let _ = h.join();
         }
         self.render_job = None;
+        self.pipeline_cache = reply.pipeline_cache;
         if generation != self.render_generation {
             return;
         }
-        match result {
+        match reply.result {
             Ok(r) => {
                 self.last_input_clone_ms = r.input_clone_ms;
                 self.last_pipeline_build_ms = r.pipeline_build_ms;
@@ -609,7 +651,8 @@ impl App {
                 self.last_worker_total_ms = r.worker_total_ms;
                 self.output_tex = Some(make_texture(ctx, r.preview));
                 self.status = format!(
-                    "Rendered {} × {} ({:.1} MP)",
+                    "{} {} × {} ({:.1} MP)",
+                    mode.label(),
                     r.output.width,
                     r.output.height,
                     r.output.pixel_count() as f64 / 1e6
@@ -626,7 +669,7 @@ impl App {
     /// Save the rendered output for the current input and film selection.
     fn save_dialog(&mut self) {
         let Some(out) = self.output_image.as_ref() else {
-            self.status = "Render a preview for the current settings before saving.".into();
+            self.status = "Run Preview or Scan before saving.".into();
             return;
         };
         let default_name = match self.source.as_ref().map(|source| source.original_path()) {
@@ -731,14 +774,11 @@ impl App {
         // the Cancel button (and `on_exit`) can kill the child cleanly
         // instead of letting it orphan after the GUI window closes.
         //
-        // Enlarger + scanner LUTs are toggled on for the export only.
-        // The GUI preview runs on wgpu (fast at full spectral
-        // integration; LUT round-trip via CPU PCHIP would only slow
-        // it down), but the f64 CPU export gets a 5-10× speedup from
-        // the LUT path — matching Python's typical export config.
+        // f64 CPU export uses the selected scan scale with the spectral LUTs.
         let film = self.film_name.clone();
         let paper = self.print_name.clone();
         let mut params = self.params.clone();
+        params.settings.preview_mode = false;
         params.settings.use_enlarger_lut = true;
         params.settings.use_scanner_lut = true;
         let bit_depth = self.bit_depth_for(&out_path);
@@ -860,7 +900,7 @@ impl App {
             let save_enabled = self.output_image.is_some();
             if ui
                 .add_enabled(save_enabled, egui::Button::new("Save…"))
-                .on_disabled_hover_text("Render a preview for the current settings before saving")
+                .on_disabled_hover_text("Run Preview or Scan before saving")
                 .clicked()
             {
                 self.save_dialog();
@@ -879,15 +919,34 @@ impl App {
                 if ui
                     .add_enabled(export_enabled, egui::Button::new("Export…"))
                     .on_hover_text(
-                        "Re-run the pipeline at f64 precision (CPU, via the spektrafilm-f64 \
-                         CLI subprocess) and write the selected image format. The live preview stays \
-                         at f32 GPU for speed; export trades time for precision.",
+                        "Render the opened image at the selected scan scale with the f64 CPU pipeline.",
                     )
                     .on_disabled_hover_text("Load an image first")
                     .clicked()
                 {
                     self.export_dialog(ctx);
                 }
+            }
+        });
+        ui.horizontal(|ui| {
+            let loaded = self.image.is_some();
+            if ui
+                .add_enabled(loaded, egui::Button::new("Preview"))
+                .on_hover_text("Render within the preview size limit.")
+                .clicked()
+            {
+                self.request_render_mode(RenderMode::Preview);
+            }
+            if ui
+                .add_enabled(loaded, egui::Button::new("Scan"))
+                .on_hover_text("Render with full effects at the selected scan scale.")
+                .clicked()
+            {
+                self.request_render_mode(RenderMode::Scan);
+            }
+            let mut auto_preview = self.auto_preview;
+            if ui.checkbox(&mut auto_preview, "Auto preview").changed() {
+                self.set_auto_preview(auto_preview);
             }
         });
         if let Some(source) = &self.source {
@@ -1468,14 +1527,18 @@ impl App {
                 }
                 changed |= ui
                     .add(
+                        egui::Slider::new(&mut self.params.settings.preview_max_size, 128..=4096)
+                            .logarithmic(true)
+                            .text("Preview max size"),
+                    )
+                    .on_hover_text("Preview long-edge limit in pixels.")
+                    .changed();
+                changed |= ui
+                    .add(
                         egui::Slider::new(&mut io.upscale_factor, 0.1..=1.0)
-                            .text("Working resolution"),
+                            .text("Scan / export scale"),
                     )
-                    .on_hover_text(
-                        "Resize the working image before processing (Python upscale_factor). \
-                         Lower = faster preview + export at reduced resolution; 1.0 = full \
-                         resolution. The diffusion-filter cost scales with this.",
-                    )
+                    .on_hover_text("1.0 retains the full resolution of the cropped image.")
                     .changed();
                 changed |= ui
                     .checkbox(&mut io.output_cctf_encoding, "Output sRGB encoded")
@@ -1550,11 +1613,11 @@ impl eframe::App for App {
             });
         if self.render_job.is_some() {
             ctx.request_repaint_after(IN_FLIGHT_REPAINT);
-        } else if let Some(requested_at) = self.render_requested_at {
-            let delay = PREVIEW_DEBOUNCE.saturating_sub(requested_at.elapsed());
+        } else if let Some(request) = self.render_request {
+            let delay = request.ready_at.saturating_duration_since(Instant::now());
             if delay.is_zero() {
-                self.render_requested_at = None;
-                self.dispatch_render(ctx);
+                self.render_request = None;
+                self.dispatch_render(ctx, request.mode);
             } else {
                 ctx.request_repaint_after(delay);
             }
@@ -1770,7 +1833,59 @@ fn fps_label(ms: f32) -> &'static str {
     }
 }
 
-fn preview_pipeline_cache_key(film_name: &str, print_name: &str, params: &RuntimeParams) -> String {
+fn render_params(mut params: RuntimeParams, mode: RenderMode, image: &ImageBuf) -> RuntimeParams {
+    params.settings.preview_mode = mode == RenderMode::Preview;
+    if mode == RenderMode::Preview {
+        let long_edge = image.width.max(image.height).max(1);
+        let cap = params.settings.preview_max_size.clamp(1, long_edge);
+        // Use the regular pipeline so it meters and crops the original frame
+        // before resampling and scales the physical pixel size for the render.
+        params.io.upscale_factor = (f64::from(cap) / f64::from(long_edge)) as f32;
+
+        // Match the Python GUI's preview-mode effect policy.
+        params.camera.lens_blur_um = 0.0;
+        params.enlarger.lens_blur = 0.0;
+        params.film_render.dir_couplers.diffusion_size_um = 0.0;
+        params.film_render.dir_couplers.diffusion_tail_um = 0.0;
+        params.film_render.grain.active = false;
+        params.print_render.glare.blur = 0.0;
+        params.scanner.lens_blur = 0.0;
+        params.scanner.unsharp_mask = [0.0, 0.0];
+    }
+    params
+}
+
+fn render_pipeline(
+    cache: &mut Option<PipelineCache>,
+    data_dir: &Path,
+    film_name: &str,
+    print_name: &str,
+    params: RuntimeParams,
+) -> Result<Pipeline, String> {
+    let key = render_pipeline_cache_key(film_name, print_name, &params);
+    if let Some(cached) = cache.as_ref().filter(|cached| cached.key == key) {
+        return Ok(cached.pipeline.clone().with_params(params));
+    }
+
+    let film = profile::load_profile_by_name(data_dir, film_name)
+        .map_err(|e| format!("film profile '{film_name}': {e}"))?;
+    let effective_print_name = if params.io.scan_film {
+        film_name
+    } else {
+        print_name
+    };
+    let print = profile::load_profile_by_name(data_dir, effective_print_name)
+        .map_err(|e| format!("print profile '{effective_print_name}': {e}"))?;
+    let pipeline = Pipeline::new_with_spectral(film, print, params, data_dir)
+        .map_err(|e| format!("pipeline build: {e}"))?;
+    *cache = Some(PipelineCache {
+        key,
+        pipeline: pipeline.clone(),
+    });
+    Ok(pipeline)
+}
+
+fn render_pipeline_cache_key(film_name: &str, print_name: &str, params: &RuntimeParams) -> String {
     serde_json::json!({
         "film": film_name,
         "print": print_name,
@@ -2343,15 +2458,23 @@ mod preview_tests {
         )))
     }
 
-    fn start_preview(app: &mut App) -> mpsc::Sender<Result<RenderResult, String>> {
+    fn start_preview(app: &mut App) -> impl FnOnce(Result<RenderResult, String>) + use<> {
         let (tx, rx) = mpsc::channel();
-        app.render_requested_at = None;
+        app.render_request = None;
         app.render_job = Some(RenderJob {
             generation: app.render_generation,
+            mode: RenderMode::Preview,
             rx,
             handle: None,
         });
-        tx
+        move |result| {
+            tx.send(RenderReply {
+                result,
+                pipeline_cache: None,
+            })
+            .ok()
+            .unwrap();
+        }
     }
 
     fn rendered_pixel(red: f32) -> RenderResult {
@@ -2374,9 +2497,7 @@ mod preview_tests {
         let mut app = App::new(Arc::new(CpuBackend), None);
         app.image = Some(Arc::new(ImageBuf::new(1, 1)));
         app.request_render();
-        start_preview(&mut app)
-            .send(Ok(rendered_pixel(0.1)))
-            .unwrap();
+        start_preview(&mut app)(Ok(rendered_pixel(0.1)));
         app.poll_render_job(&ctx);
         assert!(app.output_image.is_some());
 
@@ -2388,16 +2509,14 @@ mod preview_tests {
         app.request_render();
         app.params.camera.exposure_compensation_ev = 2.0;
         app.request_render();
-        let queued_at = app.render_requested_at.unwrap();
+        let queued_at = app.render_request.unwrap().ready_at;
 
-        stale.send(Ok(rendered_pixel(0.2))).unwrap();
+        stale(Ok(rendered_pixel(0.2)));
         app.poll_render_job(&ctx);
         assert!(app.output_image.is_none());
-        assert_eq!(app.render_requested_at, Some(queued_at));
+        assert_eq!(app.render_request.unwrap().ready_at, queued_at);
 
-        start_preview(&mut app)
-            .send(Ok(rendered_pixel(0.3)))
-            .unwrap();
+        start_preview(&mut app)(Ok(rendered_pixel(0.3)));
         app.poll_render_job(&ctx);
         assert_eq!(app.output_image.unwrap().data[0], from_f32(0.3));
     }
@@ -2413,9 +2532,7 @@ mod preview_tests {
 
         app.load_image_from_path(&path.0);
         assert_eq!(app.source.as_ref().unwrap().original_path(), path.0);
-        start_preview(&mut app)
-            .send(Ok(rendered_pixel(0.1)))
-            .unwrap();
+        start_preview(&mut app)(Ok(rendered_pixel(0.1)));
         app.poll_render_job(&ctx);
         assert!(app.output_tex.is_some());
         let stale = start_preview(&mut app);
@@ -2427,15 +2544,111 @@ mod preview_tests {
         drop(stale);
         app.poll_render_job(&ctx);
         assert_eq!(app.status, loaded_status);
-        assert!(app.render_requested_at.is_some());
+        assert!(app.render_request.is_some());
 
-        start_preview(&mut app)
-            .send(Err("test failure".into()))
-            .unwrap();
+        start_preview(&mut app)(Err("test failure".into()));
         app.poll_render_job(&ctx);
         assert_eq!(app.status, "Render error: test failure");
         assert!(app.output_image.is_none());
         assert!(app.output_tex.is_none());
+    }
+
+    #[test]
+    fn editing_with_auto_preview_off_only_invalidates_the_previous_result() {
+        let mut app = App::new(Arc::new(CpuBackend), None);
+        app.image = Some(Arc::new(ImageBuf::new(1, 1)));
+        app.request_render();
+        assert!(app.render_request.unwrap().automatic);
+        app.set_auto_preview(false);
+        assert!(app.render_request.is_none());
+
+        app.output_image = Some(ImageBuf::new(1, 1));
+        app.request_render();
+        assert!(app.output_image.is_none());
+        assert!(app.render_request.is_none());
+
+        app.request_render_mode(RenderMode::Scan);
+        assert_eq!(app.render_request.unwrap().mode, RenderMode::Scan);
+        assert!(!app.render_request.unwrap().automatic);
+        app.request_render_mode(RenderMode::Preview);
+        assert_eq!(app.render_request.unwrap().mode, RenderMode::Preview);
+        assert!(!app.render_request.unwrap().automatic);
+
+        app.set_auto_preview(true);
+        assert!(app.render_request.unwrap().automatic);
+    }
+
+    #[test]
+    fn preview_limits_its_render_before_processing_and_leaves_scan_scale_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("opened.png");
+        let image = image::RgbImage::from_fn(1024, 768, |x, y| {
+            let rgb = if (256..768).contains(&x) && (256..512).contains(&y) {
+                [128, 96, 64]
+            } else {
+                [220, 208, 196]
+            };
+            image::Rgb(rgb)
+        });
+        image.save(&source).unwrap();
+        let mut app = App::new(Arc::new(CpuBackend), Some(source));
+        app.film_name = "kodak_ektar_100".into();
+        app.print_name = "kodak_ultra_endura".into();
+        app.params.io.crop = true;
+        app.params.io.crop_center = [0.5, 0.5];
+        app.params.io.crop_size = [0.5, 0.25];
+        app.params.settings.preview_max_size = 128;
+        app.params.film_render.grain.active = false;
+        app.params.film_render.halation.active = false;
+        app.params.film_render.halation.boost_ev = 0.0;
+        app.params.film_render.dir_couplers.active = false;
+        app.params.print_render.glare.active = false;
+        app.params.scanner.unsharp_mask = [0.0, 0.0];
+        app.params.io.output_cctf_encoding = false;
+        assert!(app.params.camera.auto_exposure);
+
+        let ctx = egui::Context::default();
+        let finish = |app: &mut App, mode| {
+            app.request_render_mode(mode);
+            let request = app.render_request.take().unwrap();
+            app.dispatch_render(&ctx, request.mode);
+            assert!(app.pipeline_cache.is_none());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.render_job.is_some() && Instant::now() < deadline {
+                app.poll_render_job(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.render_job.is_none());
+            assert!(app.pipeline_cache.is_some());
+            app.output_image.take().expect(&app.status)
+        };
+
+        let preview = finish(&mut app, RenderMode::Preview);
+        assert_eq!((preview.width, preview.height), (64, 32));
+        assert_eq!(app.params.io.upscale_factor, 1.0);
+        let scan = finish(&mut app, RenderMode::Scan);
+        assert_eq!((scan.width, scan.height), (512, 256));
+        for (preview_value, scan_value) in preview.data.iter().zip(&scan.data).take(3) {
+            assert!((preview_value - scan_value).abs() < from_f32(1e-5));
+        }
+
+        app.params.io.upscale_factor = 0.5;
+        let preview_at_half_scan_scale = finish(&mut app, RenderMode::Preview);
+        assert_eq!(preview_at_half_scan_scale.data, preview.data);
+        let half_scan = finish(&mut app, RenderMode::Scan);
+        assert_eq!((half_scan.width, half_scan.height), (256, 128));
+        let saved = directory.path().join("scan.tiff");
+        write_preview_output(
+            &saved,
+            &half_scan,
+            &RasterWriteOptions {
+                bit_depth: Some(32),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let saved = read_image(&saved, DevelopOptions::default()).unwrap();
+        assert_eq!((saved.image.width, saved.image.height), (256, 128));
     }
 
     #[cfg(unix)]
