@@ -31,6 +31,7 @@ tracing-subscriber.workspace = true
 rfd = "0.15"
 rayon.workspace = true
 raw-window-handle = "0.6"
+tempfile = "3"
 
 # macOS-only: tag the CAMetalLayer's colorspace as sRGB so the OS
 # colour-manages the window correctly on wide-gamut external displays.

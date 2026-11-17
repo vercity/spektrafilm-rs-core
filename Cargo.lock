@@ -3811,6 +3811,7 @@ dependencies = [
  "spektrafilm-gpu",
  "spektrafilm-io",
  "spektrafilm-math",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

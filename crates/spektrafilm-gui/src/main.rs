@@ -20,12 +20,17 @@ use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_io::{
-    raster::{RasterColor, RasterMetadata, RasterWriteOptions, write_raster},
+    raster::{RasterColor, RasterMetadata, RasterWriteOptions},
     raw::DevelopOptions,
     read_image,
 };
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::{from_f32, srgb_encode, to_f32};
+
+mod export_output;
+mod source_snapshot;
+
+use export_output::{StagedOutput, temporary_export_directory, write_preview_output};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 const IN_FLIGHT_REPAINT: Duration = Duration::from_millis(16);
@@ -204,7 +209,7 @@ struct App {
     film_dev_times: Vec<f64>,
     print_dev_times: Vec<f64>,
     params: RuntimeParams,
-    image_path: Option<PathBuf>,
+    source: Option<Arc<source_snapshot::SourceSnapshot>>,
     image: Option<Arc<ImageBuf>>,
     source_metadata: RasterMetadata,
     output_bit_depth: u8,
@@ -322,7 +327,7 @@ impl App {
             film_dev_times,
             print_dev_times,
             params,
-            image_path: None,
+            source: None,
             image: None,
             source_metadata: RasterMetadata::default(),
             output_bit_depth: 16,
@@ -353,8 +358,16 @@ impl App {
 
     fn load_image_from_path(&mut self, path: &Path) {
         let t = Instant::now();
-        match read_image(path, DevelopOptions::default()) {
-            Ok(loaded) => {
+        let captured = source_snapshot::SourceSnapshot::capture(path)
+            .and_then(|source| {
+                Ok((
+                    read_image(source.path(), DevelopOptions::default())?,
+                    source,
+                ))
+            })
+            .with_context(|| format!("loading {}", path.display()));
+        match captured {
+            Ok((loaded, source)) => {
                 let color = loaded.color.unwrap_or(RasterColor {
                     color_space: "ProPhoto RGB",
                     cctf_encoding: false,
@@ -371,7 +384,7 @@ impl App {
                     t.elapsed().as_secs_f32() * 1000.0
                 );
                 self.image = Some(Arc::new(img));
-                self.image_path = Some(path.to_path_buf());
+                self.source = Some(Arc::new(source));
                 self.output_tex = None;
                 self.request_render();
             }
@@ -616,7 +629,7 @@ impl App {
             self.status = "Render a preview for the current settings before saving.".into();
             return;
         };
-        let default_name = match &self.image_path {
+        let default_name = match self.source.as_ref().map(|source| source.original_path()) {
             Some(p) => {
                 let stem = p
                     .file_stem()
@@ -637,7 +650,7 @@ impl App {
         if path.extension().is_none() {
             path.set_extension("png");
         }
-        match write_raster(
+        match write_preview_output(
             &path,
             out,
             &RasterWriteOptions {
@@ -679,7 +692,7 @@ impl App {
     /// `cargo build --release --features precision-f64 -p spektrafilm-cli`
     /// and either rename / symlink it to `spektrafilm-f64` or set the env var.
     fn export_dialog(&mut self, ctx: &egui::Context) {
-        let Some(input_path) = self.image_path.clone() else {
+        let Some(source) = self.source.clone() else {
             self.status = "Load an image before exporting.".into();
             return;
         };
@@ -690,7 +703,8 @@ impl App {
                 return;
             }
         };
-        let stem = input_path
+        let stem = source
+            .original_path()
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("spektrafilm");
@@ -702,7 +716,16 @@ impl App {
         else {
             return;
         };
+        self.start_f64_export(ctx, source, cli_path, out_path);
+    }
 
+    fn start_f64_export(
+        &mut self,
+        ctx: &egui::Context,
+        source: Arc<source_snapshot::SourceSnapshot>,
+        cli_path: PathBuf,
+        out_path: PathBuf,
+    ) {
         // Spawn the export on a worker thread so the egui event loop
         // keeps drawing. The cancel flag is shared with the worker so
         // the Cancel button (and `on_exit`) can kill the child cleanly
@@ -730,7 +753,7 @@ impl App {
             .spawn(move || {
                 let res = run_f64_export(
                     &cli_path,
-                    &input_path,
+                    source.path(),
                     &out_path,
                     bit_depth,
                     &film,
@@ -852,7 +875,7 @@ impl App {
                     self.cancel_export();
                 }
             } else {
-                let export_enabled = self.image_path.is_some();
+                let export_enabled = self.source.is_some();
                 if ui
                     .add_enabled(export_enabled, egui::Button::new("Export…"))
                     .on_hover_text(
@@ -867,9 +890,16 @@ impl App {
                 }
             }
         });
-        if let Some(p) = &self.image_path {
+        if let Some(source) = &self.source {
             ui.label(
-                egui::RichText::new(p.file_name().and_then(|s| s.to_str()).unwrap_or("")).small(),
+                egui::RichText::new(
+                    source
+                        .original_path()
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(""),
+                )
+                .small(),
             );
         }
         ui.add_space(4.0);
@@ -1938,25 +1968,18 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// RAII guard so the params tempfile is unlinked on every code path
-/// (early `?` return, panic during `Command::output`, normal exit).
-/// Without this, a failed `serde_json::to_writer` or a panic mid-spawn
-/// would leak user-state JSON into the OS temp dir.
+#[cfg(test)]
 struct TempPath(PathBuf);
 
+#[cfg(test)]
 impl Drop for TempPath {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
-/// Run the f64 CLI as a child process. Writes the current
-/// `RuntimeParams` to a temp JSON file, invokes
-/// `spektrafilm-f64 process …`, polls for completion while watching
-/// `cancel`, and surfaces the CLI's stderr verbatim on failure. If
-/// `cancel` is set the child is SIGKILLed and `Err("cancelled")` is
-/// returned — this prevents the orphan-process / system-freeze bug
-/// where closing the GUI mid-export left the CPU pipeline running.
+/// Run the f64 CLI against a staged output and publish after it exits
+/// successfully. Capture stderr and reap the child on cancellation.
 fn run_f64_export(
     cli_path: &Path,
     input: &Path,
@@ -1968,27 +1991,22 @@ fn run_f64_export(
     data_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp = TempPath(std::env::temp_dir().join(format!(
-        "spektrafilm-export-{}-{nanos}.json",
-        std::process::id()
-    )));
+    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+    let staged = StagedOutput::new(output)?;
+    let job_files = temporary_export_directory(&std::env::temp_dir(), "spektrafilm-export-")
+        .context("creating temporary export job directory")?;
+    let params_path = job_files.path().join("params.json");
     {
-        let f = std::fs::File::create(&temp.0)
-            .with_context(|| format!("creating params tempfile {}", temp.0.display()))?;
-        serde_json::to_writer(std::io::BufWriter::new(f), params)
-            .context("serializing params to JSON")?;
+        let file =
+            std::fs::File::create(&params_path).context("creating temporary export params")?;
+        serde_json::to_writer(file, params).context("serializing export params")?;
     }
 
     // Redirect diagnostics to disk so the child can make progress while the
     // GUI polls for completion or cancellation.
-    let stderr_path = temp.0.with_extension("stderr");
+    let stderr_path = job_files.path().join("stderr");
     let stderr_file = std::fs::File::create_new(&stderr_path)
         .with_context(|| format!("creating export log {}", stderr_path.display()))?;
-    let stderr_path = TempPath(stderr_path);
 
     let mut cmd = std::process::Command::new(cli_path);
     // Force the CPU backend: the wgpu shaders run f32 even in a
@@ -1998,13 +2016,13 @@ fn run_f64_export(
         .arg("process")
         .arg(input)
         .arg("-o")
-        .arg(output)
+        .arg(staged.path())
         .arg("--film")
         .arg(film)
         .arg("--paper")
         .arg(paper)
         .arg("--params")
-        .arg(&temp.0)
+        .arg(&params_path)
         .arg("--data-dir")
         .arg(data_dir)
         .stdout(std::process::Stdio::null())
@@ -2017,6 +2035,7 @@ fn run_f64_export(
         cmd.arg("--bit-depth").arg(bit_depth.to_string());
     }
 
+    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", cli_path.display()))?;
@@ -2024,19 +2043,25 @@ fn run_f64_export(
     // Poll loop. 100 ms is responsive to a Cancel click without
     // burning CPU while the export grinds through CPU f64 math.
     let status = loop {
-        if let Some(s) = child.try_wait().context("waiting for f64 CLI")? {
-            break s;
-        }
         if cancel.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("cancelled");
         }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("waiting for f64 CLI");
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     };
 
     if !status.success() {
-        let stderr_bytes = std::fs::read(&stderr_path.0)
+        let stderr_bytes = std::fs::read(&stderr_path)
             .with_context(|| format!("reading export log after CLI exited {status}"))?;
         let stderr = String::from_utf8_lossy(&stderr_bytes);
         let trimmed = stderr.trim();
@@ -2053,7 +2078,154 @@ fn run_f64_export(
             }
         );
     }
-    Ok(())
+    // A cancel may arrive between the last poll and the child's exit.
+    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
+    staged.publish()
+}
+
+#[cfg(all(test, unix))]
+mod f64_export_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn export_child(directory: &Path, body: &str) -> PathBuf {
+        let script = directory.join("export-child.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = process ] && [ \"$3\" = -o ] || exit 24\n\
+                 case \"$4\" in *.tiff) ;; *) exit 25 ;; esac\n\
+                 {body}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    fn run_child(script: &Path, input: &Path, target: &Path, cancel: &AtomicBool) -> Result<()> {
+        run_f64_export(
+            script,
+            input,
+            target,
+            Some(32),
+            "film",
+            "paper",
+            &RuntimeParams::default(),
+            Path::new("."),
+            cancel,
+        )
+    }
+
+    #[test]
+    fn successful_child_creates_or_replaces_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = export_child(directory.path(), r#"printf complete > "$4""#);
+        let target = directory.path().join("rendered frame.tiff");
+        let cancel = AtomicBool::new(false);
+        run_child(&script, Path::new("unused"), &target, &cancel).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"complete");
+
+        fs::write(&target, b"previous contents").unwrap();
+        run_child(&script, Path::new("unused"), &target, &cancel).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"complete");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_child_leaves_existing_and_absent_targets_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = export_child(
+            directory.path(),
+            r#"printf partial > "$4"; printf 'encoder failed' >&2; exit 23"#,
+        );
+        let target = directory.path().join("rendered.tiff");
+        let cancel = AtomicBool::new(false);
+        for existing in [false, true] {
+            if existing {
+                fs::write(&target, b"previous contents").unwrap();
+            }
+            let error = run_child(&script, Path::new("unused"), &target, &cancel).unwrap_err();
+            assert!(error.to_string().contains("exited 23 — encoder failed"));
+            if existing {
+                assert_eq!(fs::read(&target).unwrap(), b"previous contents");
+            } else {
+                assert!(!target.exists());
+            }
+            assert_eq!(
+                fs::read_dir(directory.path()).unwrap().count(),
+                1 + usize::from(existing)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_child_after_write_leaves_targets_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = export_child(
+            directory.path(),
+            r#"printf partial > "$4"; : > "$2"; exec sleep 30"#,
+        );
+        let marker = directory.path().join("staged-output-written");
+        let target = directory.path().join("rendered.tiff");
+
+        for existing in [false, true] {
+            if existing {
+                fs::write(&target, b"previous contents").unwrap();
+            }
+            let cancel = AtomicBool::new(false);
+            let (written, while_writing, result) = std::thread::scope(|scope| {
+                let export = scope.spawn(|| run_child(&script, &marker, &target, &cancel));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !marker.is_file() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let written = marker.is_file();
+                let while_writing = fs::read(&target);
+                cancel.store(true, Ordering::SeqCst);
+                (written, while_writing, export.join().unwrap())
+            });
+            assert!(written, "child did not write staged output");
+            assert_eq!(result.unwrap_err().to_string(), "cancelled");
+            if existing {
+                assert_eq!(while_writing.unwrap(), b"previous contents");
+                assert_eq!(fs::read(&target).unwrap(), b"previous contents");
+            } else {
+                assert_eq!(
+                    while_writing.unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert!(!target.exists());
+            }
+            fs::remove_file(&marker).unwrap();
+            assert_eq!(
+                fs::read_dir(directory.path()).unwrap().count(),
+                1 + usize::from(existing)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_publish_leaves_destination_directory_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = export_child(directory.path(), r#"printf complete > "$4""#);
+        let target = directory.path().join("rendered.tiff");
+        fs::create_dir(&target).unwrap();
+        let marker = target.join("keep");
+        fs::write(&marker, b"keep").unwrap();
+
+        let error = run_child(
+            &script,
+            Path::new("unused"),
+            &target,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().starts_with("publishing output to "));
+        assert_eq!(fs::read(&marker).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
 }
 
 /// macOS only: walk from the eframe `RawWindowHandle` down to the
@@ -2240,7 +2412,7 @@ mod preview_tests {
             .unwrap();
 
         app.load_image_from_path(&path.0);
-        assert_eq!(app.image_path.as_deref(), Some(path.0.as_path()));
+        assert_eq!(app.source.as_ref().unwrap().original_path(), path.0);
         start_preview(&mut app)
             .send(Ok(rendered_pixel(0.1)))
             .unwrap();
@@ -2289,6 +2461,7 @@ exit 23
         std::fs::set_permissions(&script.0, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let cancel = AtomicBool::new(false);
+        let output = fixture_path("unused-output.tiff");
         let err = std::thread::scope(|scope| {
             let (done, waiting) = mpsc::channel::<()>();
             let cancel = &cancel;
@@ -2300,7 +2473,7 @@ exit 23
             let result = run_f64_export(
                 &script.0,
                 Path::new("unused-input"),
-                Path::new("unused-output"),
+                &output.0,
                 Some(32),
                 "film",
                 "paper",
