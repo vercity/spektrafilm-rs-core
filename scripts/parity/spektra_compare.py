@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,17 @@ def parse_args() -> argparse.Namespace:
         choices=("ACES2065-1", "ProPhoto RGB", "sRGB"),
         default="ACES2065-1",
         help="Input primaries (default ACES2065-1). The channels must already be linear.",
+    )
+    parser.add_argument(
+        "--output-color-space",
+        choices=("sRGB", "ProPhoto RGB", "ITU-R BT.2020", "ACES2065-1", "V-Gamut"),
+        default="sRGB",
+        help="Output primaries for the linear comparison (default sRGB).",
+    )
+    parser.add_argument("--input-gamut", choices=("off", "xy", "oklch"))
+    parser.add_argument(
+        "--output-gamut",
+        choices=("off", "oklch", "oklrab", "cam16ucs", "jzazbz", "aces_rgc"),
     )
     destination = parser.add_mutually_exclusive_group(required=True)
     destination.add_argument("--paper", help="Explicit paper profile for print and scan")
@@ -108,6 +120,8 @@ def render_python(
 
     params = init_params(film_profile=args.film, print_profile=args.paper or args.film)
     for name, value in config["io"].items():
+        if name in ("input_gamut_compress", "output_gamut_compress"):
+            value = replace(getattr(params.io, name), **value)
         setattr(params.io, name, value)
     for name, value in config["settings"].items():
         setattr(params.settings, name, value)
@@ -204,7 +218,7 @@ def compare(args: argparse.Namespace) -> None:
         "io": {
             "input_color_space": args.input_color_space,
             "input_cctf_decoding": False,
-            "output_color_space": "sRGB",
+            "output_color_space": args.output_color_space,
             "output_cctf_encoding": False,
             "scan_film": args.scan_film,
         },
@@ -214,6 +228,12 @@ def compare(args: argparse.Namespace) -> None:
             "use_scanner_lut": args.scanner_lut,
         },
     }
+    if args.input_gamut is not None:
+        config["io"]["input_gamut_compress"] = (
+            {"active": False} if args.input_gamut == "off" else {"algorithm": args.input_gamut}
+        )
+    if args.output_gamut is not None:
+        config["io"]["output_gamut_compress"] = {"algorithm": args.output_gamut}
     with (args.out_dir / "rust_params.json").open("x", encoding="utf-8") as params_file:
         json.dump(config, params_file, indent=2)
         params_file.write("\n")

@@ -1286,13 +1286,10 @@ impl App {
             .show(ui, |ui| {
                 let algo = &mut self.params.io.output_gamut_compress.algorithm;
                 let mut changed = false;
-                // Only the ported modes are offered; cam16ucs is upstream's
-                // default, oklch the lighter perceptual option. Enabling either
-                // drops the preview off the GPU-resident fast path.
-                egui::ComboBox::from_label("Gamut compression")
+                egui::ComboBox::from_label("Output gamut compression")
                     .selected_text(algo.clone())
                     .show_ui(ui, |ui| {
-                        for opt in ["off", "oklch", "oklrab", "cam16ucs", "aces_rgc"] {
+                        for opt in ["off", "oklch", "oklrab", "cam16ucs", "jzazbz", "aces_rgc"] {
                             changed |= ui.selectable_value(algo, opt.to_string(), opt).changed();
                         }
                     });
@@ -1303,7 +1300,7 @@ impl App {
                 egui::ComboBox::from_label("Input gamut compression")
                     .selected_text(in_algo.clone())
                     .show_ui(ui, |ui| {
-                        for opt in ["off", "xy"] {
+                        for opt in ["off", "xy", "oklch"] {
                             changed |= ui.selectable_value(in_algo, opt.to_string(), opt).changed();
                         }
                     });

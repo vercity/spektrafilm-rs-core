@@ -1,5 +1,5 @@
 //! Output gamut compression — port of upstream spektrafilm's
-//! `utils/gamut_compression.compress_rgb` (oklch / oklrab / cam16ucs / aces_rgc).
+//! `utils/gamut_compression.compress_rgb`.
 //!
 //! The scan produces linear RGB in the chosen output color space. Colors
 //! outside the output cube would otherwise be hard-clipped to `[0, 1]` at
@@ -10,7 +10,7 @@
 //! lightness. A one-sided lightness compression first rolls super-bright
 //! highlights (`L > white`) back into range.
 //!
-//! Supports `oklch`, `oklrab`, `cam16ucs` (default), and `aces_rgc` via
+//! Supports `oklch`, `oklrab`, `jzazbz`, `cam16ucs` (default), and `aces_rgc` via
 //! `io.output_gamut_compress`.
 
 use std::collections::HashMap;
@@ -52,9 +52,9 @@ const M2_LAB_TO_LMS: [[f64; 3]; 3] = [
 
 // C_max(L, h) table grid dims, matching `_OKLCH_CMAX_TABLE_N_*`. The L-axis
 // bounds and the bisection's chroma ceiling are per-space (see `build`).
-const N_L: usize = 64;
-const N_H: usize = 720;
-const N_BISECT: usize = 18;
+pub(crate) const N_L: usize = 64;
+pub(crate) const N_H: usize = 720;
+pub(crate) const N_BISECT: usize = 18;
 
 #[inline]
 fn mat_vec(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
@@ -66,14 +66,14 @@ fn mat_vec(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
 }
 
 #[inline]
-fn xyz_to_oklab(xyz: [f64; 3]) -> [f64; 3] {
+pub(crate) fn xyz_to_oklab(xyz: [f64; 3]) -> [f64; 3] {
     let lms = mat_vec(&M1_XYZ_TO_LMS, xyz);
     let lms_ = [lms[0].cbrt(), lms[1].cbrt(), lms[2].cbrt()];
     mat_vec(&M2_LMS_TO_LAB, lms_)
 }
 
 #[inline]
-fn oklab_to_xyz(lab: [f64; 3]) -> [f64; 3] {
+pub(crate) fn oklab_to_xyz(lab: [f64; 3]) -> [f64; 3] {
     let lms_ = mat_vec(&M2_LAB_TO_LMS, lab);
     let lms = [lms_[0].powi(3), lms_[1].powi(3), lms_[2].powi(3)];
     mat_vec(&M1_LMS_TO_XYZ, lms)
@@ -111,9 +111,35 @@ pub(crate) fn reinhard_knee(d: f64, threshold: f64, limit: f64, power: f64) -> f
 }
 
 #[inline]
-fn h_grid(j: usize) -> f64 {
+pub(crate) fn h_grid(j: usize) -> f64 {
     // linspace(-pi, pi, N_H, endpoint=False)
     -std::f64::consts::PI + (2.0 * std::f64::consts::PI) * (j as f64) / (N_H as f64)
+}
+
+/// Bilinear `C_max(L, h)` lookup (L clamped, h wraps).
+#[inline]
+pub(crate) fn c_max_lookup(table: &[f64], l: f64, h: f64, l_min: f64, l_max: f64) -> f64 {
+    let l = l.clamp(l_min, l_max);
+    let h_step = h_grid(1) - h_grid(0);
+    let h_idx = (h - h_grid(0)) / h_step;
+    let h_floor = h_idx.floor();
+    let h_lo = (h_floor as i64).rem_euclid(N_H as i64) as usize;
+    let h_hi = (h_lo + 1) % N_H;
+    let h_frac = h_idx - h_floor;
+
+    let l_idx = (l - l_min) / (l_max - l_min) * ((N_L - 1) as f64);
+    let l_lo = (l_idx.floor() as i64).clamp(0, (N_L - 2) as i64) as usize;
+    let l_hi = l_lo + 1;
+    let l_frac = l_idx - l_lo as f64;
+
+    let v00 = table[l_lo * N_H + h_lo];
+    let v01 = table[l_lo * N_H + h_hi];
+    let v10 = table[l_hi * N_H + h_lo];
+    let v11 = table[l_hi * N_H + h_hi];
+    v00 * (1.0 - l_frac) * (1.0 - h_frac)
+        + v01 * (1.0 - l_frac) * h_frac
+        + v10 * l_frac * (1.0 - h_frac)
+        + v11 * l_frac * h_frac
 }
 
 /// Perceptual space the chroma reduction runs in.
@@ -122,6 +148,7 @@ enum Space {
     Oklch,
     /// OkLab with the Ottosson Lr-rebased lightness on the L axis.
     Oklrab,
+    Jzazbz,
     Cam16ucs,
 }
 
@@ -133,6 +160,7 @@ impl Space {
         match self {
             // oklrab shares OkLab coords; only the C_max lookup index differs.
             Space::Oklch | Space::Oklrab => xyz_to_oklab(xyz),
+            Space::Jzazbz => xyz_to_jzazbz(xyz),
             Space::Cam16ucs => xyz_to_cam16ucs(xyz, view),
         }
     }
@@ -141,6 +169,7 @@ impl Space {
     fn lab_to_rgb(self, lab: [f64; 3], target: RgbSpace, view: Cam16White) -> [f64; 3] {
         let xyz = match self {
             Space::Oklch | Space::Oklrab => oklab_to_xyz(lab),
+            Space::Jzazbz => jzazbz_to_xyz(lab),
             Space::Cam16ucs => cam16ucs_to_xyz(lab, view),
         };
         mat_vec(&target.from_xyz(), xyz)
@@ -167,6 +196,7 @@ impl Space {
     fn table_geometry(self) -> (f64, f64, f64) {
         match self {
             Space::Oklch | Space::Oklrab => (0.02, 1.0, 0.5),
+            Space::Jzazbz => (0.002, 0.18, 0.3),
             Space::Cam16ucs => (1.0, 110.0, 150.0),
         }
     }
@@ -190,7 +220,7 @@ pub struct OutputGamutCompress {
     cam16_white: Cam16White,
     knee: (f64, f64, f64),
     lightness: Option<(f64, f64, f64)>,
-    /// Perceptual lightness of the output white (1.0 for OkLab, ~100 for CAM16-UCS).
+    /// Perceptual lightness of the output white.
     l_white: f64,
     /// Lightness-axis bounds of the `C_max` table grid.
     l_min: f64,
@@ -251,14 +281,8 @@ impl OutputGamutCompress {
             "off" => return Self::identity(),
             "oklch" => Space::Oklch,
             "oklrab" => Space::Oklrab,
+            "jzazbz" => Space::Jzazbz,
             "cam16ucs" => Space::Cam16ucs,
-            other @ "jzazbz" => {
-                tracing::error!(
-                    algorithm = other,
-                    "output gamut compression: jzazbz not yet ported; disabling"
-                );
-                return Self::identity();
-            }
             other => {
                 tracing::error!(
                     algorithm = other,
@@ -277,6 +301,7 @@ impl OutputGamutCompress {
         let cam16_white = Cam16White::new(target);
         let l_white = match space {
             Space::Oklch | Space::Oklrab => 1.0,
+            Space::Jzazbz => xyz_to_jzazbz(target.white_xyz())[0],
             Space::Cam16ucs => xyz_to_cam16ucs(target.white_xyz(), cam16_white)[0],
         };
         let (l_min, l_max, _) = space.table_geometry();
@@ -294,21 +319,24 @@ impl OutputGamutCompress {
         }
     }
 
-    /// Shaders currently implement the perceptual transforms for sRGB.
+    /// The perceptual shaders cover OkLab and CAM16-UCS for sRGB only.
     pub(crate) fn requires_staged_rendering(&self) -> bool {
-        matches!(self.kind, Kind::Perceptual(_)) && self.target != RgbSpace::Srgb
+        match self.kind {
+            Kind::Perceptual(Space::Jzazbz) => true,
+            Kind::Perceptual(_) => self.target != RgbSpace::Srgb,
+            _ => false,
+        }
     }
 
     /// GPU-pass inputs for the active compressor (mode id matching
     /// `gamut_compress.wgsl`, knee/lightness coefficients, table geometry
-    /// and the baked `C_max` table). `None` when the compressor is off —
-    /// callers skip the pass entirely.
+    /// and the baked `C_max` table). `None` for inactive and CPU-only compressors.
     pub fn gpu_params(&self) -> Option<spektrafilm_gpu::GamutGpuParams<'_>> {
         if self.requires_staged_rendering() {
             return None;
         }
         let mode = match self.kind {
-            Kind::Off => return None,
+            Kind::Off | Kind::Perceptual(Space::Jzazbz) => return None,
             Kind::AcesRgc => 0,
             Kind::Perceptual(Space::Oklch) => 1,
             Kind::Perceptual(Space::Oklrab) => 2,
@@ -327,33 +355,6 @@ impl OutputGamutCompress {
             n_l: N_L as u32,
             n_h: N_H as u32,
         })
-    }
-
-    /// Bilinear `C_max(L, h)` lookup (L clamped, h wraps).
-    #[inline]
-    fn c_max_lookup(&self, l: f64, h: f64) -> f64 {
-        let l = l.clamp(self.l_min, self.l_max);
-        let h_step = h_grid(1) - h_grid(0);
-        let h_idx = (h - h_grid(0)) / h_step;
-        let h_floor = h_idx.floor();
-        let h_lo = (h_floor as i64).rem_euclid(N_H as i64) as usize;
-        let h_hi = (h_lo + 1) % N_H;
-        let h_frac = h_idx - h_floor;
-
-        let l_idx = (l - self.l_min) / (self.l_max - self.l_min) * ((N_L - 1) as f64);
-        let l_lo = (l_idx.floor() as i64).clamp(0, (N_L - 2) as i64) as usize;
-        let l_hi = l_lo + 1;
-        let l_frac = l_idx - l_lo as f64;
-
-        let t = &self.cmax;
-        let v00 = t[l_lo * N_H + h_lo];
-        let v01 = t[l_lo * N_H + h_hi];
-        let v10 = t[l_hi * N_H + h_lo];
-        let v11 = t[l_hi * N_H + h_hi];
-        v00 * (1.0 - l_frac) * (1.0 - h_frac)
-            + v01 * (1.0 - l_frac) * h_frac
-            + v10 * l_frac * (1.0 - h_frac)
-            + v11 * l_frac * h_frac
     }
 
     /// Compress a single linear output-RGB pixel. Identity when inactive.
@@ -377,7 +378,13 @@ impl OutputGamutCompress {
         let h = b.atan2(a);
         // C_max is looked up at the lookup-lightness (Lr for oklrab); the
         // reconstruction below keeps the reconstruction lightness `l`.
-        let c_max = self.c_max_lookup(space.lookup_lightness(l), h);
+        let c_max = c_max_lookup(
+            &self.cmax,
+            space.lookup_lightness(l),
+            h,
+            self.l_min,
+            self.l_max,
+        );
         let safe = c_max.max(1e-9);
         let d_comp = reinhard_knee(c / safe, self.knee.0, self.knee.1, self.knee.2);
         let c_new = d_comp * safe;
@@ -404,6 +411,105 @@ impl OutputGamutCompress {
         }
         out
     }
+}
+
+// Safdar 2017 JzAzBz with the same signed ST 2084 variant as colour-science.
+// The transforms take relative XYZ, with diffuse white at 100 cd/m².
+const JZAZBZ_WHITE_CD_M2: f64 = 100.0;
+const JZAZBZ_PQ_PEAK_CD_M2: f64 = 10_000.0;
+const JZAZBZ_B: f64 = 1.15;
+const JZAZBZ_G: f64 = 0.66;
+const JZAZBZ_D: f64 = -0.56;
+const JZAZBZ_D0: f64 = 1.629_549_953_282_156_6e-11;
+const JZAZBZ_PQ_C1: f64 = 3424.0 / 4096.0;
+const JZAZBZ_PQ_C2: f64 = 2413.0 / 128.0;
+const JZAZBZ_PQ_C3: f64 = 2392.0 / 128.0;
+const JZAZBZ_PQ_M1: f64 = 2610.0 / 16384.0;
+const JZAZBZ_PQ_M2: f64 = 1.7 * 2523.0 / 32.0;
+
+const JZAZBZ_XYZ_TO_LMS: [[f64; 3]; 3] = [
+    [0.41478972, 0.579999, 0.0146480],
+    [-0.2015100, 1.120649, 0.0531008],
+    [-0.0166008, 0.264800, 0.6684799],
+];
+const JZAZBZ_LMS_TO_XYZ: [[f64; 3]; 3] = [
+    [
+        1.9242264357876069,
+        -1.0047923125953657,
+        0.037651404030617994,
+    ],
+    [
+        0.35031676209499907,
+        0.7264811939316552,
+        -0.06538442294808501,
+    ],
+    [
+        -0.09098281098284752,
+        -0.3127282905230739,
+        1.5227665613052603,
+    ],
+];
+const JZAZBZ_LMS_P_TO_IZAZBZ: [[f64; 3]; 3] = [
+    [0.5, 0.5, 0.0],
+    [3.524, -4.066708, 0.542708],
+    [0.199076, 1.096799, -1.295875],
+];
+const JZAZBZ_IZAZBZ_TO_LMS_P: [[f64; 3]; 3] = [
+    [0.9999999999999999, 0.1386050432715393, 0.05804731615611899],
+    [
+        0.9999999999999999,
+        -0.13860504327153927,
+        -0.05804731615611874,
+    ],
+    [
+        0.9999999999999998,
+        -0.09601924202631892,
+        -0.8118918960560387,
+    ],
+];
+
+#[inline]
+fn signed_pow(value: f64, exponent: f64) -> f64 {
+    value.abs().powf(exponent).copysign(value)
+}
+
+#[inline]
+fn xyz_to_jzazbz(xyz: [f64; 3]) -> [f64; 3] {
+    let [x, y, z] = xyz.map(|value| value * JZAZBZ_WHITE_CD_M2);
+    let x_prime = JZAZBZ_B * x - (JZAZBZ_B - 1.0) * z;
+    let y_prime = JZAZBZ_G * y - (JZAZBZ_G - 1.0) * x;
+    let lms = mat_vec(&JZAZBZ_XYZ_TO_LMS, [x_prime, y_prime, z]);
+    let lms_p = lms.map(|value| {
+        let powered = signed_pow(value / JZAZBZ_PQ_PEAK_CD_M2, JZAZBZ_PQ_M1);
+        signed_pow(
+            (JZAZBZ_PQ_C1 + JZAZBZ_PQ_C2 * powered) / (1.0 + JZAZBZ_PQ_C3 * powered),
+            JZAZBZ_PQ_M2,
+        )
+    });
+    let [i, a, b] = mat_vec(&JZAZBZ_LMS_P_TO_IZAZBZ, lms_p);
+    let j = ((1.0 + JZAZBZ_D) * i) / (1.0 + JZAZBZ_D * i) - JZAZBZ_D0;
+    [j, a, b]
+}
+
+#[inline]
+fn jzazbz_to_xyz([j, a, b]: [f64; 3]) -> [f64; 3] {
+    let j = j + JZAZBZ_D0;
+    let i = j / (1.0 + JZAZBZ_D - JZAZBZ_D * j);
+    let lms_p = mat_vec(&JZAZBZ_IZAZBZ_TO_LMS_P, [i, a, b]);
+    let lms = lms_p.map(|value| {
+        let powered = signed_pow(value, 1.0 / JZAZBZ_PQ_M2);
+        let delta = powered - JZAZBZ_PQ_C1;
+        let numerator = if delta < 0.0 { 0.0 } else { delta };
+        JZAZBZ_PQ_PEAK_CD_M2
+            * signed_pow(
+                numerator / (JZAZBZ_PQ_C2 - JZAZBZ_PQ_C3 * powered),
+                1.0 / JZAZBZ_PQ_M1,
+            )
+    });
+    let [x_prime, y_prime, z] = mat_vec(&JZAZBZ_LMS_TO_XYZ, lms);
+    let x = (x_prime + (JZAZBZ_B - 1.0) * z) / JZAZBZ_B;
+    let y = (y_prime + (JZAZBZ_G - 1.0) * x) / JZAZBZ_G;
+    [x, y, z].map(|value| value / JZAZBZ_WHITE_CD_M2)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -749,6 +855,55 @@ mod tests {
                 assert!((actual - expected).abs() < 1e-6, "{target}: {rgb:?}");
             }
             assert!(comp.requires_staged_rendering());
+        }
+    }
+
+    /// Safdar 2017 reference rows from Python's `compress_rgb_jzazbz_chroma`
+    /// with the default chroma and lightness knees.
+    #[test]
+    fn jzazbz_matches_python_reference() {
+        let params = OutputGamutCompressParams {
+            algorithm: "jzazbz".into(),
+            ..Default::default()
+        };
+        let srgb = OutputGamutCompress::build(&params, "sRGB");
+        assert!(srgb.is_active());
+        assert!(srgb.requires_staged_rendering());
+        assert!(srgb.gpu_params().is_none());
+        assert_eq!(srgb.compress([0.0; 3]), [0.0; 3]);
+        let cases = [
+            (
+                "sRGB",
+                [0.5, 0.4, 0.3],
+                [0.500_001_736, 0.400_024_820, 0.300_007_383],
+            ),
+            (
+                "sRGB",
+                [2.0, 0.0, 0.0],
+                [1.000_143_220, 0.414_960_635, 0.327_763_363],
+            ),
+            (
+                "sRGB",
+                [-0.25, 0.0, 0.5],
+                [-0.082_010_818, -0.081_771_448, -0.081_736_008],
+            ),
+            (
+                "ITU-R BT.2020",
+                [1.0, -0.2, 0.7],
+                [0.794_302_238, 0.005_812_849, 0.592_695_809],
+            ),
+            (
+                "ProPhoto RGB",
+                [0.0, 2.0, 2.0],
+                [0.776_402_056, 0.811_315_640, 1.056_883_781],
+            ),
+        ];
+        for (target, rgb, expected) in cases {
+            let comp = OutputGamutCompress::build(&params, target);
+            let actual = comp.compress(rgb);
+            for (got, want) in actual.into_iter().zip(expected) {
+                assert!((got - want).abs() < 1e-6, "{target} {rgb:?}: {actual:?}");
+            }
         }
     }
 

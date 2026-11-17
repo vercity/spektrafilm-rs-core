@@ -4,28 +4,32 @@
 //! The compression is baked into the tc_lut once at build time via
 //! remap-resample: `new_lut[xy] = old_lut[compress(xy)]`. The per-pixel
 //! runtime path (RGB → CIE xy → tc → bilinear LUT sample) therefore stays
-//! compression-agnostic. Only the production `"xy"` algorithm (ACES-RGC-style
-//! radial compression toward the visible spectral locus) is ported; the
-//! inspection-only `"oklch"` input variant is not.
+//! compression-agnostic. The `"xy"` mode compresses radially from the film
+//! white toward the visible spectral locus. `"oklch"` holds OkLab hue and
+//! lightness fixed while compressing chroma to the same locus.
 
+use std::sync::OnceLock;
+
+use rayon::prelude::*;
 use spektrafilm_math::spectral::{self, CMF_X_F64, CMF_Y_F64, CMF_Z_F64, TcLut};
 
-use crate::gamut_compression::reinhard_knee;
+use crate::gamut_compression::{
+    N_BISECT, N_H, N_L, c_max_lookup, h_grid, oklab_to_xyz, reinhard_knee, xyz_to_oklab,
+};
 
 /// CIE 1931 2° visible spectral locus as a closed xy polygon, sampled at 5 nm
 /// from 380 to 700 nm (65 vertices + the first repeated). Mirrors upstream
 /// `spectral_locus_xy()`; the CMFs are the same colour-science values.
-fn spectral_locus_xy() -> Vec<[f64; 2]> {
+fn spectral_locus_xy() -> &'static [[f64; 2]] {
     // Wavelengths 380..=700 step 5 → indices 0..65 of the 380..780 grid.
-    const N: usize = 65;
-    let mut poly = Vec::with_capacity(N + 1);
-    for i in 0..N {
-        let (x, y, z) = (CMF_X_F64[i], CMF_Y_F64[i], CMF_Z_F64[i]);
-        let total = (x + y + z).max(1e-12);
-        poly.push([x / total, y / total]);
-    }
-    poly.push(poly[0]);
-    poly
+    const VERTICES: usize = 65;
+    static LOCUS: OnceLock<[[f64; 2]; VERTICES + 1]> = OnceLock::new();
+    LOCUS.get_or_init(|| {
+        std::array::from_fn(|vertex| {
+            let i = vertex % VERTICES;
+            xyz_to_locus_xy([CMF_X_F64[i], CMF_Y_F64[i], CMF_Z_F64[i]])
+        })
+    })
 }
 
 /// Distance from `origin` along unit `direction` to the first intersection
@@ -80,22 +84,100 @@ fn compress_xy_radial(
     ]
 }
 
+const OKLCH_L_MIN: f64 = 0.05;
+const OKLCH_L_MAX: f64 = 1.0;
+
+fn xyz_to_locus_xy([x, y, z]: [f64; 3]) -> [f64; 2] {
+    let total = (x + y + z).max(1e-12);
+    [x / total, y / total]
+}
+
+/// Ray crossing against the closed CIE xy polygon. The horizontal ray
+/// counts each vertex once by treating the endpoints as a half-open range.
+fn inside_locus([x, y]: [f64; 2], locus: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    for edge in locus.windows(2) {
+        let [x0, y0] = edge[0];
+        let [x1, y1] = edge[1];
+        if (y0 > y) != (y1 > y) && x < x0 + (x1 - x0) * (y - y0) / (y1 - y0) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// The input C_max table is defined by the spectral locus alone.
+fn oklch_c_max_table() -> &'static [f64] {
+    static TABLE: OnceLock<Vec<f64>> = OnceLock::new();
+    if let Some(table) = TABLE.get() {
+        return table;
+    }
+    // Bake before initializing the cache so concurrent Rayon callers can
+    // keep working while the first bake is in progress.
+    let table = build_oklch_c_max_table(spectral_locus_xy());
+    TABLE.get_or_init(|| table)
+}
+
+fn build_oklch_c_max_table(locus: &[[f64; 2]]) -> Vec<f64> {
+    let mut table = vec![0.0; N_L * N_H];
+    table
+        .par_chunks_exact_mut(N_H)
+        .enumerate()
+        .for_each(|(row, bins)| {
+            let l = OKLCH_L_MIN + row as f64 * ((OKLCH_L_MAX - OKLCH_L_MIN) / (N_L - 1) as f64);
+            for (bin, out) in bins.iter_mut().enumerate() {
+                let (sin_h, cos_h) = h_grid(bin).sin_cos();
+                let mut lo = 0.0;
+                let mut hi = 0.5;
+                for _ in 0..N_BISECT {
+                    let mid = (lo + hi) * 0.5;
+                    let xy = xyz_to_locus_xy(oklab_to_xyz([l, mid * cos_h, mid * sin_h]));
+                    if inside_locus(xy, locus) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                *out = lo;
+            }
+        });
+    table
+}
+
+fn compress_oklch_chroma([x, y]: [f64; 2], knee: (f64, f64, f64)) -> [f64; 2] {
+    // The LUT reaches y=0 at its edges. Python floors y before converting
+    // xy to XYZ at Y=1, so these cells keep their limiting chromaticity.
+    let y_denominator = y.max(1e-12);
+    let [l, a, b] = xyz_to_oklab([x / y_denominator, 1.0, (1.0 - x - y) / y_denominator]);
+    let h = b.atan2(a);
+    let c_max = c_max_lookup(oklch_c_max_table(), l, h, OKLCH_L_MIN, OKLCH_L_MAX).max(1e-9);
+    let (t, limit, p) = knee;
+    let c = reinhard_knee(a.hypot(b) / c_max, t, limit, p) * c_max;
+    let (sin_h, cos_h) = h.sin_cos();
+    xyz_to_locus_xy(oklab_to_xyz([l, c * cos_h, c * sin_h]))
+}
+
+enum Algorithm {
+    Off,
+    Xy,
+    Oklch,
+}
+
 /// Configured input gamut compressor. `build` resolves the algorithm string;
 /// `is_active` reports whether a non-identity remap will be applied.
 pub struct InputGamutCompress {
-    active: bool,
+    algorithm: Algorithm,
     knee: (f64, f64, f64),
-    locus: Vec<[f64; 2]>,
 }
 
 impl InputGamutCompress {
-    /// Resolve from the param algorithm string. `"off"` → inactive (identity);
-    /// `"xy"` → active radial compression. Any other value errors. The knee is
-    /// validated as in upstream `InputGamutCompressSpec.__post_init__`.
+    /// Resolve `"off"`, `"xy"`, or `"oklch"` and validate the knee following
+    /// upstream `InputGamutCompressSpec.__post_init__`.
     pub fn build(algorithm: &str, knee: [f32; 3]) -> Result<Self, String> {
-        let active = match algorithm {
-            "off" => false,
-            "xy" => true,
+        let algorithm = match algorithm {
+            "off" => Algorithm::Off,
+            "xy" => Algorithm::Xy,
+            "oklch" => Algorithm::Oklch,
             other => return Err(format!("unknown input gamut algorithm: {other}")),
         };
         let [t, l, p] = knee;
@@ -109,28 +191,23 @@ impl InputGamutCompress {
             return Err(format!("knee power must be > 0, got {p}"));
         }
         Ok(Self {
-            active,
+            algorithm,
             knee: (knee[0] as f64, knee[1] as f64, knee[2] as f64),
-            locus: if active {
-                spectral_locus_xy()
-            } else {
-                Vec::new()
-            },
         })
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        !matches!(self.algorithm, Algorithm::Off)
     }
 
     /// Bake the compression into a freshly resampled copy of `lut`. For each
     /// LUT cell we decode its tc index to CIE xy, compress, re-encode to tc,
     /// and bilinearly sample the original LUT there (clamp-to-edge boundary,
     /// matching `scipy.ndimage.map_coordinates(order=1, mode="nearest")`).
-    /// `ref_xy` is the film reference illuminant chromaticity — the
-    /// compression's achromatic axis. Returns `lut` unchanged when inactive.
+    /// The `"xy"` algorithm uses `ref_xy` as its achromatic axis.
+    /// Returns `lut` unchanged when inactive.
     pub fn remap(&self, lut: &TcLut, ref_xy: [f64; 2]) -> TcLut {
-        if !self.active {
+        if !self.is_active() {
             return lut.clone();
         }
         let size = lut.size;
@@ -142,7 +219,13 @@ impl InputGamutCompress {
                 // Step 1: tc cell → CIE xy.
                 let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
                 // Step 2: compress.
-                let cxy = compress_xy_radial([x, y], ref_xy, self.knee, &self.locus);
+                let cxy = match self.algorithm {
+                    Algorithm::Off => [x, y],
+                    Algorithm::Xy => {
+                        compress_xy_radial([x, y], ref_xy, self.knee, spectral_locus_xy())
+                    }
+                    Algorithm::Oklch => compress_oklch_chroma([x, y], self.knee),
+                };
                 // Step 3: compressed xy → tc.
                 let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
                 // Step 4: bilinear sample original LUT at (tx, ty) grid coords.
@@ -259,5 +342,31 @@ mod tests {
         let lut = synthetic_lut(16);
         let out = spec.remap(&lut, [0.3127, 0.3290]);
         assert_eq!(out.data, lut.data);
+    }
+
+    /// Python's input OkLCh remap, including LUT edges where y=0 and
+    /// saturated cells outside the spectral locus. The film white only
+    /// affects the radial algorithm.
+    #[test]
+    fn oklch_remap_matches_python_reference() {
+        let spec = InputGamutCompress::build("oklch", [0.0, 1.0, 6.0]).unwrap();
+        let lut = synthetic_lut(64);
+        let out = spec.remap(&lut, [0.3127, 0.3290]);
+        let cells = [
+            (0, 0, [0.3097350191, 0.3818999675, 0.4540649160]),
+            (10, 20, [0.3902313195, 0.4623962679, 0.5345612164]),
+            (32, 32, [0.5463948705, 0.6185598189, 0.6907152120]),
+            (63, 0, [0.3013510998, 0.3735160483, 0.4456809967]),
+            (63, 63, [0.4193442459, 0.4915091943, 0.5636741428]),
+        ];
+        for (i, j, expected) in cells {
+            let base = (i * 64 + j) * 3;
+            for (actual, expected) in out.data[base..base + 3].iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-7, "cell ({i},{j}): {actual}");
+            }
+        }
+        let checksum: f64 = out.data.iter().sum();
+        assert!((checksum - 6060.7266009485).abs() < 1e-6, "sum {checksum}");
+        assert_eq!(out.data, spec.remap(&lut, [0.3457, 0.3585]).data);
     }
 }

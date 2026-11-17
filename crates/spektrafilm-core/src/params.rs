@@ -611,8 +611,9 @@ impl Default for IoParams {
 /// Input gamut compression config — mirrors upstream `InputGamutCompressSpec`.
 /// Baked into the tc_lut at build time, so the per-pixel path stays
 /// compression-agnostic. `"xy"` (the default, matching upstream 0.3.4) applies
-/// the ACES-RGC-style radial compression toward the spectral locus;
-/// `algorithm = "off"` passes input chromaticities through unchanged.
+/// radial compression toward the spectral locus. `"oklch"` compresses chroma
+/// at constant OkLab lightness and hue. `active = false` or `algorithm = "off"`
+/// passes input chromaticities through unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputGamutCompressParams {
     #[serde(default = "default_true")]

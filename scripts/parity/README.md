@@ -39,6 +39,8 @@ The synthetic fixture contains a gray ramp through 4.0, saturated color patches,
 and mixed highlights. A direct scan omits the print exposure and print CMY taps.
 Use `--pointwise-dir` to enable DIR without diffusion. Use `--enlarger-lut` and
 `--scanner-lut` to compare the internal spectral LUT paths independently.
+`--input-gamut oklch` selects input OkLCh, and `--output-gamut jzazbz` selects
+output JzAzBz. Use `--output-color-space 'ITU-R BT.2020'` to compare Rec.2020.
 `--rust-bin` and `--data-dir` accept alternate paths.
 
 For an existing image, replace `--synthetic` with `--input /path/to/frame.tif`.
@@ -51,8 +53,8 @@ Use a new or empty output directory for each run. It receives the exact Rust JSO
 parameters, a 16-bit convenience TIFF from the Rust CLI, and `metrics.json`.
 `python_<tap>.npy` and `rust_<tap>.f64le` contain the compared values in interleaved
 H×W×3 order. Rust probes contain headerless little-endian float64 samples. The
-`rgb_out` tap is linear sRGB after scan-stage processing and before the terminal
-clamp or transfer encoding.
+`rgb_out` tap is linear RGB in the selected output space after scan-stage
+processing and before the terminal clamp or transfer encoding.
 
 `py_stages.py`, `py_bisect.py`, and `rs_bisect.rs` contain earlier diagnostic probes.
 

@@ -145,8 +145,43 @@ target/debug/spektrafilm-f64 export-lut --input-encoding vlog \
 
 Apple Silicon 的 Metal/wgpu f32 端到端验证覆盖 Rec.2020、ProPhoto、V-Log 输入与输出、Hanatos 校正面和模糊组合、`TH-KG3-L`，相对 Python 的最终 RGB 最大绝对误差为 `6.65e-6`。默认 workspace 测试通过 109 项，CLI 和相关库在 f64 下通过 104 项。CUDA feature 通过编译检查，硬件待测。
 
-后续仍有输入 OkLCh、输出 JzAzBz、其他相机 Log 和非 sRGB 感知压缩的 GPU 常驻路径。GUI 工作流及 2／3／4-LUT 仍按独立任务推进。
+其他相机 Log 和非 sRGB 感知压缩的 GPU 常驻路径仍待对齐。GUI 工作流及 2／3／4-LUT 仍按独立任务推进。
+
+## 输入 OkLCh 与输出 JzAzBz
+
+基于 `858c9dd`，对照本地 `/Users/ougu/Downloads/spektrafilm-main` 的 Python 0.3.4（`3bb2c2d`）和 colour-science 0.4.7。GUI 的 **Color management** 提供两种新选项，CLI `process --params` 使用 `io.input_gamut_compress.algorithm="oklch"` 和 `io.output_gamut_compress.algorithm="jzazbz"`。
+
+- 输入 OkLCh 在 Y=1 的 OkLab 坐标下从可见光谱轨迹构建 `C_max`，保留明度和色相，重映射预计算的 TC LUT。64×720 边界表的 46,080 项与 Python 逐位一致，包含 `y=0` 边界在内的 7 个 xy 样本最大误差为 `1.25e-16`。64×64×3 合成 TC LUT 重映射最大误差为 `5.60e-14`，P99 为 `1.54e-14`。
+- 输出 JzAzBz 以目标空间白点和 100 cd/m² 参考亮度计算边界，沿用现有明度压缩配置。每个目标空间比较 523 组 RGB，包括 `np.random.default_rng(12017).uniform(-0.05, 2, (512, 3))` 和 11 组黑位、近黑、中灰、原色、负通道及超白样本。sRGB、Rec.2020、ProPhoto、ACES2065-1、V-Gamut 之中的最大绝对误差为 `5.41e-8`，关闭明度压缩时为 `7.25e-13`。浮点输出保留上游压缩结果的范围，个别饱和 ProPhoto 超白样本仍可超过 1。
+
+### 端到端验证
+
+使用 [阶段对照脚本](../scripts/parity/spektra_compare.py) 的 8×8 线性 ACES2065-1 色板。色板包含线性值 0–4 的灰阶、饱和色块和混合高光。相纸路线用 Ektar 100／Ultra Endura，直扫用 Provia 100F。关闭自动测光、DIR、空间和随机效果。下表为 CPU f64 相对 Python 的最大绝对误差。
+
+| 输入 / 输出压缩和目标 | 胶片 log E | 最终线性 RGB |
+|---|---:|---:|
+| 默认 xy / CAM16-UCS，sRGB | 2.44e-15 | 2.91e-9，与 `858c9dd` 逐字节一致 |
+| OkLCh / CAM16-UCS，sRGB | 1.11e-15 | 2.91e-9 |
+| xy / JzAzBz，sRGB | 2.44e-15 | 2.04e-9，修改前为 0.21317 |
+| xy / JzAzBz，ProPhoto | 2.44e-15 | 2.14e-9 |
+| OkLCh / JzAzBz，Rec.2020 | 1.11e-15 | 2.03e-9 |
+| 输入关闭 / JzAzBz，sRGB | 1.78e-15 | 2.04e-9 |
+| OkLCh / JzAzBz，sRGB 直扫 | 1.44e-15 | 3.51e-9 |
+
+```bash
+PYTHONPATH="/Users/ougu/Downloads/spektrafilm-main/src" "$parity_python" \
+  scripts/parity/spektra_compare.py --synthetic --film kodak_ektar_100 \
+  --paper kodak_ultra_endura --input-gamut oklch --output-gamut jzazbz \
+  --output-color-space 'ITU-R BT.2020' --rust-bin target/debug/spektrafilm-f64 \
+  --out-dir "$(mktemp -d)"
+```
+
+Apple Silicon Metal/wgpu 对照中，输入 OkLCh 使用 GPU 常驻路径，JzAzBz 使用分段渲染并在 CPU 执行压缩。5 组配置相对 Python 的 Metal 最终 RGB 最大绝对误差为 `5.68e-6`，CPU f32 为 `9.56e-8`。Python 自带色域压缩测试通过 71 项。
+
+Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上采样方法，选择 OkLCh 后设 `active=false` 与 `algorithm="off"` 的胶片 log E 逐字节一致。Arctic 验证仅使用 Rust。
+
+默认 workspace 通过 111 项测试，CLI 和相关库在 f64 下通过 106 项。CUDA feature 通过编译检查，硬件待测。
 
 ## P3 进阶交付和持续验证
 
-单 LUT 达标后，先稳定胶片 CMY 的 2-LUT 接口，再做 3／4-LUT、曝光 shaper、OCIO 和其他交付格式。剩余色域算法和自定义 profile 形状校验各自验收。CI 增加 CPU f32／f64 回归和任意工作目录下的打包冒烟测试，Metal、CUDA 用对应硬件测画质。出处见 [现有发布流程](../.github/workflows/release.yml)。
+单 LUT 达标后，先稳定胶片 CMY 的 2-LUT 接口，再做 3／4-LUT、曝光 shaper、OCIO 和其他交付格式。单独验收自定义 profile 形状校验。CI 增加 CPU f32／f64 回归和任意工作目录下的打包冒烟测试，Metal、CUDA 用对应硬件测画质。出处见 [现有发布流程](../.github/workflows/release.yml)。

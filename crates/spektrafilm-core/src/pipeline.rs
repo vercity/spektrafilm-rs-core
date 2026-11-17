@@ -262,9 +262,9 @@ impl Pipeline {
                         )?;
                     }
 
-                    // Bake input gamut compression into the LUT at build time, around
-                    // the film reference illuminant (the runtime's achromatic axis).
-                    // The per-pixel path then stays compression-agnostic.
+                    // Bake input gamut compression into the LUT so the per-pixel
+                    // path stays compression-agnostic. The radial mode uses the
+                    // film reference illuminant as its achromatic axis.
                     let input_gamut = crate::input_gamut::InputGamutCompress::build(
                         params.io.input_gamut_compress.effective_algorithm(),
                         params.io.input_gamut_compress.knee,
