@@ -305,7 +305,7 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 | 4-LUT 画质 | 对照两端逐段与重采样结果。65³ Ektar 100／Ultra Endura V-Log→sRGB 三线性／四面体逐段最大 ΔE00 为 6.65／6.28，两端一致，样本仍超出最大值 2.0 的门槛。 |
 | 运行时阶段接口 | 已验收。普通渲染公开 `process_with_taps`，包含 `rgb_pre`、`cmy_print` 等边界，返回工作像素尺寸供从中途继续。Portra 400／Portra Endura 与 Provia 直扫启用全图测光、裁切、1.5× 缩放、空间效果与黑白校正，从每个可达阶段续跑与 Rust 一次渲染逐位一致。Python f64 对照同为 14×9，六个阶段从 `rgb_pre` 到 `rgb_out` 的最大差依次为 `2.22e-15`、`4.34e-9`、`1.66e-7`、`1.05e-7`、`1.70e-7`、`1.59e-7`。 |
 | 自定义 profile 保存 | 已验收。公共 `save_profile` 写回片纸 JSON，保留许可信息、波段空值和黑白片多显影时间，替换前先完整写入同目录暂存文件。Portra 400、Portra Endura 由 Python 原版读取并通过验证，光谱及密度数组形状、空值位置一致，有限数值的最大差为 `1.78e-15`。Rust 额外覆盖 Double-X 与保存失败后保留原件。 |
-| RAW 与其他文件细节 | EXIF 的嵌入 JPEG 缩略图已验收。Rust 与 Python 写出的 JPEG、PNG、TIFF 均能由 Exiv2 读回同一份 633 字节缩略图，新图主尺寸为 16×12。输出 XMP 色彩标签、EXIF 日期、MakerNote 与 RAW 去马赛克、高光和非直线镜头校正待验收。源码复核确认 Python 对 EXR 跳过 Exiv2 元数据写入，因此 EXR 通用元数据透传属于扩展。 |
+| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。MakerNote 与 RAW 去马赛克、高光和非直线镜头校正待验收。源码复核确认 Python 对 EXR 跳过 Exiv2 元数据写入，因此 EXR 通用元数据透传属于扩展。 |
 | GPU 和发布验证 | 对照 Metal／wgpu 的色域压缩、散射和颗粒。另需 CUDA、Lumix 和 Windows 文件取消／替换实测。待验收。 |
 
 ### 审阅验证范围

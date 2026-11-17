@@ -3846,6 +3846,7 @@ name = "spektrafilm-io"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "exr",
  "image",
  "lensfun",
@@ -3853,6 +3854,7 @@ dependencies = [
  "png",
  "rawler",
  "rayon",
+ "roxmltree",
  "spektrafilm-math",
  "tiff 0.10.3",
 ]

@@ -226,7 +226,7 @@ fn write_tiff(
             if let Some(icc) = icc {
                 directory.write_tag(Tag::IccProfile, icc)?;
             }
-            metadata.write_tiff_packets(directory)?;
+            metadata.write_tiff_packets(directory, color)?;
             output.write_data($data)?;
         }};
     }
@@ -267,10 +267,8 @@ fn write_png(
         true,
     )?));
     let mut encoder = png::Encoder::with_info(&mut file, info)?;
-    if let Some(text) = metadata
-        .xmp
-        .as_deref()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    if let Some(packet) = metadata.xmp_for_color(color)
+        && let Ok(text) = std::str::from_utf8(&packet)
     {
         encoder.add_itxt_chunk("XML:com.adobe.xmp".into(), text.into())?;
     }
@@ -323,7 +321,7 @@ fn write_jpeg(
         2
     };
     file.write_all(&bytes[..insertion])?;
-    metadata.write_jpeg_packets(&mut file)?;
+    metadata.write_jpeg_packets(&mut file, color)?;
     file.write_all(&bytes[insertion..])?;
     file.flush()?;
     Ok(())

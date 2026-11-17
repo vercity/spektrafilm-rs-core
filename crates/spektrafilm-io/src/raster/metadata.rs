@@ -30,6 +30,8 @@ const PHOTOSHOP_TAG: u16 = 34377;
 const IPTC_NAA_TAG: u16 = 33723;
 const JPEG_THUMB_OFFSET: u16 = 513;
 const JPEG_THUMB_SIZE: u16 = 514;
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const PHOTOSHOP: &str = "http://ns.adobe.com/photoshop/1.0/";
 
 type Tags = Vec<(u16, Value)>;
 
@@ -39,7 +41,7 @@ pub struct RasterMetadata {
     exif: Tags,
     gps: Tags,
     jpeg_thumbnail: Option<Vec<u8>>,
-    pub(super) xmp: Option<Vec<u8>>,
+    xmp: Option<Vec<u8>>,
     pub(super) icc: Option<Vec<u8>>,
     // JPEG APP13 and TIFF tag 34377 both use Photoshop Image Resources.
     photoshop: Option<Vec<u8>>,
@@ -178,9 +180,16 @@ impl RasterMetadata {
         color: Option<RasterColor>,
     ) -> Result<Directories> {
         let srgb = color.is_some_and(|color| color.color_space == "sRGB" && color.cctf_encoding);
-        let interoperability = if srgb {
+        let interoperability_index = match color {
+            Some(_) if srgb => Some("R98"),
+            Some(color) if color.color_space == "Adobe RGB (1998)" && color.cctf_encoding => {
+                Some("R03")
+            }
+            _ => None,
+        };
+        let interoperability = if let Some(index) = interoperability_index {
             let mut directory = encoder.extra_directory()?;
-            directory.write_tag(Tag::Unknown(1), "R98")?;
+            directory.write_tag(Tag::Unknown(1), index)?;
             Some(directory.finish_with_offsets()?.offset)
         } else {
             None
@@ -211,6 +220,8 @@ impl RasterMetadata {
     ) -> Result<()> {
         write_tags(root, &self.root)?;
         root.write_tag(Tag::Orientation, 1u16)?;
+        let now = chrono::Local::now().format("%Y:%m:%d %H:%M:%S").to_string();
+        root.write_tag(Tag::DateTime, now.as_str())?;
         root.write_tag(Tag::Software, "spektrafilm")?;
         root.write_tag(Tag::ExifDirectory, directories.exif)?;
         if let Some(gps) = directories.gps {
@@ -253,12 +264,38 @@ impl RasterMetadata {
         Ok(())
     }
 
+    pub(super) fn xmp_for_color(&self, color: Option<RasterColor>) -> Option<Cow<'_, [u8]>> {
+        let Some(color) = color else {
+            return self.xmp.as_deref().map(Cow::Borrowed);
+        };
+        let profile = if color.cctf_encoding {
+            Cow::Borrowed(color.color_space)
+        } else {
+            Cow::Owned(format!("{} (linear)", color.color_space))
+        };
+        let description = format!(
+            r#"<rdf:Description xmlns:rdf="{RDF}" xmlns:photoshop="{PHOTOSHOP}" rdf:about="" photoshop:ICCProfile="{profile}"/>"#
+        );
+        match self.xmp.as_deref() {
+            None => Some(Cow::Owned(format!(
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="{RDF}">{description}</rdf:RDF></x:xmpmeta>"#
+            ).into_bytes())),
+            Some(packet) => Some(
+                std::str::from_utf8(packet)
+                    .ok()
+                    .and_then(|xml| update_xmp(xml, &description))
+                    .map_or(Cow::Borrowed(packet), |xml| Cow::Owned(xml.into_bytes())),
+            ),
+        }
+    }
+
     pub(super) fn write_tiff_packets<W: Write + Seek>(
         &self,
         directory: &mut DirectoryEncoder<'_, W, TiffKindStandard>,
+        color: Option<RasterColor>,
     ) -> Result<()> {
-        if let Some(bytes) = &self.xmp {
-            directory.write_tag(Tag::Unknown(XMP_TAG), bytes.as_slice())?;
+        if let Some(bytes) = self.xmp_for_color(color) {
+            directory.write_tag(Tag::Unknown(XMP_TAG), bytes.as_ref())?;
         }
         if let Some(bytes) = &self.photoshop {
             directory.write_tag(Tag::Unknown(PHOTOSHOP_TAG), bytes.as_slice())?;
@@ -280,9 +317,13 @@ impl RasterMetadata {
         Some(text)
     }
 
-    pub(super) fn write_jpeg_packets(&self, file: &mut impl Write) -> Result<()> {
-        if let Some(bytes) = &self.xmp {
-            write_jpeg_packet(file, 0xe1, b"http://ns.adobe.com/xap/1.0/\0", bytes)?;
+    pub(super) fn write_jpeg_packets(
+        &self,
+        file: &mut impl Write,
+        color: Option<RasterColor>,
+    ) -> Result<()> {
+        if let Some(bytes) = self.xmp_for_color(color) {
+            write_jpeg_packet(file, 0xe1, b"http://ns.adobe.com/xap/1.0/\0", &bytes)?;
         }
         if let Some(bytes) = &self.photoshop {
             write_jpeg_packet(file, 0xed, b"Photoshop 3.0\0", bytes)?;
@@ -309,6 +350,53 @@ pub(super) fn read_source_metadata(path: &Path) -> RasterMetadata {
         Some(RasterMetadata::from_decoder(path, format, &mut decoder))
     };
     raw().or_else(raster).unwrap_or_default()
+}
+
+fn update_xmp(xml: &str, description: &str) -> Option<String> {
+    let document = roxmltree::Document::parse(xml.trim_end_matches('\0')).ok()?;
+    let rdf = document
+        .descendants()
+        .find(|node| node.has_tag_name((RDF, "RDF")))?;
+    let is_profile = |node: roxmltree::Node<'_, '_>| node.has_tag_name((PHOTOSHOP, "ICCProfile"));
+    let mut removals = Vec::new();
+    for node in rdf.descendants().filter(roxmltree::Node::is_element) {
+        if node.ancestors().skip(1).any(is_profile) {
+            continue;
+        }
+        if is_profile(node) {
+            removals.push(node.range());
+        } else {
+            removals.extend(
+                node.attributes()
+                    .filter(|attribute| {
+                        attribute.namespace() == Some(PHOTOSHOP) && attribute.name() == "ICCProfile"
+                    })
+                    .map(|attribute| attribute.range()),
+            );
+        }
+    }
+
+    let range = rdf.range();
+    let text = &xml[range.clone()];
+    let mut updated = xml.to_owned();
+    if let Some(index) = text.rfind("</") {
+        updated.insert_str(range.start + index, description);
+    } else if text.ends_with("/>") {
+        let qualified_name = text[1..]
+            .split(|c: char| c.is_ascii_whitespace() || c == '/')
+            .next()?;
+        updated.replace_range(
+            range.end - 2..range.end,
+            &format!(">{description}</{qualified_name}>"),
+        );
+    } else {
+        return None;
+    }
+    removals.sort_unstable_by_key(|range| std::cmp::Reverse(range.start));
+    for range in removals {
+        updated.replace_range(range, "");
+    }
+    Some(updated)
 }
 
 fn read_thumbnail(reader: &mut (impl Read + Seek), directory: &IFD) -> Option<Vec<u8>> {
@@ -478,6 +566,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xmp_preserves_other_metadata_and_replaces_both_forms_of_the_profile() {
+        let old = format!(
+            r#"<r:RDF xmlns:r="{RDF}" xmlns:p="{PHOTOSHOP}"><r:Description p:ICCProfile="old" p:Credit="credit"><p:ICCProfile>older</p:ICCProfile></r:Description></r:RDF>"#
+        );
+        let metadata = RasterMetadata {
+            xmp: Some(old.into_bytes()),
+            ..RasterMetadata::default()
+        };
+        let packet = metadata
+            .xmp_for_color(RasterColor::new("ProPhoto RGB", false))
+            .unwrap();
+        let doc = roxmltree::Document::parse(std::str::from_utf8(&packet).unwrap()).unwrap();
+        let profiles: Vec<_> = doc
+            .descendants()
+            .filter_map(|node| node.attribute((PHOTOSHOP, "ICCProfile")))
+            .collect();
+        assert_eq!(profiles, ["ProPhoto RGB (linear)"]);
+        assert!(
+            doc.descendants()
+                .any(|node| node.attribute((PHOTOSHOP, "Credit")) == Some("credit"))
+        );
+        assert!(
+            !doc.descendants()
+                .any(|node| node.has_tag_name((PHOTOSHOP, "ICCProfile")))
+        );
+
+        let empty = format!(r#"<rdf:RDF xmlns:rdf="{RDF}"/>"#);
+        let metadata = RasterMetadata {
+            xmp: Some(empty.into_bytes()),
+            ..RasterMetadata::default()
+        };
+        let packet = metadata
+            .xmp_for_color(RasterColor::new("sRGB", true))
+            .unwrap();
+        let doc = roxmltree::Document::parse(std::str::from_utf8(&packet).unwrap()).unwrap();
+        assert!(
+            doc.descendants()
+                .any(|node| node.attribute((PHOTOSHOP, "ICCProfile")) == Some("sRGB"))
+        );
+    }
+
+    #[test]
     fn jpeg_thumbnail_offset_is_relocated_in_the_new_exif_payload() -> Result<()> {
         let bytes = vec![0xff, 0xd8, 0xff, 0xd9];
         let input = RasterMetadata {
@@ -519,7 +649,7 @@ mod tests {
         assert_eq!(decode_png_iptc(png_text.as_bytes()), Some(resource));
 
         let mut jpeg_packet = Vec::new();
-        metadata.write_jpeg_packets(&mut jpeg_packet)?;
+        metadata.write_jpeg_packets(&mut jpeg_packet, None)?;
         assert_eq!(&jpeg_packet[..2], &[0xff, 0xed]);
         assert_eq!(&jpeg_packet[4..18], b"Photoshop 3.0\0");
         assert_eq!(&jpeg_packet[30..], iim);
