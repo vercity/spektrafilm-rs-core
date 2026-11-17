@@ -64,6 +64,9 @@ pub(crate) struct BundleOptions {
     /// Evaluate the CUBEs as applied in sequence against the live pipeline.
     #[arg(long)]
     qa: bool,
+    /// Run QA only for this zero-based printing stock index.
+    #[arg(long, value_name = "I")]
+    qa_print_index: Option<usize>,
     /// New output directory.
     #[arg(short, long)]
     output: PathBuf,
@@ -561,16 +564,7 @@ impl BundleWriter<'_> {
         let live = self
             .baker
             .encode(&samples_for_runtime.run(pipeline, Tap::RgbOut)?)?;
-        let output = self.baker.output;
-        let space = output.space();
-        let to_lab = |code: [f64; 3]| {
-            let linear = code.map(|c| output.decode(c) / output.output_gain());
-            let xyz = space
-                .to_xyz()
-                .map(|row| row.iter().zip(linear).map(|(a, b)| a * b).sum());
-            qa::xyz_to_lab(xyz, space.white_xyz())
-        };
-        qa::evaluate(self.directory, &paths, samples, &live, to_lab)
+        qa::evaluate(self.directory, &paths, samples, &live, self.baker.output)
     }
 }
 
@@ -622,6 +616,13 @@ pub(crate) fn export(options: BundleOptions) -> Result<()> {
         options.input_encoding.name(),
         options.output_encoding.name(),
     )?;
+    if let Some(index) = options.qa_print_index {
+        ensure!(
+            index < options.paper.len(),
+            "QA print index {index} is out of range for {} printing stock(s)",
+            options.paper.len()
+        );
+    }
     let destination = &options.output;
     let name = destination
         .file_name()
@@ -680,7 +681,11 @@ pub(crate) fn export(options: BundleOptions) -> Result<()> {
             writer.bake_group(&pipeline, None)?;
         }
         writer.bake_group(&pipeline, Some(paper))?;
-        if let Some(samples) = &samples {
+        if let Some(samples) = &samples
+            && options
+                .qa_print_index
+                .is_none_or(|selected| selected == index)
+        {
             report.push((paper.clone(), writer.qa(&pipeline, paper, samples)?));
         }
     }

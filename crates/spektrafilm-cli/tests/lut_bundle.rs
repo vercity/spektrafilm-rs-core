@@ -166,3 +166,33 @@ fn numeric_exposure_and_destination_failures_are_explicit() {
     );
     assert!(!failed.exists());
 }
+
+#[test]
+fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("selected");
+    let response = export("2lut", &output, &["--qa", "--qa-print-index", "1"]);
+    assert!(
+        response.status.success(),
+        "{}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    let read =
+        |name| -> Value { serde_json::from_slice(&fs::read(output.join(name)).unwrap()).unwrap() };
+    let bundle = read("bundle.json");
+    assert_eq!(bundle["stocks"]["prints"].as_array().unwrap().len(), 2);
+    let qa = read("qa.json");
+    let prints = qa["prints"].as_object().unwrap();
+    assert_eq!(prints.len(), 1);
+    for kind in ["sequential", "resampled"] {
+        let method = &prints["kodak_2383"][kind]["trilinear"];
+        assert!(method["delta_e00_p95"].is_number());
+        assert!(method["delta_itp_p99"].is_number());
+    }
+
+    let invalid = temp.path().join("invalid-index");
+    let rejected = export("2lut", &invalid, &["--qa", "--qa-print-index", "2"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("QA print index 2 is out of range"));
+    assert!(!invalid.exists());
+}

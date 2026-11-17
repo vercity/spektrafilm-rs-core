@@ -8,6 +8,9 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+use spektrafilm_math::colorspace::XYZ_TO_REC2020_F64;
+
+use super::transport::Encoding;
 
 const SAMPLE_COUNT: usize = 50_000;
 const RNG_SEED: u64 = 20_260_515;
@@ -133,10 +136,11 @@ fn rgb_row<'a>(mut tokens: impl Iterator<Item = &'a str>) -> Result<[f64; 3]> {
 
 #[derive(Clone, Copy, Serialize)]
 struct Summary {
-    delta_e00_mean: f64,
-    delta_e00_p50: f64,
-    delta_e00_p99: f64,
-    delta_e00_max: f64,
+    mean: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
 }
 
 impl Summary {
@@ -149,18 +153,52 @@ impl Summary {
             values[lower] + (values[upper] - values[lower]) * x.fract()
         };
         Self {
-            delta_e00_mean: values.iter().sum::<f64>() / values.len() as f64,
-            delta_e00_p50: percentile(0.50),
-            delta_e00_p99: percentile(0.99),
-            delta_e00_max: values[values.len() - 1],
+            mean: values.iter().sum::<f64>() / values.len() as f64,
+            p50: percentile(0.50),
+            p95: percentile(0.95),
+            p99: percentile(0.99),
+            max: values[values.len() - 1],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ErrorMetrics {
+    delta_e00_mean: f64,
+    delta_e00_p50: f64,
+    delta_e00_p95: f64,
+    delta_e00_p99: f64,
+    delta_e00_max: f64,
+    delta_itp_mean: f64,
+    delta_itp_p50: f64,
+    delta_itp_p95: f64,
+    delta_itp_p99: f64,
+    delta_itp_max: f64,
+}
+
+impl ErrorMetrics {
+    fn new(delta_e00: Vec<f64>, delta_itp: Vec<f64>) -> Self {
+        let de = Summary::new(delta_e00);
+        let itp = Summary::new(delta_itp);
+        Self {
+            delta_e00_mean: de.mean,
+            delta_e00_p50: de.p50,
+            delta_e00_p95: de.p95,
+            delta_e00_p99: de.p99,
+            delta_e00_max: de.max,
+            delta_itp_mean: itp.mean,
+            delta_itp_p50: itp.p50,
+            delta_itp_p95: itp.p95,
+            delta_itp_p99: itp.p99,
+            delta_itp_max: itp.max,
         }
     }
 }
 
 #[derive(Clone, Copy, Serialize)]
 struct InterpolationMetrics {
-    trilinear: Summary,
-    tetrahedral: Summary,
+    trilinear: ErrorMetrics,
+    tetrahedral: ErrorMetrics,
     within_sdr_target: bool,
 }
 
@@ -175,7 +213,7 @@ pub(super) fn evaluate(
     paths: &[&str],
     samples: &[[f64; 3]],
     expected: &[[f64; 3]],
-    to_lab: impl Fn([f64; 3]) -> [f64; 3],
+    output: Encoding,
 ) -> Result<Metrics> {
     ensure!(!paths.is_empty(), "QA needs at least one CUBE");
     ensure!(
@@ -194,7 +232,11 @@ pub(super) fn evaluate(
             .iter()
             .fold(input, |value, cube| interpolate(cube, value))
     };
-    let sequential = measure(samples, expected, &to_lab, |input| {
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|&rgb| qa_coordinates(rgb, output))
+        .collect();
+    let sequential = measure(samples, &expected, output, |input| {
         (
             apply_chain(input, Cube::trilinear),
             apply_chain(input, Cube::tetrahedral),
@@ -212,7 +254,7 @@ pub(super) fn evaluate(
                 .map(|input| apply_chain(input, Cube::trilinear))
                 .collect(),
         };
-        measure(samples, expected, &to_lab, |input| {
+        measure(samples, &expected, output, |input| {
             (cube.trilinear(input), cube.tetrahedral(input))
         })?
     };
@@ -224,40 +266,36 @@ pub(super) fn evaluate(
 
 fn measure(
     samples: &[[f64; 3]],
-    expected: &[[f64; 3]],
-    to_lab: &impl Fn([f64; 3]) -> [f64; 3],
+    expected: &[QaCoordinates],
+    output: Encoding,
     interpolate: impl Fn([f64; 3]) -> ([f64; 3], [f64; 3]),
 ) -> Result<InterpolationMetrics> {
-    let mut trilinear = Vec::with_capacity(samples.len());
-    let mut tetrahedral = Vec::with_capacity(samples.len());
-    for (&input, &output) in samples.iter().zip(expected) {
-        ensure!(
-            input.into_iter().chain(output).all(f64::is_finite),
-            "non-finite QA sample"
-        );
-        let target = to_lab(output);
+    let mut trilinear_de = Vec::with_capacity(samples.len());
+    let mut tetrahedral_de = Vec::with_capacity(samples.len());
+    let mut trilinear_itp = Vec::with_capacity(samples.len());
+    let mut tetrahedral_itp = Vec::with_capacity(samples.len());
+    for (&input, target) in samples.iter().zip(expected) {
+        ensure!(input.into_iter().all(f64::is_finite), "non-finite QA input");
         let (tri, tetra) = interpolate(input);
-        let tri = to_lab(tri);
-        let tetra = to_lab(tetra);
+        let tri = qa_coordinates(tri, output);
+        let tetra = qa_coordinates(tetra, output);
+        let tri_de = delta_e00(tri.lab, target.lab);
+        let tetra_de = delta_e00(tetra.lab, target.lab);
+        let tri_itp = delta_itp(tri.ictcp, target.ictcp);
+        let tetra_itp = delta_itp(tetra.ictcp, target.ictcp);
         ensure!(
-            target
+            [tri_de, tetra_de, tri_itp, tetra_itp]
                 .into_iter()
-                .chain(tri)
-                .chain(tetra)
                 .all(f64::is_finite),
-            "non-finite Lab color"
-        );
-        let tri_error = delta_e00(tri, target);
-        let tetra_error = delta_e00(tetra, target);
-        ensure!(
-            tri_error.is_finite() && tetra_error.is_finite(),
             "non-finite color difference"
         );
-        trilinear.push(tri_error);
-        tetrahedral.push(tetra_error);
+        trilinear_de.push(tri_de);
+        tetrahedral_de.push(tetra_de);
+        trilinear_itp.push(tri_itp);
+        tetrahedral_itp.push(tetra_itp);
     }
-    let trilinear = Summary::new(trilinear);
-    let tetrahedral = Summary::new(tetrahedral);
+    let trilinear = ErrorMetrics::new(trilinear_de, trilinear_itp);
+    let tetrahedral = ErrorMetrics::new(tetrahedral_de, tetrahedral_itp);
     let within_sdr_target = [&trilinear, &tetrahedral]
         .into_iter()
         .all(|s| s.delta_e00_max <= 2.0 && s.delta_e00_p99 <= 1.0);
@@ -287,7 +325,97 @@ pub(super) fn write_report(directory: &Path, prints: Vec<(String, Metrics)>) -> 
     .context("writing LUT QA report")
 }
 
-pub(super) fn xyz_to_lab(xyz: [f64; 3], white: [f64; 3]) -> [f64; 3] {
+const D65: [f64; 3] = [0.950_455_927_051_671_6, 1.0, 1.089_057_750_759_878_4];
+
+// colour-science uses distinct published matrices for sRGB and BT.709,
+// although their primaries match. The runtime shares sRGB's working space.
+const BT709_TO_XYZ: [[f64; 3]; 3] = [
+    [
+        0.412_390_799_265_959_34,
+        0.357_584_339_383_877_96,
+        0.180_480_788_401_834_32,
+    ],
+    [
+        0.212_639_005_871_510_3,
+        0.715_168_678_767_755_9,
+        0.072_192_315_360_733_73,
+    ],
+    [
+        0.019_330_818_715_591_825,
+        0.119_194_779_794_625_95,
+        0.950_532_152_249_660_8,
+    ],
+];
+
+fn mat_vec(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    matrix.map(|row| row.iter().zip(vector).map(|(a, b)| a * b).sum())
+}
+
+fn to_xyz_qa(code: [f64; 3], output: Encoding) -> [f64; 3] {
+    let linear = code.map(|c| output.decode(c) / output.output_gain());
+    let matrix = if output == Encoding::Rec709 {
+        BT709_TO_XYZ
+    } else {
+        output.space().to_xyz()
+    };
+    mat_vec(matrix, linear)
+}
+
+struct QaCoordinates {
+    lab: [f64; 3],
+    ictcp: [f64; 3],
+}
+
+fn qa_coordinates(code: [f64; 3], output: Encoding) -> QaCoordinates {
+    let xyz = to_xyz_qa(code, output);
+    // Python's to_xyz_qa retains native primaries and its XYZ_to_Lab call
+    // uses the default D65 reference, including for ProPhoto RGB.
+    QaCoordinates {
+        lab: xyz_to_lab(xyz, D65),
+        ictcp: xyz_to_ictcp(xyz),
+    }
+}
+
+fn xyz_to_ictcp(xyz: [f64; 3]) -> [f64; 3] {
+    let rgb = mat_vec(XYZ_TO_REC2020_F64, xyz);
+    let lms = mat_vec(
+        [
+            [1688.0, 2146.0, 262.0],
+            [683.0, 2951.0, 462.0],
+            [99.0, 309.0, 3688.0],
+        ],
+        rgb,
+    );
+    // Dolby 2016 with the ST 2084 inverse EOTF, as used by Colour's
+    // XYZ_to_ICtCp on the reflectance-scale XYZ of Python's QA suite.
+    let lms = lms.map(|value| {
+        let power = signed_pow(value / (4096.0 * 10_000.0), 2610.0 / 16384.0);
+        signed_pow(
+            (3424.0 / 4096.0 + (2413.0 / 128.0) * power) / (1.0 + (2392.0 / 128.0) * power),
+            2523.0 / 32.0,
+        )
+    });
+    mat_vec(
+        [
+            [2048.0, 2048.0, 0.0],
+            [6610.0, -13613.0, 7003.0],
+            [17933.0, -17390.0, -543.0],
+        ],
+        lms,
+    )
+    .map(|value| value / 4096.0)
+}
+
+fn signed_pow(value: f64, power: f64) -> f64 {
+    value.abs().powf(power).copysign(value)
+}
+
+fn delta_itp(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let [i, t, p] = std::array::from_fn(|index| a[index] - b[index]);
+    720.0 * (i * i + 0.25 * t * t + p * p).sqrt()
+}
+
+fn xyz_to_lab(xyz: [f64; 3], white: [f64; 3]) -> [f64; 3] {
     const DELTA: f64 = 6.0 / 29.0;
     let [x, y, z] = std::array::from_fn(|i| {
         let t = xyz[i] / white[i];
@@ -396,6 +524,48 @@ mod tests {
         assert_eq!(cube.trilinear([0.75, 0.25, 0.5]), [0.1875, 0.25, 0.5]);
         assert_eq!(cube.tetrahedral([0.75, 0.25, 0.5]), [0.25, 0.25, 0.5]);
         assert_eq!(cube.tetrahedral([1.0, 1.0, 1.0]), [1.0; 3]);
+    }
+
+    #[test]
+    fn encoded_color_errors_match_python_d65_lab_and_ictcp() {
+        let a = [0.6, 0.18, 0.9];
+        let b = [0.48, 0.25, 0.86];
+        // Python 0.3.4 qa.metrics, using Colour 0.4.7.
+        for (space, de, itp) in [
+            (
+                Encoding::Srgb,
+                5.071_269_143_041_611_5,
+                10.688_941_268_084_59,
+            ),
+            (
+                Encoding::Prophoto,
+                8.787_045_156_965_615,
+                26.299_023_980_977_022,
+            ),
+            (
+                Encoding::Rec709,
+                5.071_093_430_310_547_5,
+                11.142_747_874_035_01,
+            ),
+            (
+                Encoding::Rec2020,
+                6.632_852_942_837_3,
+                18.563_571_013_037_055,
+            ),
+            (
+                Encoding::Rec2100Pq,
+                11.078_143_028_218_383,
+                19.280_061_856_468_617,
+            ),
+        ] {
+            let a = qa_coordinates(a, space);
+            let b = qa_coordinates(b, space);
+            assert!((delta_e00(a.lab, b.lab) - de).abs() < 1e-10, "{space:?}");
+            assert!(
+                (delta_itp(a.ictcp, b.ictcp) - itp).abs() < 1e-10,
+                "{space:?}"
+            );
+        }
     }
 
     #[test]
