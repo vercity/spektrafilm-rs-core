@@ -12,7 +12,7 @@ pub enum Cctf {
     Bt2020,
     VLog,
     Bt1886,
-    Gamma22,
+    AdobeRgb,
     Gamma26,
     Linear,
 }
@@ -33,7 +33,7 @@ impl Cctf {
             Self::VLog if x < from_f64(0.01) => from_f64(5.6) * x + from_f64(0.125),
             Self::VLog => from_f64(0.241514) * (x + from_f64(0.00873)).log10() + from_f64(0.598206),
             Self::Bt1886 => x.abs().powf(from_f64(1.0 / 2.4)).copysign(x),
-            Self::Gamma22 => x.abs().powf(from_f64(1.0 / 2.2)).copysign(x),
+            Self::AdobeRgb => x.abs().powf(from_f64(256.0 / 563.0)).copysign(x),
             Self::Gamma26 => x.abs().powf(from_f64(1.0 / 2.6)).copysign(x),
             Self::Linear => x,
         }
@@ -52,7 +52,7 @@ impl Cctf {
                     - from_f64(0.00873)
             }
             Self::Bt1886 => x.max(from_f64(0.0)).powf(from_f64(2.4)),
-            Self::Gamma22 => x.abs().powf(from_f64(2.2)).copysign(x),
+            Self::AdobeRgb => x.abs().powf(from_f64(563.0 / 256.0)).copysign(x),
             Self::Gamma26 => x.abs().powf(from_f64(2.6)).copysign(x),
             Self::Linear => x,
         }
@@ -163,7 +163,7 @@ impl RgbSpace {
             Self::Rec709 => Cctf::Bt1886,
             Self::DisplayP3 => Cctf::Srgb,
             Self::DciP3 => Cctf::Gamma26,
-            Self::AdobeRgb => Cctf::Gamma22,
+            Self::AdobeRgb => Cctf::AdobeRgb,
             Self::P3D65 => Cctf::Linear,
             Self::AcesCg => Cctf::Linear,
             Self::ArriWideGamut3 => Cctf::Linear,

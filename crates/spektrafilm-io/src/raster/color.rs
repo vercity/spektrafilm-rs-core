@@ -68,7 +68,7 @@ pub(super) fn make_icc(color: RasterColor) -> Result<Option<Vec<u8>>> {
     let curve = if color.cctf_encoding {
         match color.color_space {
             "ITU-R BT.709" => Some(ToneReprCurve::Parametric(vec![2.4])),
-            "Adobe RGB (1998)" => Some(ToneReprCurve::Parametric(vec![2.2])),
+            "Adobe RGB (1998)" => Some(ToneReprCurve::Parametric(vec![563.0 / 256.0])),
             "ProPhoto RGB" => Some(ToneReprCurve::Parametric(vec![
                 1.8,
                 1.0,
