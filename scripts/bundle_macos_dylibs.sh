@@ -27,7 +27,7 @@ copy_notices() {
     keg="${relative%/lib/*}"
     destination="$notices/$keg"
     local files=("$cellar/$keg"/LICENSE* "$cellar/$keg"/COPYING* "$cellar/$keg"/COPYRIGHT*
-                 "$cellar/$keg"/NOTICE* "$cellar/$keg"/README.ijg
+                 "$cellar/$keg"/NOTICE* "$cellar/$keg"/README.ij[g]
                  "$cellar/$keg"/share/doc/*/README.ijg)
     if (( ${#files[@]} == 0 )); then
         echo "No notices found in the Homebrew keg: $cellar/$keg" >&2
@@ -37,6 +37,10 @@ copy_notices() {
     for notice in "${files[@]}"; do
         cp -RL "$notice" "$destination/"
     done
+    local formula="$cellar/$keg/.brew/${keg%%/*}.rb"
+    if [[ -f "$formula" ]]; then
+        awk '/^  (homepage|url|sha256|revision) / { print }' "$formula" > "$destination/source.txt"
+    fi
 }
 
 # Canonical source paths keep basename collisions from silently binding the

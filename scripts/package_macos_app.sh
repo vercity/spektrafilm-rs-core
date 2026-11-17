@@ -116,6 +116,7 @@ Command-line tools in Spektrafilm.app/Contents/MacOS:
 - spektrafilm-lut: LUT bundle export using the Python Spektrafilm command syntax.
 
 License and dependency notices are in Spektrafilm.app/Contents/Resources/Notices.
+This software is based in part on the work of the Independent JPEG Group.
 
 Gatekeeper:
 - This package is ad-hoc signed for local testing. It is not Apple-notarized.
