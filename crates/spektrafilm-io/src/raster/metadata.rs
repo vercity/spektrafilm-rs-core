@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     fs::File,
-    io::{BufReader, Cursor, Read, Seek, Write},
+    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -28,6 +28,8 @@ const GPS_IFD: u16 = 0x8825;
 const XMP_TAG: u16 = 700;
 const PHOTOSHOP_TAG: u16 = 34377;
 const IPTC_NAA_TAG: u16 = 33723;
+const JPEG_THUMB_OFFSET: u16 = 513;
+const JPEG_THUMB_SIZE: u16 = 514;
 
 type Tags = Vec<(u16, Value)>;
 
@@ -36,6 +38,7 @@ pub struct RasterMetadata {
     root: Tags,
     exif: Tags,
     gps: Tags,
+    jpeg_thumbnail: Option<Vec<u8>>,
     pub(super) xmp: Option<Vec<u8>>,
     pub(super) icc: Option<Vec<u8>>,
     // JPEG APP13 and TIFF tag 34377 both use Photoshop Image Resources.
@@ -88,7 +91,9 @@ impl RasterMetadata {
     }
 
     fn from_tiff(reader: &mut (impl Read + Seek)) -> Option<Self> {
-        let decoder = GenericTiffReader::new(reader, 0, 0, Some(1), &[EXIF_IFD, GPS_IFD]).ok()?;
+        let decoder = GenericTiffReader::new(reader, 0, 0, Some(2), &[EXIF_IFD, GPS_IFD])
+            .or_else(|_| GenericTiffReader::new(reader, 0, 0, Some(1), &[EXIF_IFD, GPS_IFD]))
+            .ok()?;
         let root = decoder.chains().first()?;
         let packet = |tag| match &root.entries().get(&tag)?.value {
             Value::Byte(bytes) | Value::Undefined(bytes) => Some(bytes.clone()),
@@ -132,6 +137,10 @@ impl RasterMetadata {
                 !matches!(tag, 37500 | 40961..=40965)
             }),
             gps: copy_tags(root.get_sub_ifd(GPS_IFD), |_| true),
+            jpeg_thumbnail: decoder
+                .chains()
+                .get(1)
+                .and_then(|ifd| read_thumbnail(reader, ifd)),
             xmp: packet(XMP_TAG),
             icc: packet(34675),
             photoshop,
@@ -215,6 +224,7 @@ impl RasterMetadata {
         width: u32,
         height: u32,
         color: Option<RasterColor>,
+        include_thumbnail: bool,
     ) -> Result<Vec<u8>> {
         let mut bytes = Cursor::new(Vec::new());
         let mut encoder = TiffEncoder::new(&mut bytes)?;
@@ -222,7 +232,25 @@ impl RasterMetadata {
         let mut root = encoder.image_directory()?;
         self.write_root(&mut root, directories)?;
         root.finish()?;
+        if include_thumbnail {
+            self.write_thumbnail(&mut encoder)?;
+        }
         Ok(bytes.into_inner())
+    }
+
+    pub(super) fn write_thumbnail<W: Write + Seek>(
+        &self,
+        encoder: &mut TiffEncoder<W>,
+    ) -> Result<()> {
+        if let Some(bytes) = &self.jpeg_thumbnail {
+            let mut directory = encoder.image_directory()?;
+            let offset = u32::try_from(directory.write_data(bytes.as_slice())?)?;
+            directory.write_tag(Tag::Compression, 6u16)?;
+            directory.write_tag(Tag::Unknown(JPEG_THUMB_OFFSET), offset)?;
+            directory.write_tag(Tag::Unknown(JPEG_THUMB_SIZE), u32::try_from(bytes.len())?)?;
+            directory.finish()?;
+        }
+        Ok(())
     }
 
     pub(super) fn write_tiff_packets<W: Write + Seek>(
@@ -281,6 +309,23 @@ pub(super) fn read_source_metadata(path: &Path) -> RasterMetadata {
         Some(RasterMetadata::from_decoder(path, format, &mut decoder))
     };
     raw().or_else(raster).unwrap_or_default()
+}
+
+fn read_thumbnail(reader: &mut (impl Read + Seek), directory: &IFD) -> Option<Vec<u8>> {
+    let long = |tag| match &directory.entries().get(&tag)?.value {
+        Value::Long(values) => values.first().copied().map(u64::from),
+        Value::Short(values) => values.first().copied().map(u64::from),
+        _ => None,
+    };
+    let offset = long(JPEG_THUMB_OFFSET)?;
+    let length = long(JPEG_THUMB_SIZE)?;
+    if length < 4 || offset.checked_add(length)? > reader.seek(SeekFrom::End(0)).ok()? {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(offset)).ok()?;
+    let mut data = Vec::new();
+    reader.take(length).read_to_end(&mut data).ok()?;
+    (data.len() as u64 == length && data.starts_with(&[0xff, 0xd8])).then_some(data)
 }
 
 fn copy_tags(ifd: Option<&IFD>, mut retain: impl FnMut(u16) -> bool) -> Tags {
@@ -431,6 +476,23 @@ fn write_jpeg_packet(file: &mut impl Write, marker: u8, prefix: &[u8], data: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_thumbnail_offset_is_relocated_in_the_new_exif_payload() -> Result<()> {
+        let bytes = vec![0xff, 0xd8, 0xff, 0xd9];
+        let input = RasterMetadata {
+            jpeg_thumbnail: Some(bytes.clone()),
+            ..RasterMetadata::default()
+        };
+        let included = input.exif_bytes(8, 6, None, true)?;
+        let output = RasterMetadata::from_tiff(&mut Cursor::new(included)).unwrap();
+        assert_eq!(output.jpeg_thumbnail, Some(bytes));
+
+        let omitted = input.exif_bytes(8, 6, None, false)?;
+        let output = RasterMetadata::from_tiff(&mut Cursor::new(omitted)).unwrap();
+        assert!(output.jpeg_thumbnail.is_none());
+        Ok(())
+    }
 
     #[test]
     fn retains_long_iptc_in_tiff_and_png_text_profile() -> Result<()> {

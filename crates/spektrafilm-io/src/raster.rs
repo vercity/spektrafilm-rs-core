@@ -239,6 +239,7 @@ fn write_tiff(
             &image.data.iter().copied().map(to_f32).collect::<Vec<_>>()
         ),
     }
+    metadata.write_thumbnail(&mut encoder)?;
     file.flush()?;
     Ok(())
 }
@@ -263,6 +264,7 @@ fn write_png(
         image.width,
         image.height,
         color,
+        true,
     )?));
     let mut encoder = png::Encoder::with_info(&mut file, info)?;
     if let Some(text) = metadata
@@ -301,7 +303,12 @@ fn write_jpeg(
     if let Some(icc) = icc {
         encoder.set_icc_profile(icc)?;
     }
-    encoder.set_exif_metadata(metadata.exif_bytes(image.width, image.height, color)?)?;
+    let mut exif = metadata.exif_bytes(image.width, image.height, color, true)?;
+    // APP1 includes the two-byte length field and six-byte EXIF marker.
+    if exif.len() > u16::MAX as usize - 8 {
+        exif = metadata.exif_bytes(image.width, image.height, color, false)?;
+    }
+    encoder.set_exif_metadata(exif)?;
     encoder.write_image(
         &quantize8(image),
         image.width,
