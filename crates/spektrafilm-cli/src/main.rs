@@ -206,6 +206,10 @@ impl LutInputEncoding {
 }
 
 fn main() -> Result<()> {
+    if env!("CARGO_BIN_NAME") == "spektrafilm-lut" {
+        return lut_bundle::compat::run();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -30,6 +30,8 @@ pub(crate) struct DeliveryOptions {
     /// Write canonical CUBE files using the Lumix Real-Time LUT header.
     #[arg(long, value_enum)]
     target: Option<Target>,
+    #[arg(skip)]
+    python_layout: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -45,11 +47,44 @@ enum ExtraFormat {
     HaldPng,
 }
 
+impl Target {
+    fn name(self) -> &'static str {
+        match self {
+            Self::LumixRealtimeVlog => "lumix_realtime_vlog",
+        }
+    }
+}
+
+pub(super) fn target_names() -> impl Iterator<Item = &'static str> {
+    Target::value_variants().iter().map(|target| target.name())
+}
+
 impl DeliveryOptions {
-    pub(super) fn target_name(&self) -> Option<&'static str> {
-        self.target.map(|target| match target {
-            Target::LumixRealtimeVlog => "lumix_realtime_vlog",
+    pub(super) fn from_recipe(
+        target: Option<&str>,
+        zip: Option<PathBuf>,
+        ocio_config: bool,
+    ) -> Result<Self> {
+        let target = target
+            .map(|value| {
+                Target::from_str(value, false).map_err(|error| anyhow::anyhow!("target: {error}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            zip,
+            ocio_config,
+            target,
+            python_layout: true,
+            ..Default::default()
         })
+    }
+
+    pub(super) fn target_name(&self) -> Option<&'static str> {
+        self.target.map(Target::name)
+    }
+
+    pub(super) fn archive_path(&self) -> Option<&Path> {
+        self.zip.as_deref()
     }
 }
 
@@ -132,10 +167,12 @@ pub(super) fn validate_target(
 ) -> Result<()> {
     if matches!(options.target, Some(Target::LumixRealtimeVlog)) {
         ensure!(
-            topology == "1lut"
-                && input == "Panasonic V-Log"
-                && matches!(output, "sRGB" | "Rec.709" | "Rec.2020"),
-            "Lumix Real-Time LUT requires 1lut, Panasonic V-Log input, and encoded sRGB, Rec.709 or Rec.2020 output"
+            options.python_layout || topology == "1lut",
+            "Lumix Real-Time LUT requires 1lut"
+        );
+        ensure!(
+            input == "Panasonic V-Log" && matches!(output, "sRGB" | "Rec.709" | "Rec.2020"),
+            "Lumix Real-Time LUT requires Panasonic V-Log input and encoded sRGB, Rec.709 or Rec.2020 output"
         );
     }
     Ok(())
@@ -165,9 +202,20 @@ pub(super) fn finish_bundle(
     options: &DeliveryOptions,
 ) -> Result<Option<StagedArchive>> {
     options
-        .zip
-        .as_deref()
-        .map(|path| stage_archive(dir, archive_destination(path, destination)?))
+        .archive_path()
+        .map(|path| {
+            let root = if options.python_layout {
+                Some(
+                    destination
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .context("ZIP bundle root needs a UTF-8 directory name")?,
+                )
+            } else {
+                None
+            };
+            stage_archive(dir, archive_destination(path, destination)?, root)
+        })
         .transpose()
 }
 
@@ -205,11 +253,14 @@ fn archive_destination(zip: &Path, bundle: &Path) -> Result<PathBuf> {
     Ok(zip)
 }
 
-fn stage_archive(dir: &Path, destination: PathBuf) -> Result<StagedArchive> {
+fn stage_archive(dir: &Path, destination: PathBuf, root: Option<&str>) -> Result<StagedArchive> {
     let mut file =
         NamedTempFile::new_in(parent(&destination)).context("creating temporary ZIP archive")?;
     let mut archive = zip::ZipWriter::new(file.as_file_mut());
-    add_archive_files(&mut archive, dir, dir)?;
+    if let Some(root) = root {
+        archive.add_directory(format!("{root}/"), zip::write::SimpleFileOptions::default())?;
+    }
+    add_archive_files(&mut archive, dir, dir, root)?;
     archive.finish().context("finishing ZIP archive")?.flush()?;
     Ok(StagedArchive { file, destination })
 }
@@ -218,26 +269,36 @@ fn add_archive_files(
     archive: &mut zip::ZipWriter<&mut File>,
     root: &Path,
     dir: &Path,
+    archive_root: Option<&str>,
 ) -> Result<()> {
     let mut entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
     entries.sort_unstable_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
         let kind = entry.file_type()?;
+        let relative = path.strip_prefix(root)?;
+        let name = archive_root
+            .into_iter()
+            .map(Ok)
+            .chain(
+                relative
+                    .iter()
+                    .map(|part| part.to_str().context("non-UTF-8 archive entry")),
+            )
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
         if kind.is_dir() {
-            add_archive_files(archive, root, &path)?;
+            if archive_root.is_some() {
+                archive
+                    .add_directory(format!("{name}/"), zip::write::SimpleFileOptions::default())?;
+            }
+            add_archive_files(archive, root, &path, archive_root)?;
         } else {
             ensure!(
                 kind.is_file(),
                 "unsupported bundle entry {}",
                 path.display()
             );
-            let relative = path.strip_prefix(root)?;
-            let name = relative
-                .iter()
-                .map(|part| part.to_str().context("non-UTF-8 archive entry"))
-                .collect::<Result<Vec<_>>>()?
-                .join("/");
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .large_file(entry.metadata()?.len() >= u64::from(u32::MAX));

@@ -19,12 +19,15 @@ use spektrafilm_math::{
 };
 
 mod camera_curves;
+pub(crate) mod compat;
 mod delivery;
 mod qa;
 mod transport;
 
 use transport::{Encoding, Exposure};
 
+const UPSTREAM_VERSION: &str = "0.3.4";
+const UPSTREAM_VERSION_TAG: &str = "v034";
 const PROBE_SIZE: u32 = 9;
 const PROJECT_URL: &str = "https://github.com/andreavolpato/spektrafilm";
 const LICENSE_FILENAME: &str = "SPEKTRAFILM_LICENSE.txt";
@@ -76,6 +79,8 @@ pub(crate) struct BundleOptions {
     data_dir: PathBuf,
     #[command(flatten)]
     delivery: delivery::DeliveryOptions,
+    #[arg(skip)]
+    recipe: Option<compat::RecipeSettings>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -441,6 +446,7 @@ struct BundleWriter<'a> {
     options: &'a BundleOptions,
     directory: &'a Path,
     baker: Baker,
+    version_tag: String,
     luts: Vec<LutFile>,
 }
 
@@ -459,11 +465,8 @@ impl BundleWriter<'_> {
         let samples = samples.run(pipeline, segment.end)?;
         let code = self.baker.encode(&samples)?;
 
-        let file_stem = format!(
-            "lut_v{}_{}",
-            env!("CARGO_PKG_VERSION").replace('.', ""),
-            stock_tag(&self.options.film)
-        );
+        let film_tag = stock_tag(&self.options.film);
+        let title_stem = format!("{}_{film_tag}", self.version_tag);
         let paper_tag = paper.map_or(String::new(), |paper| format!("_{}", stock_tag(paper)));
         let suffix = if let Some(id) = combination {
             format!("_l{id}")
@@ -477,7 +480,7 @@ impl BundleWriter<'_> {
         } else {
             ""
         };
-        let path = format!("{prefix}{file_stem}{paper_tag}{suffix}.cube");
+        let path = format!("{prefix}lut_{title_stem}{paper_tag}{suffix}.cube");
         let mut writer = BufWriter::new(
             OpenOptions::new()
                 .write(true)
@@ -498,7 +501,8 @@ impl BundleWriter<'_> {
             contract(segment.start),
             contract(segment.end)
         )?;
-        writeln!(writer, "TITLE \"{file_stem}{paper_tag}{suffix}\"")?;
+        let title_prefix = if self.options.recipe.is_some() { "" } else { "lut_" };
+        writeln!(writer, "TITLE \"{title_prefix}{title_stem}{paper_tag}{suffix}\"")?;
         writeln!(writer, "DOMAIN_MIN 0.0 0.0 0.0")?;
         writeln!(writer, "DOMAIN_MAX 1.0 1.0 1.0")?;
         writeln!(writer, "LUT_3D_SIZE {size}")?;
@@ -592,6 +596,10 @@ fn runtime_params(options: &BundleOptions) -> RuntimeParams {
         OutputGamut::AcesRgc => "aces_rgc",
     }
     .into();
+    if let Some(recipe) = &options.recipe {
+        params.io.input_gamut_compress.clone_from(&recipe.input_gamut);
+        params.io.output_gamut_compress.clone_from(&recipe.output_gamut);
+    }
     params
 }
 
@@ -628,10 +636,14 @@ pub(crate) fn export(options: BundleOptions) -> Result<()> {
         );
     }
     let destination = &options.output;
-    let name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("expected a UTF-8 output directory name")?;
+    let name = if let Some(recipe) = &options.recipe {
+        &recipe.name
+    } else {
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("expected a UTF-8 output directory name")?
+    };
     ensure!(
         !destination.exists() && !destination.is_symlink(),
         "bundle destination already exists: {}",
@@ -659,6 +671,11 @@ pub(crate) fn export(options: BundleOptions) -> Result<()> {
             output: options.output_encoding,
             gain,
             wires: Wires::default(),
+        },
+        version_tag: if options.recipe.is_some() {
+            UPSTREAM_VERSION_TAG.into()
+        } else {
+            format!("v{}", env!("CARGO_PKG_VERSION").replace('.', ""))
         },
         luts: Vec::new(),
     };
@@ -748,7 +765,7 @@ fn write_metadata(
         "resolution": options.size,
         "target": options.delivery.target_name(),
         "provenance": {
-            "spektrafilm_version": "0.3.4",
+            "spektrafilm_version": UPSTREAM_VERSION,
             "lut_creator_version": env!("CARGO_PKG_VERSION"),
             "created": created.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "copyright": "Andrea Volpato (spektrafilm stock profiles); Rust port by spektrafilm-rs contributors.",

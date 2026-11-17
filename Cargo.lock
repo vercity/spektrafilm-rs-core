@@ -3775,6 +3775,7 @@ dependencies = [
  "spektrafilm-math",
  "tempfile",
  "tiff 0.10.3",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "zip",
