@@ -1,13 +1,17 @@
 use std::{cmp::Reverse, sync::OnceLock};
 
-use anyhow::{Context, Result, ensure};
-use lensfun::{Camera, Database, Lens, LensType, Modifier};
+use anyhow::{Context, Result};
+use lensfun::{Camera, Database, Lens};
 use rawler::{decoders::RawDecodeParams, formats::tiff::Rational, rawsource::RawSource};
-use rayon::prelude::*;
 use spektrafilm_math::{
     image::ImageBuf,
     precision::{Scalar, from_f64, to_f64},
 };
+
+mod correction;
+mod projection;
+
+use correction::Correction;
 
 static DATABASE: OnceLock<Result<Database, lensfun::Error>> = OnceLock::new();
 
@@ -82,100 +86,8 @@ fn select_lens<'a>(
 }
 
 fn correct(image: &mut ImageBuf, crop: f32, lens: &Lens, focal: f32, aperture: f32) -> Result<()> {
-    ensure!(
-        image.width > 0 && image.height > 0,
-        "empty image for lens correction"
-    );
-    ensure!(
-        lens.lens_type == LensType::Rectilinear,
-        "Lensfun cannot convert {:?} projection for {}",
-        lens.lens_type,
-        lens.model
-    );
-    let width = image.width as usize;
-    let mut modifier = Modifier::new(lens, focal, crop, image.width, image.height, false);
-    let distortion = modifier.enable_distortion_correction(lens);
-    let tca = modifier.enable_tca_correction(lens);
-    // The reference uses the Lensfun default subject distance of 1000 m.
-    if aperture > 0.0 && modifier.enable_vignetting_correction(lens, aperture, 1000.0) {
-        image
-            .data
-            .par_chunks_exact_mut(3 * width)
-            .enumerate()
-            .for_each_init(
-                || vec![1.0; width],
-                |gains, (y, row)| {
-                    gains.fill(1.0);
-                    modifier.apply_color_modification_f32(gains, 0.0, y as f32, width, 1, 1);
-                    for (pixel, gain) in row.chunks_exact_mut(3).zip(gains) {
-                        for component in pixel {
-                            *component = from_f64(to_f64(*component) * f64::from(*gain));
-                        }
-                    }
-                },
-            );
-    }
-    if !distortion && !tca {
-        return Ok(());
-    }
-
-    let half_width = (image.width - 1) as f32 * 0.5;
-    let half_height = (image.height - 1) as f32 * 0.5;
-    let short_half = half_width.min(half_height);
-    let center = [
-        half_width + short_half * lens.center_x,
-        half_height + short_half * lens.center_y,
-    ];
-    let mut scale = if tca { 1.001 } else { 1.0 };
-    if distortion {
-        let mut inverse = Modifier::new(lens, focal, crop, image.width, image.height, true);
-        if inverse.enable_distortion_correction(lens) {
-            scale *= auto_scale(&inverse, center, [half_width, half_height]);
-        }
-    }
-    let mut corrected = vec![from_f64(0.0); image.data.len()];
-    corrected
-        .par_chunks_exact_mut(3 * width)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
-                let [mut sx, mut sy] = [
-                    center[0] + (x as f32 - center[0]) / scale,
-                    center[1] + (y as f32 - center[1]) / scale,
-                ];
-                if distortion {
-                    let mut geometry = [0.0; 2];
-                    modifier.apply_geometry_distortion(sx, sy, 1, 1, &mut geometry);
-                    [sx, sy] = geometry;
-                }
-                let mut coords = [sx, sy, sx, sy, sx, sy];
-                if tca {
-                    modifier.apply_subpixel_distortion(sx, sy, 1, 1, &mut coords);
-                }
-                for (channel, point) in coords.chunks_exact(2).enumerate() {
-                    pixel[channel] = sample(image, point[0], point[1], channel);
-                }
-            }
-        });
-    image.data = corrected;
+    Correction::new(image.width, image.height, crop, lens, focal, aperture)?.apply(image);
     Ok(())
-}
-
-fn auto_scale(inverse: &Modifier, center: [f32; 2], half: [f32; 2]) -> f32 {
-    // Use the same edge midpoints and corners as Lensfun's automatic scaling.
-    // Inverting the radial map gives the input position for each sensor edge.
-    let mut scale = 0.01_f32;
-    for x in [-half[0], 0.0, half[0]] {
-        for y in [-half[1], 0.0, half[1]] {
-            let mut point = [0.0; 2];
-            inverse.apply_geometry_distortion(center[0] + x, center[1] + y, 1, 1, &mut point);
-            let distance = (point[0] - center[0]).hypot(point[1] - center[1]);
-            if distance > 0.0 {
-                scale = scale.max(x.hypot(y) / distance);
-            }
-        }
-    }
-    scale * 1.001
 }
 
 fn sample(image: &ImageBuf, x: f32, y: f32, channel: usize) -> Scalar {
@@ -225,6 +137,175 @@ mod tests {
                     (to_f64(*actual) - expected).abs() < 0.003,
                     "({x}, {y}) {actual} vs {expected}"
                 );
+            }
+        }
+        Ok(())
+    }
+    const FIXTURE_SIZE: (u32, u32) = (97, 51);
+
+    fn fixture_lens(projection: &str) -> Result<Lens> {
+        let calibration = if matches!(projection, "equisolid" | "fisheye") {
+            r#"<calibration>
+              <distortion model="ptlens" focal="12" a="0.013" b="-0.037" c="0.018" real-focal="12.45"/>
+              <tca model="poly3" focal="12" br="0.004" cr="-0.002" vr="1.002" bb="-0.0025" cb="0.003" vb="0.997"/>
+              <vignetting model="pa" focal="12" aperture="4" distance="1000" k1="-0.15" k2="0.04" k3="-0.01"/>
+              </calibration>"#
+        } else {
+            ""
+        };
+        let mut db = Database::new();
+        db.load_str(&format!(
+            r#"<lensdatabase version="2">
+              <mount><name>Fixture mount</name></mount>
+              <lens>
+              <maker>Test</maker><model>Fixture 12mm f/4</model>
+              <mount>Fixture mount</mount><cropfactor>1.2</cropfactor>
+              <aspect-ratio>3:2</aspect-ratio><center x="0.047" y="-0.031"/>
+              <type>{projection}</type>{calibration}
+              </lens>
+              </lensdatabase>"#
+        ))?;
+        Ok(db.lenses.remove(0))
+    }
+
+    fn fixture_image(width: u32, height: u32) -> ImageBuf {
+        let data = (0..height)
+            .flat_map(|y| {
+                (0..width).flat_map(move |x| {
+                    let (x, y) = (f64::from(x), f64::from(y));
+                    [
+                        0.06 + x * 0.006 + y * 0.001,
+                        0.25 + x * 0.003 + y * 0.004,
+                        0.9 - x * 0.004 + y * 0.002,
+                    ]
+                    .map(|v| from_f64(f64::from(v as f32)))
+                })
+            })
+            .collect();
+        ImageBuf::from_data(width, height, data)
+    }
+
+    #[test]
+    fn non_rectilinear_projections_match_native_lensfun_in_both_orientations() -> Result<()> {
+        // Top-left green sample from lensfunpy 1.18 / Lensfun 0.3.4 with
+        // Modifier.initialize(12, 4, flags=ALL, pixel_format=float32).
+        for (kind, landscape, portrait) in [
+            (
+                "fisheye",
+                [11.16416454, 5.49978209],
+                [5.79552078, 10.45628929],
+            ),
+            (
+                "panoramic",
+                [11.85065460, 7.87217808],
+                [2.48436308, 6.42691135],
+            ),
+            (
+                "equirectangular",
+                [9.38152122, 7.83896399],
+                [0.26008373, 12.26835155],
+            ),
+            (
+                "orthographic",
+                [15.83284092, 7.79970551],
+                [8.24428749, 14.87436199],
+            ),
+            (
+                "stereographic",
+                [9.09546947, 4.48068571],
+                [4.71423626, 8.50543880],
+            ),
+            (
+                "equisolid",
+                [12.18648243, 6.00340700],
+                [6.33075905, 11.42196751],
+            ),
+            (
+                "fisheye_thoby",
+                [12.84396267, 6.32729816],
+                [6.67382669, 12.04092789],
+            ),
+        ] {
+            let lens = fixture_lens(kind)?;
+            for (width, height, expected) in [(97, 51, landscape), (51, 97, portrait)] {
+                let correction = Correction::new(width, height, 1.5, &lens, 12.0, 4.0)?;
+                let green = correction.sample_at(width, height, 0, 0)[1];
+                for (actual, expected) in green.into_iter().map(f64::from).zip(expected) {
+                    assert!(
+                        (actual - expected).abs() < 0.0005,
+                        "{kind}, {width}×{height}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fisheye_remapping_composes_projection_distortion_tca_and_vignetting() -> Result<()> {
+        let (width, height) = FIXTURE_SIZE;
+        for (kind, expected_coords, expected_pixels) in [
+            (
+                "fisheye",
+                [
+                    [19.27515030, 35.16736603],
+                    [19.36962509, 35.13278961],
+                    [19.43671799, 35.10823822],
+                ],
+                [
+                    [0.13875002, 0.32269055, 0.91452539],
+                    [0.61416233, 0.55735010, 0.59714407],
+                    [0.65473086, 0.72258097, 0.68110830],
+                    [0.21764626, 0.46308479, 0.92108196],
+                ],
+            ),
+            (
+                "equisolid",
+                [
+                    [19.54416275, 35.06891632],
+                    [19.63673210, 35.03503799],
+                    [19.70295334, 35.01080322],
+                ],
+                [
+                    [0.14544910, 0.32716617, 0.90882909],
+                    [0.60719180, 0.55506778, 0.60058957],
+                    [0.64642406, 0.71555239, 0.68225354],
+                    [0.21909003, 0.46325535, 0.91928136],
+                ],
+            ),
+        ] {
+            let lens = fixture_lens(kind)?;
+            let correction = Correction::new(width, height, 1.5, &lens, 12.0, 4.0)?;
+            let sampled = correction.sample_at(width, height, 17, 36);
+            for (actual, expected) in sampled
+                .into_iter()
+                .flatten()
+                .map(f64::from)
+                .zip(expected_coords.into_iter().flatten())
+            {
+                assert!(
+                    (actual - expected).abs() < 0.0005,
+                    "{kind}: {actual} vs {expected}"
+                );
+            }
+            let mut image = fixture_image(width, height);
+            correction.apply(&mut image);
+            for ((x, y), expected) in [(0, 0), (96, 0), (96, 50), (17, 36)]
+                .into_iter()
+                .zip(expected_pixels)
+            {
+                let i = (y * width as usize + x) * 3;
+                for (actual, expected) in image.data[i..i + 3]
+                    .iter()
+                    .copied()
+                    .map(to_f64)
+                    .zip(expected)
+                {
+                    assert!(
+                        (actual - expected).abs() < 0.000004,
+                        "{kind} ({x}, {y}): {actual} vs {expected}"
+                    );
+                }
             }
         }
         Ok(())
