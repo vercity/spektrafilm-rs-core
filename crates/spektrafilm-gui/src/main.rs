@@ -30,6 +30,8 @@ use spektrafilm_math::{
 };
 
 mod development_animation;
+#[cfg(target_os = "windows")]
+mod display_profile_windows;
 mod export_output;
 mod paper_back;
 mod presets;
@@ -359,6 +361,8 @@ struct App {
     manual_input_color: RasterColor,
     saving_color: RasterColor,
     display_transform: bool,
+    #[cfg(target_os = "windows")]
+    display_profile: display_profile_windows::DisplayProfile,
     output_depths: OutputDepths,
     /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
@@ -525,6 +529,8 @@ impl App {
             manual_input_color: UNTAGGED_INPUT,
             saving_color: SRGB_DISPLAY,
             display_transform: true,
+            #[cfg(target_os = "windows")]
+            display_profile: display_profile_windows::DisplayProfile::default(),
             output_depths: OutputDepths::default(),
             output_image: None,
             output_tex: None,
@@ -884,7 +890,7 @@ impl App {
         let print_name = self.print_name.clone();
         let data_dir = self.data_dir.clone();
         let params = self.params.clone();
-        let display_transform = self.display_transform;
+        let display_transform = self.display_transform_active();
         let channel_orders = [self.film_channel_swap, self.print_channel_swap];
         let raw_input_destination =
             (self.override_input_color && self.source_is_raw()).then_some(self.manual_input_color);
@@ -1059,6 +1065,41 @@ impl App {
         );
     }
 
+    fn display_transform_active(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self.display_transform && self.display_profile.available();
+        #[cfg(not(target_os = "windows"))]
+        self.display_transform
+    }
+
+    fn monitor_rgb(&self, preview: PreviewTextureData) -> PreviewTextureData {
+        #[cfg(target_os = "windows")]
+        if self.display_transform_active() {
+            if let Some(rgba) = self.display_profile.convert_rgba(&preview.rgba) {
+                return PreviewTextureData {
+                    size: preview.size,
+                    rgba,
+                };
+            }
+        }
+        preview
+    }
+
+    fn refresh_output_display(&mut self, ctx: &egui::Context) {
+        if let Some(output) = self.output_image.as_ref() {
+            let color = self
+                .display_transform_active()
+                .then(|| simulation_color(&self.params));
+            let preview = self.monitor_rgb(make_preview_texture_data(output, color));
+            self.viewer.replace_output(
+                ctx,
+                &mut self.output_tex,
+                preview,
+                &self.preview_interpolation,
+            );
+        }
+    }
+
     /// Accept only a completed render for the current input generation.
     fn poll_render_job(&mut self, ctx: &egui::Context) {
         let Some(job) = self.render_job.as_mut() else {
@@ -1097,15 +1138,16 @@ impl App {
                 self.last_render_ms = r.render_ms;
                 self.last_preview_ms = r.preview_ms;
                 self.last_worker_total_ms = r.worker_total_ms;
-                let preview = if r.display_transform == self.display_transform {
+                let display_transform = self.display_transform_active();
+                let preview = if r.display_transform == display_transform {
                     r.preview
                 } else {
                     make_preview_texture_data(
                         &r.output,
-                        self.display_transform
-                            .then(|| simulation_color(&self.params)),
+                        display_transform.then(|| simulation_color(&self.params)),
                     )
                 };
+                let preview = self.monitor_rgb(preview);
                 self.viewer.show_output(
                     ctx,
                     &mut self.output_tex,
@@ -2158,18 +2200,11 @@ impl App {
                 .checkbox(&mut self.display_transform, "Convert colors for display")
                 .changed()
             {
-                if let Some(output) = self.output_image.as_ref() {
-                    let color = self
-                        .display_transform
-                        .then(|| simulation_color(&self.params));
-                    let texture = make_preview_texture_data(output, color);
-                    self.viewer.replace_output(
-                        ctx,
-                        &mut self.output_tex,
-                        texture,
-                        &self.preview_interpolation,
-                    );
-                }
+                self.refresh_output_display(ctx);
+            }
+            #[cfg(target_os = "windows")]
+            if self.display_transform && !self.display_profile.available() {
+                ui.label("This monitor has no usable ICC profile.");
             }
             ui.checkbox(&mut self.gray_canvas, "18% gray canvas");
             ui.add(egui::Slider::new(&mut self.white_border, 0.0..=1.0).text("White border"))
@@ -2219,6 +2254,10 @@ impl eframe::App for App {
                     eprintln!("[spektrafilm] colorspace tag attempt: {e}");
                 }
             }
+        }
+        #[cfg(target_os = "windows")]
+        if self.display_profile.refresh(ctx, frame) && self.display_transform {
+            self.refresh_output_display(ctx);
         }
         let _ = frame;
 
