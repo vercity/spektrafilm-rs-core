@@ -30,15 +30,18 @@ use spektrafilm_math::{
 };
 
 mod export_output;
+mod paper_back;
 mod presets;
 mod preview_source;
 mod raw_workflow;
 mod source_snapshot;
+mod viewer;
 
 use export_output::{StagedOutput, temporary_export_directory, write_preview_output};
 use presets::{FACTORY_FILM, FACTORY_PAPER, GuiPreset, Preferences};
 use preview_source::{PreviewSource, interpret_input};
 use raw_workflow::RawDevelopSettings;
+use viewer::{InputLayerRequest, Layer, Viewer};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 const IN_FLIGHT_REPAINT: Duration = Duration::from_millis(16);
@@ -359,6 +362,7 @@ struct App {
     /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
+    viewer: Viewer,
     pipeline_cache: Option<PipelineCache>,
     preview_source: Option<PreviewSource>,
     last_render_ms: f32,
@@ -523,6 +527,7 @@ impl App {
             output_depths: OutputDepths::default(),
             output_image: None,
             output_tex: None,
+            viewer: Viewer::default(),
             pipeline_cache: None,
             preview_source: None,
             last_render_ms: 0.0,
@@ -759,6 +764,7 @@ impl App {
                 );
                 self.image = Some(Arc::new(img));
                 self.preview_source = None;
+                self.viewer.source_changed();
                 self.source = Some(Arc::new(source));
                 self.source_rotation = 0;
                 self.output_tex = None;
@@ -793,6 +799,7 @@ impl App {
                 };
                 self.image = Some(Arc::new(image));
                 self.preview_source = None;
+                self.viewer.source_changed();
                 self.source_metadata = loaded.metadata;
                 self.output_tex = None;
                 self.request_render();
@@ -807,6 +814,7 @@ impl App {
             return;
         };
         self.image = Some(Arc::new(image.rotated(clockwise_quarter_turns)));
+        self.viewer.source_changed();
         self.preview_source = None;
         self.source_rotation = (self.source_rotation + clockwise_quarter_turns) % 4;
         self.output_tex = None;
@@ -1097,6 +1105,7 @@ impl App {
                     )
                 };
                 self.output_tex = Some(make_texture(ctx, preview));
+                self.viewer.layer = Layer::Output;
                 self.status = format!(
                     "{} {} × {} ({:.1} MP)",
                     mode.label(),
@@ -2232,10 +2241,30 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Clone the texture handle (cheap — internally `Arc`) so we
-            // can take `&mut self` to mutate `zoom` / `pan` from the
-            // closure without a borrow conflict on `self.output_tex`.
-            let tex = self.output_tex.clone();
+            self.viewer
+                .layers(ui, self.image.is_some(), self.output_tex.is_some());
+            let tex = match self.viewer.layer {
+                Layer::PaperBack => Some(self.viewer.paper_texture(ctx, self.image.as_deref())),
+                Layer::Input => self.image.as_ref().cloned().and_then(|image| {
+                    let color = RasterColor::new(
+                        &self.params.io.input_color_space,
+                        self.params.io.input_cctf_decoding,
+                    )
+                    .unwrap_or(UNTAGGED_INPUT);
+                    let convert_raw = (self.override_input_color && self.source_is_raw())
+                        .then_some(self.manual_input_color);
+                    self.viewer.input_texture(
+                        ctx,
+                        InputLayerRequest {
+                            image,
+                            color,
+                            convert_raw,
+                            cap: self.params.settings.preview_max_size,
+                        },
+                    )
+                }),
+                Layer::Output => self.output_tex.clone(),
+            };
             if let Some(tex) = tex {
                 self.draw_preview_with_zoom(ui, &tex);
             } else {
