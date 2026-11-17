@@ -9,7 +9,7 @@ use spektrafilm_math::image::ImageBuf;
 
 use crate::{
     PreviewTextureData, development_animation::Transition, make_preview_texture_data, paper_back,
-    preview_source::PreviewSource,
+    preview_source::PreviewSource, spatial_filter::FilteredViewport,
 };
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -52,7 +52,8 @@ pub(super) struct Viewer {
     paper: Option<([usize; 2], egui::TextureHandle)>,
     input: Option<(InputLayerRequest, egui::TextureHandle)>,
     input_job: Option<(InputLayerRequest, mpsc::Receiver<PreviewTextureData>)>,
-    output_frame: Option<PreviewTextureData>,
+    output_frame: Option<Arc<PreviewTextureData>>,
+    filtered: FilteredViewport,
     animation: Option<Animation>,
 }
 
@@ -65,6 +66,7 @@ impl Viewer {
 
     pub fn clear_output(&mut self) {
         self.output_frame = None;
+        self.filtered.source_changed();
         self.animation = None;
     }
 
@@ -157,7 +159,25 @@ impl Viewer {
             Some(texture) => texture.set(display_image, sampler),
             None => *texture = Some(ctx.load_texture("spektrafilm-output", display_image, sampler)),
         }
-        self.output_frame = Transition::can_animate(target.size).then_some(target);
+        self.filtered.source_changed();
+        self.output_frame = (Transition::can_animate(target.size)
+            || crate::spatial_filter::high_order(interpolation))
+        .then(|| Arc::new(target));
+    }
+
+    pub fn output_filter(
+        &mut self,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        viewport: egui::Rect,
+        mode: &str,
+    ) -> Option<(egui::TextureHandle, egui::Rect)> {
+        if self.layer != Layer::Output {
+            return None;
+        }
+        let source = self.output_frame.as_ref().cloned()?;
+        self.filtered
+            .texture(ctx, source, image_rect, viewport, mode)
     }
 
     pub fn layers(&mut self, ui: &mut egui::Ui, input: bool, output: bool) {

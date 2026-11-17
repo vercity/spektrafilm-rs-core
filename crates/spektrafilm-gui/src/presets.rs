@@ -346,6 +346,10 @@ impl GuiPreset {
 
     fn validate(&self) -> Result<()> {
         ensure!(
+            crate::spatial_filter::OUTPUT_INTERPOLATIONS.contains(&self.interpolation.as_str()),
+            "unsupported output interpolation"
+        );
+        ensure!(
             self.params.settings.preview_max_size > 0,
             "preview size must be positive"
         );

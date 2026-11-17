@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use std::sync::Arc;
 
 use crate::PreviewTextureData;
 
@@ -173,7 +174,7 @@ fn layer_coefficients(t: f64) -> [f32; 9] {
 
 pub(super) enum Transition {
     Develop(Development),
-    Crossfade(PreviewTextureData),
+    Crossfade(Arc<PreviewTextureData>),
 }
 
 impl Transition {
@@ -182,7 +183,7 @@ impl Transition {
     }
 
     pub fn prepare(
-        previous: Option<PreviewTextureData>,
+        previous: Option<Arc<PreviewTextureData>>,
         target: &PreviewTextureData,
         was_visible: bool,
     ) -> Option<Self> {
@@ -292,14 +293,14 @@ mod tests {
             size: [1, 1],
             rgba: vec![50, 100, 150, 255],
         };
-        let fade = Transition::prepare(Some(original), &target, true).unwrap();
+        let fade = Transition::prepare(Some(Arc::new(original)), &target, true).unwrap();
         assert_eq!(fade.frame(&target, 5).unwrap().rgba, [26, 175, 100, 255]);
         assert!(fade.frame(&target, 10).is_none());
         let differently_shaped = PreviewTextureData {
             size: [1, 2],
             rgba: vec![100; 8],
         };
-        assert!(Transition::prepare(Some(differently_shaped), &target, true).is_none());
+        assert!(Transition::prepare(Some(Arc::new(differently_shaped)), &target, true).is_none());
         assert!(!Transition::can_animate([2000, 1000]));
     }
 }

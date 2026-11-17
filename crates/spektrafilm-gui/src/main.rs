@@ -38,6 +38,7 @@ mod presets;
 mod preview_source;
 mod raw_workflow;
 mod source_snapshot;
+mod spatial_filter;
 mod viewer;
 
 use export_output::{StagedOutput, temporary_export_directory, write_preview_output};
@@ -1046,7 +1047,14 @@ impl App {
         if border > 0.0 {
             painter.rect_filled(draw_rect.expand(border * scale), 0.0, egui::Color32::WHITE);
         }
-        painter.image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
+        if let Some((filtered, filtered_rect)) =
+            self.viewer
+                .output_filter(ui.ctx(), draw_rect, rect, &self.preview_interpolation)
+        {
+            painter.image(filtered.id(), filtered_rect, uv, egui::Color32::WHITE);
+        } else {
+            painter.image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
+        }
 
         // Zoom indicator + reset chip in the corner.
         let pct = (self.zoom * fit_scale * 100.0).round() as i32;
@@ -2203,6 +2211,23 @@ impl App {
             #[cfg(target_os = "windows")]
             if self.display_transform && !self.display_profile.available() {
                 ui.label("This monitor has no usable ICC profile.");
+            }
+            let mut interpolation_changed = false;
+            egui::ComboBox::from_label("Output interpolation")
+                .selected_text(&self.preview_interpolation)
+                .show_ui(ui, |ui| {
+                    for interpolation in spatial_filter::OUTPUT_INTERPOLATIONS {
+                        interpolation_changed |= ui
+                            .selectable_value(
+                                &mut self.preview_interpolation,
+                                interpolation.into(),
+                                interpolation,
+                            )
+                            .changed();
+                    }
+                });
+            if interpolation_changed {
+                self.refresh_output_display(ctx);
             }
             ui.checkbox(&mut self.gray_canvas, "18% gray canvas");
             ui.add(egui::Slider::new(&mut self.white_border, 0.0..=1.0).text("White border"))
