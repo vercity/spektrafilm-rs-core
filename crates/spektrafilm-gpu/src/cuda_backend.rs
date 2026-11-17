@@ -905,6 +905,10 @@ __device__ float dot3_g(float3 a, float3 b) { return a.x*b.x + a.y*b.y + a.z*b.z
 __device__ float3 mv3_g(float3 r0, float3 r1, float3 r2, float3 v) {
     return make_float3(dot3_g(r0, v), dot3_g(r1, v), dot3_g(r2, v));
 }
+__device__ float3 mul_matrix_g(const float* m, float3 v) {
+    return mv3_g(make_float3(m[0], m[1], m[2]),
+        make_float3(m[3], m[4], m[5]), make_float3(m[6], m[7], m[8]), v);
+}
 __device__ float sign_g(float x) { return (x > 0.0f) - (x < 0.0f); }
 __device__ float cbrt_signed_g(float x) { return sign_g(x) * powf(fabsf(x), 1.0f / 3.0f); }
 __device__ float len2_g(float x, float y) { return sqrtf(x*x + y*y); }
@@ -915,8 +919,10 @@ __device__ float reinhard_knee_g(float d, float threshold, float limit, float po
     if (d <= threshold) return d;
     float scale = limit - threshold;
     float x = (d - threshold) / scale;
-    float y = x / powf(1.0f + powf(x, power), 1.0f / power);
-    return threshold + scale * y;
+    if (x >= 1.0f) {
+        return threshold + scale * powf(1.0f + powf(1.0f / x, power), -1.0f / power);
+    }
+    return threshold + scale * x / powf(1.0f + powf(x, power), 1.0f / power);
 }
 
 __device__ float3 xyz_to_oklab_g(float3 xyz) {
@@ -985,20 +991,20 @@ __device__ float3 cam16_padc_inverse_g(float3 rgb) {
         sign_g(d.z) * 100.0f / fl * powf(bz, 1.0f / 0.42f));
 }
 
-__device__ float3 xyz_to_cam16ucs_g(float3 xyz) {
+__device__ float3 xyz_to_cam16ucs_g(float3 xyz, const float* white) {
     float3 rgb = mv3_g(
         make_float3(0.401288f, 0.650173f, -0.051461f),
         make_float3(-0.250268f, 1.204414f, 0.045854f),
         make_float3(-0.002079f, 0.048952f, 0.953127f),
         make_float3(xyz.x * 100.0f, xyz.y * 100.0f, xyz.z * 100.0f));
-    float3 d_rgb = make_float3(rgb.x * 1.0228770275f, rgb.y * 0.9852074783f, rgb.z * 0.9285450587f);
+    float3 d_rgb = make_float3(rgb.x * white[0], rgb.y * white[1], rgb.z * white[2]);
     float3 p = cam16_padc_forward_g(d_rgb);
     float a = p.x - 12.0f * p.y / 11.0f + p.z / 11.0f;
     float b = (p.x + p.y - 2.0f * p.z) / 9.0f;
     float h = atan2_deg_g(b, a);
     float e_t = 0.25f * (cosf(2.0f + radians_g(h)) + 3.8f);
     float a_resp = (2.0f * p.x + p.y + p.z / 20.0f - 0.305f) * 1.0003040046f;
-    float jj = 100.0f * powf(a_resp / 37.1690753022f, 0.69f * 1.9272135955f);
+    float jj = 100.0f * powf(fmaxf(a_resp, 0.0f) / white[3], 0.69f * 1.9272135955f);
     float denom = p.x + p.y + 21.0f * p.z / 20.0f;
     float t = denom != 0.0f ? 3846.1538461538f * 1.0003040046f * (e_t * sqrtf(a*a + b*b)) / denom : 0.0f;
     float cc = powf(t, 0.9f) * sqrtf(jj / 100.0f) * powf(1.64f - powf(0.29f, 0.2f), 0.73f);
@@ -1009,17 +1015,17 @@ __device__ float3 xyz_to_cam16ucs_g(float3 xyz) {
     return make_float3(jp, mp * cosf(hr), mp * sinf(hr));
 }
 
-__device__ float3 cam16ucs_to_xyz_g(float3 jab) {
+__device__ float3 cam16ucs_to_xyz_g(float3 jab, const float* white) {
     float jp = jab.x;
     float mp = len2_g(jab.y, jab.z);
     float h = atan2_deg_g(jab.z, jab.y);
     float jj = jp / ((1.0f + 100.0f * 0.007f) - 0.007f * jp);
     float m = (expf(0.0228f * mp) - 1.0f) / 0.0228f;
     float cc = m / powf(0.6839903846f, 0.25f);
-    float j_prime = fmaxf(jj, 1.1920929e-7f);
+    float j_prime = fmaxf(jj, 2.22044605e-16f);
     float t = powf(cc / (sqrtf(j_prime / 100.0f) * powf(1.64f - powf(0.29f, 0.2f), 0.73f)), 1.0f / 0.9f);
     float e_t = 0.25f * (cosf(2.0f + radians_g(h)) + 3.8f);
-    float a_resp = 37.1690753022f * powf(jj / 100.0f, 1.0f / (0.69f * 1.9272135955f));
+    float a_resp = white[3] * powf(jj / 100.0f, 1.0f / (0.69f * 1.9272135955f));
     float p1 = t != 0.0f ? 3846.1538461538f * 1.0003040046f * e_t / t : 0.0f;
     float p2 = a_resp / 1.0003040046f + 0.305f;
     float hr = radians_g(h);
@@ -1041,11 +1047,78 @@ __device__ float3 cam16ucs_to_xyz_g(float3 jab) {
     float ga = (460.0f * p2 - 891.0f * a - 261.0f * b) / 1403.0f;
     float ba = (460.0f * p2 - 220.0f * a - 6300.0f * b) / 1403.0f;
     float3 inv = cam16_padc_inverse_g(make_float3(ra, ga, ba));
-    float3 rgb = make_float3(inv.x / 1.0228770275f, inv.y / 0.9852074783f, inv.z / 0.9285450587f);
+    float3 rgb = make_float3(inv.x / white[0], inv.y / white[1], inv.z / white[2]);
     return make_float3(
         dot3_g(make_float3(1.8620678551f, -1.0112546305f, 0.1491867754f), rgb) / 100.0f,
         dot3_g(make_float3(0.3875265432f, 0.6214474419f, -0.0089739852f), rgb) / 100.0f,
         dot3_g(make_float3(-0.0158414988f, -0.0341229380f, 1.0499644369f), rgb) / 100.0f);
+}
+
+// Safdar 2017 JzAzBz, relative XYZ with diffuse white at 100 cd/m².
+__device__ constexpr float JZ_D = -0.56f;
+__device__ constexpr float JZ_D0 = 1.6295499532821566e-11f;
+__device__ constexpr float JZ_B = 1.15f;
+__device__ constexpr float JZ_G = 0.66f;
+__device__ constexpr float JZ_C1 = 3424.0f / 4096.0f;
+__device__ constexpr float JZ_C2 = 2413.0f / 128.0f;
+__device__ constexpr float JZ_C3 = 2392.0f / 128.0f;
+__device__ constexpr float JZ_M1 = 2610.0f / 16384.0f;
+__device__ constexpr float JZ_M2 = 1.7f * 2523.0f / 32.0f;
+
+__device__ float signed_pow_g(float x, float p) {
+    return copysignf(powf(fabsf(x), p), x);
+}
+
+__device__ float jz_pq_forward_g(float lms) {
+    float powered = signed_pow_g(lms / 100.0f, JZ_M1);
+    float offset = fmaf(JZ_C2 - JZ_C3, powered, JZ_C1 - 1.0f)
+        / fmaf(JZ_C3, powered, 1.0f);
+    // Preserve the small offset in the PQ ratio around one.
+    if (offset > -1.0f) return expf(JZ_M2 * log1pf(offset));
+    return signed_pow_g(1.0f + offset, JZ_M2);
+}
+
+__device__ float jz_pq_inverse_g(float code) {
+    float powered = signed_pow_g(code, 1.0f / JZ_M2);
+    float ratio = fmaxf(powered - JZ_C1, 0.0f) / fmaf(-JZ_C3, powered, JZ_C2);
+    return 100.0f * signed_pow_g(ratio, 1.0f / JZ_M1);
+}
+
+__device__ float3 xyz_to_jzazbz_g(float3 xyz) {
+    float3 prime = make_float3(JZ_B * xyz.x - (JZ_B - 1.0f) * xyz.z,
+        JZ_G * xyz.y - (JZ_G - 1.0f) * xyz.x, xyz.z);
+    float3 lms = mv3_g(
+        make_float3(0.41478972f, 0.579999f, 0.0146480f),
+        make_float3(-0.2015100f, 1.120649f, 0.0531008f),
+        make_float3(-0.0166008f, 0.264800f, 0.6684799f),
+        prime);
+    float3 lms_p = make_float3(jz_pq_forward_g(lms.x), jz_pq_forward_g(lms.y), jz_pq_forward_g(lms.z));
+    float3 izab = mv3_g(
+        make_float3(0.5f, 0.5f, 0.0f),
+        make_float3(3.524f, -4.066708f, 0.542708f),
+        make_float3(0.199076f, 1.096799f, -1.295875f),
+        lms_p);
+    float jz = (1.0f + JZ_D) * izab.x / (1.0f + JZ_D * izab.x) - JZ_D0;
+    return make_float3(jz, izab.y, izab.z);
+}
+
+__device__ float3 jzazbz_to_xyz_g(float3 lab) {
+    float jz = lab.x + JZ_D0;
+    float iz = jz / (1.0f + JZ_D - JZ_D * jz);
+    float3 lms_p = mv3_g(
+        make_float3(1.0f, 0.1386050433f, 0.0580473162f),
+        make_float3(1.0f, -0.1386050433f, -0.0580473162f),
+        make_float3(1.0f, -0.0960192420f, -0.8118918961f),
+        make_float3(iz, lab.y, lab.z));
+    float3 lms = make_float3(jz_pq_inverse_g(lms_p.x), jz_pq_inverse_g(lms_p.y), jz_pq_inverse_g(lms_p.z));
+    float3 prime = mv3_g(
+        make_float3(1.924226436f, -1.004792313f, 0.037651404f),
+        make_float3(0.350316762f, 0.726481194f, -0.065384423f),
+        make_float3(-0.090982811f, -0.312728291f, 1.522766561f),
+        lms);
+    float x = (prime.x + (JZ_B - 1.0f) * prime.z) / JZ_B;
+    float y = (prime.y + (JZ_G - 1.0f) * x) / JZ_G;
+    return make_float3(x, y, prime.z);
 }
 
 __device__ float cmax_lookup_g(float l_in, float h, const float* cmax, unsigned int n_l_u, unsigned int n_h_u, float l_min, float l_max) {
@@ -1088,12 +1161,14 @@ extern "C" __global__ void gamut_compress_kernel(
     float l_white,
     float l_min,
     float l_max,
-    const float* __restrict__ cmax
+    const float* __restrict__ cmax,
+    const float* __restrict__ color_space
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_pixels) return;
     unsigned int base = idx * 3u;
     float3 rgb = make_float3(img[base], img[base + 1u], img[base + 2u]);
+    if (rgb.x == 0.0f && rgb.y == 0.0f && rgb.z == 0.0f) return;
     float3 out;
     if (mode == 0u) {
         float ach = fmaxf(rgb.x, fmaxf(rgb.y, rgb.z));
@@ -1108,12 +1183,16 @@ extern "C" __global__ void gamut_compress_kernel(
             out = make_float3(ach * (1.0f - dc.x), ach * (1.0f - dc.y), ach * (1.0f - dc.z));
         }
     } else {
-        float3 xyz = mv3_g(
-            make_float3(0.4124f, 0.3576f, 0.1805f),
-            make_float3(0.2126f, 0.7152f, 0.0722f),
-            make_float3(0.0193f, 0.1192f, 0.9505f),
-            rgb);
-        float3 lab = mode == 3u ? xyz_to_cam16ucs_g(xyz) : xyz_to_oklab_g(xyz);
+        const float* rgb_to_xyz = color_space;
+        const float* xyz_to_rgb = color_space + 9;
+        const float* cam16_white = color_space + 18;
+        float3 xyz = mul_matrix_g(rgb_to_xyz, rgb);
+        float3 lab;
+        switch (mode) {
+            case 3u: lab = xyz_to_cam16ucs_g(xyz, cam16_white); break;
+            case 4u: lab = xyz_to_jzazbz_g(xyz); break;
+            default: lab = xyz_to_oklab_g(xyz); break;
+        }
         float l = lab.x;
         if (light_enable != 0u) {
             l = reinhard_knee_g(l / l_white, light_t, light_l, light_p) * l_white;
@@ -1125,12 +1204,13 @@ extern "C" __global__ void gamut_compress_kernel(
         float d_comp = reinhard_knee_g(c / safe, knee_t, knee_l, knee_p);
         float c_new = d_comp * safe;
         float3 lab_new = make_float3(l, c_new * cosf(h), c_new * sinf(h));
-        float3 xyz_new = mode == 3u ? cam16ucs_to_xyz_g(lab_new) : oklab_to_xyz_g(lab_new);
-        out = mv3_g(
-            make_float3(3.2406f, -1.5372f, -0.4986f),
-            make_float3(-0.9689f, 1.8758f, 0.0415f),
-            make_float3(0.0557f, -0.204f, 1.057f),
-            xyz_new);
+        float3 xyz_new;
+        switch (mode) {
+            case 3u: xyz_new = cam16ucs_to_xyz_g(lab_new, cam16_white); break;
+            case 4u: xyz_new = jzazbz_to_xyz_g(lab_new); break;
+            default: xyz_new = oklab_to_xyz_g(lab_new); break;
+        }
+        out = mul_matrix_g(xyz_to_rgb, xyz_new);
     }
     img[base] = out.x;
     img[base + 1u] = out.y;
@@ -1663,6 +1743,10 @@ impl CudaBackend {
             gp.cmax.iter().map(|&v| v as f32).collect()
         };
         let cmax_dev = self.stream.clone_htod(&cmax_f32)?;
+        let mut color_space = matrix_f32(&gp.target.to_xyz());
+        color_space.extend(matrix_f32(&gp.target.from_xyz()));
+        color_space.extend(gp.cam16_white);
+        let color_space_dev = self.stream.clone_htod(&color_space)?;
         let light = gp.lightness.unwrap_or([0.0, 1.0, 1.0]);
         let light_enable = if gp.lightness.is_some() { 1u32 } else { 0u32 };
         let mode = gp.mode as u32;
@@ -1683,7 +1767,8 @@ impl CudaBackend {
             .arg(&gp.l_white)
             .arg(&gp.l_min)
             .arg(&gp.l_max)
-            .arg(&cmax_dev);
+            .arg(&cmax_dev)
+            .arg(&color_space_dev);
         unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
         Ok(())
     }
@@ -2294,10 +2379,8 @@ impl ComputeBackend for CudaBackend {
         }
     }
 
-    fn supports_resident_gamut(&self, gamut: &crate::GamutGpuParams<'_>) -> bool {
-        gamut.mode == crate::GamutMode::AcesRgc
-            || (gamut.mode != crate::GamutMode::Jzazbz
-                && gamut.target == spektrafilm_math::colorspace::RgbSpace::Srgb)
+    fn supports_resident_gamut(&self, _gamut: &crate::GamutGpuParams<'_>) -> bool {
+        true
     }
 
     fn resident_chain_applies_post_scan(&self) -> bool {
