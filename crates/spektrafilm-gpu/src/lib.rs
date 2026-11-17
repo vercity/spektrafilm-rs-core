@@ -206,6 +206,8 @@ pub struct FilmChainParams<'a> {
     /// Uses normal-approximation sampling on the GPU (matches what the
     /// CPU path does for typical λ > 30 / variance > 9 regimes).
     pub grain: Option<GrainGpuParams>,
+    /// Profiled emulsion grain, used in place of the aggregate grain pass.
+    pub layered_grain: Option<LayeredGrainGpuParams>,
     /// Optional viewing glare pass — applied after scan spectral on the
     /// final RGB buffer. Lognormal-distributed per-pixel surface noise +
     /// blur + per-channel illuminant offset.
@@ -321,6 +323,37 @@ pub struct GrainGpuParams {
     /// One shared noise field across all channels (B&W single emulsion)
     /// instead of independent per-channel RNG streams.
     pub monochrome: bool,
+}
+
+/// Profiled emulsion input for resident grain sampling. The curve table is
+/// channel-major, with each row carrying density and three layer densities.
+/// The device samples developed populations directly, using Poisson thinning.
+#[derive(Debug)]
+pub struct LayeredGrainGpuParams {
+    pub curves: Vec<[f32; 4]>,
+    pub rows: u32,
+    pub direction: f32,
+    pub layers: [GrainLayerGpuParams; 3],
+    pub grain_uniformity: [f32; 3],
+    pub density_min: [f32; 3],
+    pub final_blur: f64,
+    pub clumping: Option<GrainClumpGpuParams>,
+    pub monochrome: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GrainLayerGpuParams {
+    pub floor: [f32; 3],
+    pub maximum: [f32; 3],
+    pub particles_per_pixel: [f32; 3],
+    pub dye_blur: [f64; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GrainClumpGpuParams {
+    pub mu: f32,
+    pub sigma: f32,
+    pub blur: f64,
 }
 
 /// Selector shared by the Rust, WGSL, and CUDA gamut passes.

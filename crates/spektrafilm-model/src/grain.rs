@@ -140,14 +140,11 @@ pub struct LayeredGrainParams {
     pub use_fast_stats: bool,
 }
 
-/// Apply the profiled emulsion grain model. An incompatible profile can use
-/// the aggregate model when its layer curves are absent or unusable.
-pub fn apply_grain_to_density_layers(
-    density: &ImageBuf,
+fn prepare_layer_curves(
     density_curves: &[[f64; 3]],
     density_curves_layers: &[Vec<Vec<f64>>],
     params: &LayeredGrainParams,
-) -> Option<ImageBuf> {
+) -> Option<(f64, Vec<LayerCurves>)> {
     let n_channels = if params.monochrome { 1 } else { 3 };
     if density_curves.len() < 2
         || density_curves_layers.len() != density_curves.len()
@@ -157,32 +154,134 @@ pub fn apply_grain_to_density_layers(
     {
         return None;
     }
-
     let direction = if params.positive_film { -1.0 } else { 1.0 };
     let curves: Vec<_> = (0..n_channels)
         .map(|ch| LayerCurves::new(density_curves, density_curves_layers, ch, direction))
         .collect::<Option<_>>()?;
+    Some((direction, curves))
+}
+
+impl LayeredGrainParams {
+    fn particle_layer(
+        &self,
+        maxima: [f64; 3],
+        channel: usize,
+        layer: usize,
+    ) -> (ParticleLayer, f64) {
+        let maximum = maxima[layer];
+        let fraction = maximum / maxima.iter().sum::<f64>();
+        let floor = fraction * self.density_min[channel];
+        let particle_area = self.particle_area_um2
+            * self.particle_scale[channel]
+            * self.particle_scale_layers[layer];
+        let particles = self.pixel_size_um * self.pixel_size_um * fraction / particle_area;
+        (
+            ParticleLayer {
+                density_max: maximum + floor,
+                n_particles_per_pixel: particles,
+                uniformity: self.uniformity[channel],
+            },
+            floor,
+        )
+    }
+
+    fn clumping(&self) -> Option<(f64, f64, f64)> {
+        let [blur_um, deviation_nm] = self.micro_structure;
+        let deviation = deviation_nm * 0.001 / self.pixel_size_um;
+        if deviation <= 0.05 {
+            return None;
+        }
+        let variance_log = (deviation * deviation).ln_1p();
+        let blur = blur_um / self.pixel_size_um;
+        Some((
+            -variance_log / 2.0,
+            variance_log.sqrt(),
+            if blur > 0.4 { blur } else { 0.0 },
+        ))
+    }
+}
+
+/// Resolve the same profile curves and particle populations used by CPU grain
+/// for the GPU sampler. Unusable profiles follow the aggregate grain path.
+pub fn layered_grain_gpu_params(
+    density_curves: &[[f64; 3]],
+    density_curves_layers: &[Vec<Vec<f64>>],
+    params: &LayeredGrainParams,
+) -> Option<spektrafilm_gpu::LayeredGrainGpuParams> {
+    use spektrafilm_gpu::{GrainClumpGpuParams, GrainLayerGpuParams, LayeredGrainGpuParams};
+
+    let (direction, curves) = prepare_layer_curves(density_curves, density_curves_layers, params)?;
+    let model_channel = |ch| if params.monochrome { 0 } else { ch };
+    let layers = std::array::from_fn(|layer| {
+        let population: [(ParticleLayer, f64); 3] = std::array::from_fn(|ch| {
+            let ch = model_channel(ch);
+            params.particle_layer(curves[ch].maxima, ch, layer)
+        });
+        GrainLayerGpuParams {
+            floor: population.map(|(_, floor)| floor as f32),
+            maximum: population.map(|(p, _)| p.density_max as f32),
+            particles_per_pixel: population.map(|(p, _)| p.n_particles_per_pixel as f32),
+            dye_blur: population
+                .map(|(p, _)| params.blur_dye_clouds_um * p.particle_density().sqrt()),
+        }
+    });
+    if layers.iter().any(|layer| {
+        layer
+            .maximum
+            .iter()
+            .chain(&layer.particles_per_pixel)
+            .any(|&value| !value.is_finite() || value <= 0.0)
+    }) {
+        return None;
+    }
+    let curve_rows = curves
+        .iter()
+        .flat_map(|curve| {
+            curve
+                .axis
+                .iter()
+                .zip(&curve.values)
+                .map(|(&x, &[l0, l1, l2])| [x as f32, l0 as f32, l1 as f32, l2 as f32])
+        })
+        .collect();
+    Some(LayeredGrainGpuParams {
+        curves: curve_rows,
+        rows: density_curves.len().try_into().ok()?,
+        direction: direction as f32,
+        layers,
+        grain_uniformity: std::array::from_fn(|ch| params.uniformity[model_channel(ch)] as f32),
+        density_min: std::array::from_fn(|ch| params.density_min[model_channel(ch)] as f32),
+        final_blur: params.blur_px,
+        clumping: params
+            .clumping()
+            .map(|(mu, sigma, blur)| GrainClumpGpuParams {
+                mu: mu as f32,
+                sigma: sigma as f32,
+                blur,
+            }),
+        monochrome: params.monochrome,
+    })
+}
+
+/// Apply the profiled emulsion grain model. An incompatible profile can use
+/// the aggregate model when its layer curves are absent or unusable.
+pub fn apply_grain_to_density_layers(
+    density: &ImageBuf,
+    density_curves: &[[f64; 3]],
+    density_curves_layers: &[Vec<Vec<f64>>],
+    params: &LayeredGrainParams,
+) -> Option<ImageBuf> {
+    let (direction, curves) = prepare_layer_curves(density_curves, density_curves_layers, params)?;
     let width = density.width;
     let height = density.height;
-    let pixel_area = params.pixel_size_um * params.pixel_size_um;
     let mut out = ImageBuf::new(width, height);
 
     // Keep only a channel accumulator and one layer's samples in memory.
     for (ch, curves) in curves.iter().enumerate() {
         let mut sum = vec![ZERO; density.pixel_count()];
-        let total_max: f64 = curves.maxima.iter().sum();
         let density_min = params.density_min[ch];
-        for (sl, &maximum) in curves.maxima.iter().enumerate() {
-            let fraction = maximum / total_max;
-            let layer_floor = fraction * density_min;
-            let particle_area = params.particle_area_um2
-                * params.particle_scale[ch]
-                * params.particle_scale_layers[sl];
-            let layer = ParticleLayer {
-                density_max: maximum + layer_floor,
-                n_particles_per_pixel: pixel_area * fraction / particle_area,
-                uniformity: params.uniformity[ch],
-            };
+        for sl in 0..3 {
+            let (layer, layer_floor) = params.particle_layer(curves.maxima, ch, sl);
             let probabilities: Vec<_> = density
                 .data
                 .par_chunks_exact(3)
@@ -312,23 +411,16 @@ fn add_micro_structure(
     params: &LayeredGrainParams,
     ch: usize,
 ) {
-    let [blur_um, deviation_nm] = params.micro_structure;
-    let deviation = deviation_nm * 0.001 / params.pixel_size_um;
-    if deviation <= 0.05 {
+    let Some((mu, sigma, blur_px)) = params.clumping() else {
         return;
-    }
-    // Convert linear mean 1 and standard deviation to log-normal parameters.
-    let variance_log = (deviation * deviation).ln_1p();
-    let sigma = variance_log.sqrt();
-    let mu = -variance_log / 2.0;
+    };
     // Python's Numba sampler owns an independent RNG. Use separate stable
     // seeds for each dye channel so CPU renders are reproducible.
     let mut rng = GaussRng::new(30 + ch as u32);
     let mut clumping: Vec<_> = (0..channel.len())
         .map(|_| from_f64((mu + sigma * rng.gauss()).exp()))
         .collect();
-    let blur_px = blur_um / params.pixel_size_um;
-    if blur_px > 0.4 {
+    if blur_px > 0.0 {
         gaussian_blur_channel_reflect_in_place(&mut clumping, width, height, from_f64(blur_px));
     }
     for (density, clump) in channel.iter_mut().zip(clumping) {

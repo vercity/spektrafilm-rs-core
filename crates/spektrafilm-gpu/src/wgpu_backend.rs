@@ -1482,6 +1482,10 @@ impl WgpuBackend {
             )
         });
 
+        let layered_grain_state = p.layered_grain.as_ref().map(|plan| {
+            build_layered_grain_state(self, plan, image.width, image.height, &buf_a, &buf_b)
+        });
+
         // ── DIR couplers state ────────────────────────────────────────────
         // Allocated lazily when the DIR stage is active. Reads buf_a
         // (density_cmy from film density curve) and buf_b (log_raw),
@@ -1574,6 +1578,9 @@ impl WgpuBackend {
         if let Some(gs) = grain_state.as_ref() {
             let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
             gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
+        }
+        if let Some(grain) = &layered_grain_state {
+            grain.encode_passes(&mut encoder, &buf_a, n_pixels, workgroup_size);
         }
         // 4 + 5. Printing: print_spectral (buf_a → buf_b) then the print
         //     density curve (buf_b → buf_a). Skipped for scan_film — the
@@ -2180,6 +2187,175 @@ struct DispatchJob {
 }
 
 #[cfg(feature = "wgpu-backend")]
+fn resident_job(
+    device: &wgpu::Device,
+    pipeline: &CachedPipelineRef,
+    label: &str,
+    bytes: &[u8],
+    buffers: &[&wgpu::Buffer],
+) -> DispatchJob {
+    use wgpu::util::DeviceExt;
+    let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let entries: Vec<_> = std::iter::once(&params)
+        .chain(buffers.iter().copied())
+        .enumerate()
+        .map(|(binding, buffer)| wgpu::BindGroupEntry {
+            binding: binding as u32,
+            resource: buffer.as_entire_binding(),
+        })
+        .collect();
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &pipeline.layout,
+        entries: &entries,
+    });
+    DispatchJob {
+        _params_buf: params,
+        pipeline: pipeline.clone(),
+        bg,
+    }
+}
+
+#[cfg(feature = "wgpu-backend")]
+impl DispatchJob {
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, (x, y): (u32, u32), label: &str) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline.pipeline);
+        pass.set_bind_group(0, &self.bg, &[]);
+        pass.dispatch_workgroups(x, y, 1);
+    }
+}
+
+#[cfg(feature = "wgpu-backend")]
+fn build_optical_blur(
+    backend: &WgpuBackend,
+    width: u32,
+    height: u32,
+    plan: crate::optical_blur::GaussianRgb,
+    source: &wgpu::Buffer,
+    scratch: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+) -> OpticalBlurJob {
+    use wgpu::util::DeviceExt;
+
+    let blur_pipe = backend.cached_pipeline(
+        include_str!("../../spektrafilm-shaders/wgsl/optical_gaussian.wgsl"),
+        &[
+            wgpu::BufferBindingType::Uniform,
+            wgpu::BufferBindingType::Storage { read_only: true },
+            wgpu::BufferBindingType::Storage { read_only: true },
+            wgpu::BufferBindingType::Storage { read_only: false },
+        ],
+    );
+    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Params {
+        width: u32,
+        height: u32,
+        first_pass: u32,
+        pad: u32,
+        radii: [i32; 4],
+    }
+    let weights = backend
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("optical_gaussian_weights"),
+            contents: bytemuck::cast_slice(&plan.weights),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let [r, g, b] = plan.radii;
+    let px = width.div_ceil(16);
+    let py = height.div_ceil(16);
+    let groups = if plan.radii.iter().all(|&radius| radius < 0) {
+        [(1, py), (px, 1)]
+    } else {
+        [(px, py); 2]
+    };
+    let passes = [true, false].map(|first| {
+        let params = Params {
+            width,
+            height,
+            first_pass: u32::from(first),
+            pad: 0,
+            radii: [r, g, b, 0],
+        };
+        let (src, dst) = if first {
+            (source, scratch)
+        } else {
+            (scratch, output)
+        };
+        resident_job(
+            &backend.device,
+            &blur_pipe,
+            "optical_gaussian",
+            bytemuck::bytes_of(&params),
+            &[src, &weights, dst],
+        )
+    });
+    OpticalBlurJob {
+        _weights: weights,
+        passes,
+        groups,
+    }
+}
+
+#[cfg(feature = "wgpu-backend")]
+impl OpticalBlurJob {
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        for (pass, groups) in self.passes.iter().zip(self.groups) {
+            pass.encode(encoder, groups, "optical_gaussian");
+        }
+    }
+}
+
+#[cfg(feature = "wgpu-backend")]
+fn resident_accumulate(
+    backend: &WgpuBackend,
+    n_pixels: u32,
+    source: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    scale: f32,
+    clear_first: bool,
+) -> DispatchJob {
+    let pipe = backend.cached_pipeline(
+        include_str!("../../spektrafilm-shaders/wgsl/add_scaled.wgsl"),
+        &[
+            wgpu::BufferBindingType::Uniform,
+            wgpu::BufferBindingType::Storage { read_only: true },
+            wgpu::BufferBindingType::Storage { read_only: false },
+        ],
+    );
+    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Params {
+        n_pixels: u32,
+        scale: f32,
+        clear_first: u32,
+        pad: u32,
+    }
+    let params = Params {
+        n_pixels,
+        scale,
+        clear_first: u32::from(clear_first),
+        pad: 0,
+    };
+    resident_job(
+        &backend.device,
+        &pipe,
+        "resident_accumulate",
+        bytemuck::bytes_of(&params),
+        &[source, output],
+    )
+}
+
+#[cfg(feature = "wgpu-backend")]
 fn build_halation_state(
     device: &wgpu::Device,
     hp: &crate::HalationGpuParams,
@@ -2190,7 +2366,6 @@ fn build_halation_state(
     backend: &WgpuBackend,
 ) -> HalationState {
     use crate::optical_blur::{GaussianRgb, halation_bounces, scatter_tail};
-    use wgpu::util::DeviceExt;
 
     let n_pixels = width * height;
     let image_bytes = u64::from(n_pixels) * 3 * 4;
@@ -2208,87 +2383,7 @@ fn build_halation_state(
     let uniform = wgpu::BufferBindingType::Uniform;
     let read = wgpu::BufferBindingType::Storage { read_only: true };
     let write = wgpu::BufferBindingType::Storage { read_only: false };
-    let blur_pipe = backend.cached_pipeline(
-        include_str!("../../spektrafilm-shaders/wgsl/optical_gaussian.wgsl"),
-        &[uniform, read, read, write],
-    );
-    let make_job =
-        |pipeline: &CachedPipelineRef, label: &str, bytes: &[u8], buffers: &[&wgpu::Buffer]| {
-            let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytes,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let entries: Vec<_> = std::iter::once(&params)
-                .chain(buffers.iter().copied())
-                .enumerate()
-                .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                    binding: binding as u32,
-                    resource: buffer.as_entire_binding(),
-                })
-                .collect();
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &pipeline.layout,
-                entries: &entries,
-            });
-            DispatchJob {
-                _params_buf: params,
-                pipeline: pipeline.clone(),
-                bg,
-            }
-        };
-
-    #[repr(C)]
-    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-    struct OpticalBlurParams {
-        width: u32,
-        height: u32,
-        first_pass: u32,
-        pad: u32,
-        radii: [i32; 4],
-    }
-    let make_blur = |plan: GaussianRgb| {
-        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("optical_gaussian_weights"),
-            contents: bytemuck::cast_slice(&plan.weights),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let [r, g, b] = plan.radii;
-        let px = width.div_ceil(16);
-        let py = height.div_ceil(16);
-        let groups = if plan.radii.iter().all(|&radius| radius < 0) {
-            [(1, py), (px, 1)]
-        } else {
-            [(px, py); 2]
-        };
-        let passes = [true, false].map(|first| {
-            let params = OpticalBlurParams {
-                width,
-                height,
-                first_pass: u32::from(first),
-                pad: 0,
-                radii: [r, g, b, 0],
-            };
-            let (src, dst) = if first {
-                (buf_b, buf_a)
-            } else {
-                (buf_a, &blurred)
-            };
-            make_job(
-                &blur_pipe,
-                "optical_gaussian",
-                bytemuck::bytes_of(&params),
-                &[src, &weights, dst],
-            )
-        });
-        OpticalBlurJob {
-            _weights: weights,
-            passes,
-            groups,
-        }
-    };
-
+    let make_blur = |plan| build_optical_blur(backend, width, height, plan, buf_b, buf_a, &blurred);
     let add_channels_pipe = backend.cached_pipeline(
         include_str!("../../spektrafilm-shaders/wgsl/add_scaled_per_channel.wgsl"),
         &[uniform, read, write],
@@ -2306,7 +2401,8 @@ fn build_halation_state(
             pad: [0; 3],
             scale: [r, g, b, 0.0],
         };
-        make_job(
+        resident_job(
+            device,
             &add_channels_pipe,
             "optical_add_channels",
             bytemuck::bytes_of(&params),
@@ -2336,7 +2432,8 @@ fn build_halation_state(
         };
         ScatterState {
             core: make_blur(GaussianRgb::new(hp.scatter_core_px)),
-            mix: make_job(
+            mix: resident_job(
+                device,
                 &mix_pipe,
                 "scatter_core_mix",
                 bytemuck::bytes_of(&params),
@@ -2348,42 +2445,15 @@ fn build_halation_state(
         }
     });
 
-    #[repr(C)]
-    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-    struct AccumulateParams {
-        n_pixels: u32,
-        scale: f32,
-        clear_first: u32,
-        pad: u32,
-    }
-    let bounces = if hp.halation_n_bounces > 0 {
-        let accumulate_pipe = backend.cached_pipeline(
-            include_str!("../../spektrafilm-shaders/wgsl/add_scaled.wgsl"),
-            &[uniform, read, write],
-        );
-        halation_bounces(hp)
-            .enumerate()
-            .map(|(index, (plan, scale))| {
-                let params = AccumulateParams {
-                    n_pixels,
-                    scale,
-                    clear_first: u32::from(index == 0),
-                    pad: 0,
-                };
-                (
-                    make_blur(plan),
-                    make_job(
-                        &accumulate_pipe,
-                        "halation_accumulate",
-                        bytemuck::bytes_of(&params),
-                        &[&blurred, &mixed],
-                    ),
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let bounces: Vec<_> = halation_bounces(hp)
+        .enumerate()
+        .map(|(index, (plan, scale))| {
+            (
+                make_blur(plan),
+                resident_accumulate(backend, n_pixels, &blurred, &mixed, scale, index == 0),
+            )
+        })
+        .collect();
     let final_add = (!bounces.is_empty()).then(|| add_channels(&mixed, buf_b, hp.halation_a_tot));
     let renormalize = (!bounces.is_empty() && hp.halation_renormalize).then(|| {
         let pipe = backend.cached_pipeline(
@@ -2396,7 +2466,8 @@ fn build_halation_state(
             pad: [0; 3],
             scale: [r, g, b, 0.0],
         };
-        make_job(
+        resident_job(
+            device,
             &pipe,
             "halation_renormalize",
             bytemuck::bytes_of(&params),
@@ -2422,39 +2493,196 @@ impl HalationState {
         n_pixels: u32,
         workgroup_size: u32,
     ) {
-        let dispatch = |encoder: &mut wgpu::CommandEncoder, job: &DispatchJob, (x, y)| {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("film_optics"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&job.pipeline.pipeline);
-            pass.set_bind_group(0, &job.bg, &[]);
-            pass.dispatch_workgroups(x, y, 1);
-        };
-        let blur = |encoder: &mut wgpu::CommandEncoder, job: &OpticalBlurJob| {
-            for (pass, groups) in job.passes.iter().zip(job.groups) {
-                dispatch(encoder, pass, groups);
-            }
-        };
         let linear = (n_pixels.div_ceil(workgroup_size), 1);
         if let Some(scatter) = &self.scatter {
-            blur(encoder, &scatter.core);
-            dispatch(encoder, &scatter.mix, linear);
+            scatter.core.encode(encoder);
+            scatter.mix.encode(encoder, linear, "scatter_mix");
             for (component, add) in &scatter.tail {
-                blur(encoder, component);
-                dispatch(encoder, add, linear);
+                component.encode(encoder);
+                add.encode(encoder, linear, "film_optics_add");
             }
             encoder.copy_buffer_to_buffer(&self.mixed, 0, image, 0, self.image_bytes);
         }
         for (bounce, accumulate) in &self.bounces {
-            blur(encoder, bounce);
-            dispatch(encoder, accumulate, linear);
+            bounce.encode(encoder);
+            accumulate.encode(encoder, linear, "halation_accumulate");
         }
         if let Some(add) = &self.final_add {
-            dispatch(encoder, add, linear);
+            add.encode(encoder, linear, "film_optics_add");
         }
         if let Some(renormalize) = &self.renormalize {
-            dispatch(encoder, renormalize, linear);
+            renormalize.encode(encoder, linear, "halation_renormalize");
+        }
+    }
+}
+
+#[cfg(feature = "wgpu-backend")]
+struct LayeredGrainState {
+    _curves: wgpu::Buffer,
+    sum: wgpu::Buffer,
+    image_bytes: u64,
+    layers: Vec<(DispatchJob, Option<OpticalBlurJob>, DispatchJob)>,
+    clumping: Option<(DispatchJob, Option<OpticalBlurJob>)>,
+    finish: DispatchJob,
+    final_blur: Option<OpticalBlurJob>,
+}
+
+#[cfg(feature = "wgpu-backend")]
+fn build_layered_grain_state(
+    backend: &WgpuBackend,
+    plan: &crate::LayeredGrainGpuParams,
+    width: u32,
+    height: u32,
+    density: &wgpu::Buffer,
+    scratch: &wgpu::Buffer,
+) -> LayeredGrainState {
+    use crate::optical_blur::GaussianRgb;
+    use wgpu::util::DeviceExt;
+
+    let n_pixels = width * height;
+    let image_bytes = u64::from(n_pixels) * 12;
+    let device = &backend.device;
+    let make_scratch = |label| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: image_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let samples = make_scratch("emulsion_layer");
+    let sum = make_scratch("emulsion_density");
+    let curves = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("emulsion_density_curves"),
+        contents: bytemuck::cast_slice(&plan.curves),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let uniform = wgpu::BufferBindingType::Uniform;
+    let read = wgpu::BufferBindingType::Storage { read_only: true };
+    let write = wgpu::BufferBindingType::Storage { read_only: false };
+    let sample = backend.cached_pipeline(
+        concat!(
+            include_str!("../../spektrafilm-shaders/wgsl/grain_rng.wgsl"),
+            include_str!("../../spektrafilm-shaders/wgsl/layered_grain.wgsl"),
+        ),
+        &[uniform, read, read, write],
+    );
+    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Params {
+        n_pixels: u32,
+        mode: u32,
+        layer: u32,
+        rows: u32,
+        direction: f32,
+        clump_mu: f32,
+        clump_sigma: f32,
+        monochrome: u32,
+        floor: [f32; 4],
+        maximum: [f32; 4],
+        particles: [f32; 4],
+        uniformity: [f32; 4],
+    }
+    let pad = |[r, g, b]: [f32; 3]| [r, g, b, 0.0];
+    let base = Params {
+        n_pixels,
+        mode: 0,
+        layer: 0,
+        rows: plan.rows,
+        direction: plan.direction,
+        clump_mu: plan.clumping.map_or(0.0, |clump| clump.mu),
+        clump_sigma: plan.clumping.map_or(0.0, |clump| clump.sigma),
+        monochrome: u32::from(plan.monochrome),
+        floor: pad(plan.density_min),
+        maximum: [0.0; 4],
+        particles: [0.0; 4],
+        uniformity: pad(plan.grain_uniformity),
+    };
+    let sample_job = |params: Params, source: &wgpu::Buffer, target: &wgpu::Buffer| {
+        resident_job(
+            device,
+            &sample,
+            "layered_grain",
+            bytemuck::bytes_of(&params),
+            &[source, &curves, target],
+        )
+    };
+    let blur = |sigma, source, target| {
+        let plan = GaussianRgb::new(sigma);
+        plan.radii
+            .iter()
+            .any(|&radius| radius != 0)
+            .then(|| build_optical_blur(backend, width, height, plan, source, scratch, target))
+    };
+    let layers = plan
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| {
+            let params = Params {
+                layer: index as u32,
+                floor: pad(layer.floor),
+                maximum: pad(layer.maximum),
+                particles: pad(layer.particles_per_pixel),
+                ..base
+            };
+            (
+                sample_job(params, density, &samples),
+                blur(layer.dye_blur, &samples, &samples),
+                resident_accumulate(backend, n_pixels, &samples, &sum, 1.0, index == 0),
+            )
+        })
+        .collect();
+    let clumping = plan.clumping.map(|clump| {
+        (
+            sample_job(Params { mode: 1, ..base }, density, &samples),
+            blur([clump.blur; 3], &samples, &samples),
+        )
+    });
+    let finish = sample_job(Params { mode: 2, ..base }, &samples, &sum);
+    let final_blur = blur([plan.final_blur; 3], &sum, density);
+    LayeredGrainState {
+        _curves: curves,
+        sum,
+        image_bytes,
+        layers,
+        clumping,
+        finish,
+        final_blur,
+    }
+}
+
+#[cfg(feature = "wgpu-backend")]
+impl LayeredGrainState {
+    fn encode_passes(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        density: &wgpu::Buffer,
+        n_pixels: u32,
+        workgroup_size: u32,
+    ) {
+        let groups = (n_pixels.div_ceil(workgroup_size), 1);
+        let run_layer = |encoder: &mut wgpu::CommandEncoder,
+                         sample: &DispatchJob,
+                         blur: &Option<OpticalBlurJob>| {
+            sample.encode(encoder, groups, "grain_sample");
+            if let Some(blur) = blur {
+                blur.encode(encoder);
+            }
+        };
+        for (sample, blur, accumulate) in &self.layers {
+            run_layer(encoder, sample, blur);
+            accumulate.encode(encoder, groups, "grain_accumulate");
+        }
+        if let Some((sample, blur)) = &self.clumping {
+            run_layer(encoder, sample, blur);
+        }
+        self.finish.encode(encoder, groups, "grain_finish");
+        if let Some(blur) = &self.final_blur {
+            blur.encode(encoder);
+        } else {
+            encoder.copy_buffer_to_buffer(&self.sum, 0, density, 0, self.image_bytes);
         }
     }
 }
@@ -4758,7 +4986,10 @@ fn build_grain_state(
     let n_pixels = (width as usize) * (height as usize);
 
     let grain_pipe = backend.cached_pipeline(
-        include_str!("../../spektrafilm-shaders/wgsl/grain.wgsl"),
+        concat!(
+            include_str!("../../spektrafilm-shaders/wgsl/grain_rng.wgsl"),
+            include_str!("../../spektrafilm-shaders/wgsl/grain.wgsl"),
+        ),
         &[
             wgpu::BufferBindingType::Uniform,
             wgpu::BufferBindingType::Storage { read_only: false },

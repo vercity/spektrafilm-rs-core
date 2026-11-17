@@ -950,6 +950,128 @@ extern "C" __global__ void grain_kernel(
     }
 }
 
+__device__ float grain_open_uniform(unsigned int* state) {
+    return ((float)(next_u32(state) >> 9u) + 0.5f) / 8388608.0f;
+}
+
+__device__ unsigned int layered_grain_seed(unsigned int pixel, unsigned int stream) {
+    return splitmix32_hash(pixel ^ ((stream + 1u) * 0x9e3779b9u));
+}
+
+__device__ float grain_log_factorial(float k) {
+    if (k < 10.0f) {
+        float sum = 0.0f;
+        for (float i = 2.0f; i <= k; i += 1.0f) sum += logf(i);
+        return sum;
+    }
+    float inv = 1.0f / k;
+    return (k + 0.5f) * logf(k) - k + 0.9189385332046727f
+        + inv * (1.0f / 12.0f - inv * inv / 360.0f);
+}
+
+__device__ float grain_poisson(float lambda, unsigned int* state) {
+    // Invalid runtime inputs must terminate even if a rate becomes NaN.
+    if (!(lambda > 0.0f && lambda <= 3.402823466e38f)) return 0.0f;
+    if (lambda < 10.0f) {
+        float minimum = expf(-lambda);
+        float product = grain_open_uniform(state);
+        float count = 0.0f;
+        while (product > minimum && count < 128.0f) {
+            product *= grain_open_uniform(state);
+            count += 1.0f;
+        }
+        return count;
+    }
+    if (lambda >= 4096.0f) {
+        return fmaxf(0.0f, roundf(lambda + sqrtf(lambda) * standard_normal(state)));
+    }
+    // Hörmann transformed rejection for intermediate populations.
+    float b = 0.931f + 2.53f * sqrtf(lambda);
+    float a = -0.059f + 0.02483f * b;
+    float inv_alpha = 1.1239f + 1.1328f / (b - 3.4f);
+    float vr = 0.9277f - 3.6224f / (b - 2.0f);
+    float log_lambda = logf(lambda);
+    for (unsigned int attempt = 0; attempt < 64; ++attempt) {
+        float u = grain_open_uniform(state) - 0.5f;
+        float v = grain_open_uniform(state);
+        float us = 0.5f - fabsf(u);
+        float k = floorf((2.0f * a / us + b) * u + lambda + 0.43f);
+        if (us >= 0.07f && v <= vr) return k;
+        if (k >= 0.0f && (us >= 0.013f || v <= us)) {
+            float lhs = logf(v * inv_alpha / (a / (us * us) + b));
+            float rhs = fmaf(k, log_lambda, -lambda) - grain_log_factorial(k);
+            if (lhs <= rhs) return k;
+        }
+    }
+    // Bound dispatch time if all proposals miss the rejection test.
+    return fmaxf(0.0f, roundf(lambda + sqrtf(lambda) * standard_normal(state)));
+}
+
+__device__ float grain_layer_density(
+    float axis, unsigned int column, unsigned int rows, const float* table
+) {
+    unsigned int last = rows - 1u;
+    if (!(axis > table[0])) return table[column];
+    if (axis >= table[4u * last]) return table[4u * last + column];
+    unsigned int left = 0u;
+    unsigned int right = rows;
+    while (left < right) {
+        unsigned int middle = left + (right - left) / 2u;
+        if (axis < table[4u * middle]) {
+            right = middle;
+        } else {
+            left = middle + 1u;
+        }
+    }
+    const float* lo = table + 4u * (left - 1u);
+    const float* hi = table + 4u * left;
+    float width = hi[0] - lo[0];
+    if (width == 0.0f) return lo[column];
+    return fmaf((axis - lo[0]) / width, hi[column] - lo[column], lo[column]);
+}
+
+extern "C" __global__ void layered_grain_kernel(
+    unsigned int n_pixels,
+    unsigned int mode,
+    unsigned int layer,
+    unsigned int rows,
+    float direction,
+    float clump_mu,
+    float clump_sigma,
+    unsigned int monochrome,
+    const float* __restrict__ source,
+    const float* __restrict__ curves,
+    const float* __restrict__ physics,
+    float* __restrict__ result
+) {
+    unsigned int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel >= n_pixels) return;
+    unsigned int base = 3u * pixel;
+    for (unsigned int channel = 0; channel < 3; ++channel) {
+        unsigned int model_ch = monochrome != 0u ? 0u : channel;
+        unsigned int offset = base + channel;
+        if (mode == 0u) {
+            float axis = source[base + model_ch] * direction;
+            float density = grain_layer_density(axis, layer + 1u, rows, curves + 4u * model_ch * rows);
+            float maximum = physics[3u + channel];
+            float npp = physics[6u + channel];
+            float p = fminf(fmaxf((density + physics[channel]) / maximum, 1e-6f), 1.0f - 1e-6f);
+            float saturation = 1.0f - p * physics[9u + channel] * (1.0f - 1e-6f);
+            unsigned int rng = layered_grain_seed(pixel, model_ch + 10u * layer);
+            // Poisson thinning combines the seed count and binomial reaction.
+            float developed = grain_poisson(npp * p / saturation, &rng);
+            result[offset] = developed * (maximum / npp) * saturation;
+        } else if (mode == 1u) {
+            unsigned int rng = layered_grain_seed(pixel, 30u + model_ch);
+            result[offset] = expf(clump_mu + clump_sigma * standard_normal(&rng));
+        } else {
+            float density = result[offset];
+            if (clump_sigma > 0.0f) density *= source[offset];
+            result[offset] = density - physics[channel];
+        }
+    }
+}
+
 extern "C" __global__ void dir_matmul_kernel(
     const float* __restrict__ density,
     unsigned int n_pixels,
@@ -1324,6 +1446,7 @@ pub struct CudaBackend {
     glare_apply_kernel: CudaFunction,
     unsharp_kernel: CudaFunction,
     grain_kernel: CudaFunction,
+    layered_grain_kernel: CudaFunction,
     dir_matmul_kernel: CudaFunction,
     gamut_kernel: CudaFunction,
     post_scan_kernel: CudaFunction,
@@ -1366,6 +1489,7 @@ impl CudaBackend {
         let glare_apply_kernel = module.load_function("glare_apply_kernel").ok()?;
         let unsharp_kernel = module.load_function("unsharp_combine_kernel").ok()?;
         let grain_kernel = module.load_function("grain_kernel").ok()?;
+        let layered_grain_kernel = module.load_function("layered_grain_kernel").ok()?;
         let dir_matmul_kernel = module.load_function("dir_matmul_kernel").ok()?;
         let gamut_kernel = module.load_function("gamut_compress_kernel").ok()?;
         let post_scan_kernel = module.load_function("post_scan_kernel").ok()?;
@@ -1400,6 +1524,7 @@ impl CudaBackend {
             glare_apply_kernel,
             unsharp_kernel,
             grain_kernel,
+            layered_grain_kernel,
             dir_matmul_kernel,
             gamut_kernel,
             post_scan_kernel,
@@ -1632,6 +1757,40 @@ impl CudaBackend {
         Ok(())
     }
 
+    fn launch_optical_blur_pass(
+        &self,
+        source: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        (width, height): (u32, u32),
+        weights: &CudaSlice<f32>,
+        [r, g, b]: [i32; 3],
+        first: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut config = launch_2d(width, height);
+        if r < 0 && g < 0 && b < 0 {
+            if first != 0 {
+                config.grid_dim.0 = 1;
+            } else {
+                config.grid_dim.1 = 1;
+            }
+        }
+        let mut launch = self.stream.launch_builder(&self.optical_gaussian_kernel);
+        launch
+            .arg(source)
+            .arg(output)
+            .arg(&width)
+            .arg(&height)
+            .arg(&first)
+            .arg(&r)
+            .arg(&g)
+            .arg(&b)
+            .arg(weights);
+        // SAFETY: Bindings follow optical_gaussian_kernel, with separate
+        // source and output allocations and a fixed-width weights row per channel.
+        unsafe { launch.launch(config) }?;
+        Ok(())
+    }
+
     fn blur_optical_device(
         &self,
         image: &CudaSlice<f32>,
@@ -1642,34 +1801,20 @@ impl CudaBackend {
         plan: &crate::optical_blur::GaussianRgb,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let weights = self.stream.clone_htod(plan.weights.as_flattened())?;
-        let full_lines = plan.radii.iter().all(|&r| r < 0);
-        let [r, g, b] = plan.radii;
-        for first in [1u32, 0u32] {
-            let (src, dst) = if first != 0 {
-                (image, &mut *scratch)
-            } else {
-                (&*scratch, &mut *blurred)
-            };
-            let mut config = launch_2d(width, height);
-            if full_lines {
-                if first != 0 {
-                    config.grid_dim.0 = 1;
-                } else {
-                    config.grid_dim.1 = 1;
-                }
-            }
-            let mut launch = self.stream.launch_builder(&self.optical_gaussian_kernel);
-            launch
-                .arg(src)
-                .arg(dst)
-                .arg(&width)
-                .arg(&height)
-                .arg(&first)
-                .arg(&r)
-                .arg(&g)
-                .arg(&b)
-                .arg(&weights);
-            unsafe { launch.launch(config) }?;
+        self.launch_optical_blur_pass(image, scratch, (width, height), &weights, plan.radii, 1)?;
+        self.launch_optical_blur_pass(scratch, blurred, (width, height), &weights, plan.radii, 0)
+    }
+
+    fn blur_optical_in_place(
+        &self,
+        image: &mut CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        width: u32,
+        height: u32,
+        plan: &crate::optical_blur::GaussianRgb,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if plan.radii.iter().all(|&radius| radius == 0) {
+            return Ok(());
         }
         Ok(())
     }
@@ -1741,6 +1886,92 @@ impl CudaBackend {
                 launch.arg(&n_pixels).arg(&r).arg(&g).arg(&b).arg(img);
                 unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
             }
+        }
+        Ok(())
+    }
+
+    fn run_layered_grain_device(
+        &self,
+        density: &mut CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        width: u32,
+        height: u32,
+        plan: &crate::LayeredGrainGpuParams,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::optical_blur::GaussianRgb;
+
+        let n_pixels = width * height;
+        let mut samples = self.alloc_f32(n_pixels as usize * 3)?;
+        let mut sum = self.alloc_f32(n_pixels as usize * 3)?;
+        let curves = self.stream.clone_htod(plan.curves.as_flattened())?;
+        let monochrome = u32::from(plan.monochrome);
+        let mu = plan.clumping.map_or(0.0, |clump| clump.mu);
+        let sigma = plan.clumping.map_or(0.0, |clump| clump.sigma);
+        let launch = |mode: u32,
+                      layer: u32,
+                      physics: [[f32; 3]; 4],
+                      source: &CudaSlice<f32>,
+                      output: &mut CudaSlice<f32>|
+         -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let physics = self.stream.clone_htod(physics.as_flattened())?;
+            let mut job = self.stream.launch_builder(&self.layered_grain_kernel);
+            job.arg(&n_pixels)
+                .arg(&mode)
+                .arg(&layer)
+                .arg(&plan.rows)
+                .arg(&plan.direction)
+                .arg(&mu)
+                .arg(&sigma)
+                .arg(&monochrome)
+                .arg(source)
+                .arg(&curves)
+                .arg(&physics)
+                .arg(output);
+            // SAFETY: Bindings follow layered_grain_kernel. The live buffers
+            // cover all RGB pixels, profile rows and per-channel coefficients.
+            unsafe { job.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
+            Ok(())
+        };
+
+        for (index, layer) in plan.layers.iter().enumerate() {
+            let physics = [
+                layer.floor,
+                layer.maximum,
+                layer.particles_per_pixel,
+                plan.grain_uniformity,
+            ];
+            launch(0, index as u32, physics, density, &mut samples)?;
+            self.blur_optical_in_place(
+                &mut samples,
+                scratch,
+                width,
+                height,
+                &GaussianRgb::new(layer.dye_blur),
+            )?;
+            self.add_scaled(&samples, n_pixels, 1.0, index == 0, &mut sum)?;
+        }
+        if let Some(clump) = plan.clumping {
+            launch(1, 0, [[0.0; 3]; 4], density, &mut samples)?;
+            self.blur_optical_in_place(
+                &mut samples,
+                scratch,
+                width,
+                height,
+                &GaussianRgb::new([clump.blur; 3]),
+            )?;
+        }
+        launch(
+            2,
+            0,
+            [plan.density_min, [0.0; 3], [0.0; 3], [0.0; 3]],
+            &samples,
+            &mut sum,
+        )?;
+        let final_blur = GaussianRgb::new([plan.final_blur; 3]);
+        if final_blur.radii.iter().all(|&radius| radius == 0) {
+            std::mem::swap(density, &mut sum);
+        } else {
+            self.blur_optical_device(&sum, scratch, density, width, height, &final_blur)?;
         }
         Ok(())
     }
@@ -2218,6 +2449,9 @@ impl CudaBackend {
 
         if let Some(gp) = p.grain.as_ref() {
             self.run_grain_device(&mut buf_a, &mut buf_b, image.width, image.height, gp)?;
+        }
+        if let Some(plan) = p.layered_grain.as_ref() {
+            self.run_layered_grain_device(&mut buf_a, &mut buf_b, image.width, image.height, plan)?;
         }
 
         let scan_cd_src;

@@ -447,6 +447,28 @@ pub(crate) fn expose_working(
     raw
 }
 
+pub(crate) fn layered_grain_params(
+    params: &RuntimeParams,
+    film: &Profile,
+    pix_um: f32,
+) -> LayeredGrainParams {
+    let grain = &params.film_render.grain;
+    LayeredGrainParams {
+        pixel_size_um: f64::from(pix_um),
+        particle_area_um2: grain.agx_particle_area_um2,
+        particle_scale: grain.agx_particle_scale,
+        particle_scale_layers: grain.agx_particle_scale_layers,
+        density_min: grain.density_min,
+        uniformity: grain.uniformity,
+        blur_px: f64::from(grain.blur),
+        blur_dye_clouds_um: f64::from(grain.blur_dye_clouds_um),
+        micro_structure: grain.micro_structure.map(f64::from),
+        positive_film: film.is_positive(),
+        monochrome: film.is_bw(),
+        use_fast_stats: params.settings.use_fast_stats,
+    }
+}
+
 /// Develop: log_raw → density_cmy via density curves + DIR couplers + grain.
 pub fn develop(
     log_raw: &ImageBuf,
@@ -509,27 +531,12 @@ pub(crate) fn develop_with_pixel_size(
     let grain = &params.film_render.grain;
     if grain.active {
         let t = Instant::now();
-        // Keep the aggregate model for GPU previews until shaders consume
-        // the emulsion tables.
-        let layered = if grain.sublayers_active && !backend.is_gpu() {
+        let layered = if grain.sublayers_active {
             grain::apply_grain_to_density_layers(
                 &density_cmy,
                 &norm_curves_f64,
                 &film.data.density_curves_layers,
-                &LayeredGrainParams {
-                    pixel_size_um: f64::from(pix_um),
-                    particle_area_um2: grain.agx_particle_area_um2,
-                    particle_scale: grain.agx_particle_scale,
-                    particle_scale_layers: grain.agx_particle_scale_layers,
-                    density_min: grain.density_min,
-                    uniformity: grain.uniformity,
-                    blur_px: f64::from(grain.blur),
-                    blur_dye_clouds_um: f64::from(grain.blur_dye_clouds_um),
-                    micro_structure: grain.micro_structure.map(f64::from),
-                    positive_film: film.is_positive(),
-                    monochrome: film.is_bw(),
-                    use_fast_stats: params.settings.use_fast_stats,
-                },
+                &layered_grain_params(params, film, pix_um),
             )
         } else {
             None

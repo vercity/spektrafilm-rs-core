@@ -903,11 +903,20 @@ impl Pipeline {
             }
         });
 
-        // Grain in the resident chain — same per-channel particle math as
-        // `apply_grain_to_density`. The GPU uses normal-approximation
-        // sampling; CPU does the same whenever λ > 30 / var > 9, which is
-        // the typical regime for ≥ 1 MP images.
-        let grain = if self.params.film_render.grain.active {
+        let grain_params = &self.params.film_render.grain;
+        let layered_grain = if grain_params.active && grain_params.sublayers_active {
+            spektrafilm_model::grain::layered_grain_gpu_params(
+                &film_curves_norm,
+                &self.film.data.density_curves_layers,
+                &stages::filming::layered_grain_params(&self.params, &self.film, pix_um),
+            )
+        } else {
+            None
+        };
+        if layered_grain.is_some() {
+            tracing::debug!("pipeline: using profiled resident grain");
+        }
+        let grain = if grain_params.active && layered_grain.is_none() {
             let g = &self.params.film_render.grain;
             let pixel_area = pix_um * pix_um;
             let n_sub = g.n_sub_layers.max(1);
@@ -1070,6 +1079,7 @@ impl Pipeline {
             halation,
             dir_couplers,
             grain,
+            layered_grain,
             glare,
             gamut: self.output_gamut.gpu_params(),
             unsharp,
@@ -1222,6 +1232,93 @@ mod tests {
                 let delta = (gpu as f64 - cpu as f64).abs();
                 assert!(delta < 2e-5, "channel sample {px}: {gpu}, {cpu}, {delta}");
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native wgpu adapter"]
+    fn resident_profiled_grain_preserves_moments_and_aggregate_fallback() {
+        let backend =
+            spektrafilm_gpu::wgpu_backend::WgpuBackend::new().expect("native wgpu adapter");
+        let dir = data_dir();
+        let paper = crate::profile::load_profile_by_name(&dir, "kodak_portra_endura").unwrap();
+        let mut params = RuntimeParams::default();
+        params.camera.auto_exposure = false;
+        params.camera.film_format_mm = 0.5;
+        params.io.scan_film = true;
+        params.io.input_cctf_decoding = false;
+        params.io.output_cctf_encoding = false;
+        params.io.output_gamut_compress.algorithm = "off".into();
+        params.film_render.halation.active = false;
+        params.film_render.dir_couplers.active = true;
+        params.film_render.grain.blur = 0.0;
+        params.film_render.grain.micro_structure = [0.0, 0.0];
+        params.print_render.glare.active = false;
+        params.scanner.unsharp_mask = [0.0; 2];
+        let (width, height) = (229, 223);
+        let image = ImageBuf::from_data(
+            width,
+            height,
+            [0.24, 0.18, 0.12]
+                .map(from_f64)
+                .repeat((width * height) as usize),
+        );
+        let render = |pipeline: &Pipeline| {
+            pipeline
+                .process_resident_borrowed(&image, &backend)
+                .expect("grain should stay resident")
+        };
+        let moments = |img: &ImageBuf, channel| {
+            let n = img.pixel_count() as f64;
+            let pixels = || img.pixels().map(move |px| px[channel] as f64);
+            let mean = pixels().sum::<f64>() / n;
+            let var = pixels().map(|value| (value - mean).powi(2)).sum::<f64>() / n;
+            (mean, var)
+        };
+
+        for stock in ["kodak_portra_400", "fujifilm_velvia_100"] {
+            let film = crate::profile::load_profile_by_name(&dir, stock).unwrap();
+            let pipeline =
+                Pipeline::new_with_spectral(film, paper.clone(), params.clone(), &dir).unwrap();
+            let mut unblurred = pipeline.params.clone();
+            unblurred.film_render.grain.blur_dye_clouds_um = 0.0;
+            let raw = render(&pipeline.clone().with_params(unblurred));
+            let mut blurred = pipeline.params.clone();
+            blurred.film_render.grain.blur_dye_clouds_um = 3.0;
+            let blurred = pipeline.clone().with_params(blurred);
+            let gpu = render(&blurred);
+            let cpu = blurred.process(image.clone(), &CpuBackend);
+            for channel in 0..3 {
+                let (gpu_mean, gpu_var) = moments(&gpu, channel);
+                let (cpu_mean, cpu_var) = moments(&cpu, channel);
+                let (_, raw_var) = moments(&raw, channel);
+                assert!(
+                    (gpu_mean - cpu_mean).abs() < 0.003,
+                    "{stock} mean {channel}"
+                );
+                assert!(
+                    (gpu_var / cpu_var - 1.0).abs() < 0.15,
+                    "{stock} variance {channel}: {gpu_var} vs {cpu_var}"
+                );
+                assert!(gpu_var < 0.65 * raw_var, "{stock} dye blur {channel}");
+            }
+
+            let mut aggregate = pipeline.params.clone();
+            aggregate.film_render.grain.sublayers_active = false;
+            let aggregate = render(&pipeline.clone().with_params(aggregate));
+            let mut fallback = pipeline;
+            fallback.film.data.density_curves_layers[0][0].clear();
+            assert_eq!(
+                render(&fallback).data,
+                aggregate.data,
+                "{stock} malformed layers"
+            );
+            fallback.film.data.density_curves_layers.clear();
+            assert_eq!(
+                render(&fallback).data,
+                aggregate.data,
+                "{stock} missing layers"
+            );
         }
     }
 
