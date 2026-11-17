@@ -415,7 +415,7 @@ fn data_dir(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(explicit) = explicit {
         return explicit;
     }
-    let local = PathBuf::from("data");
+    let local = crate::default_data_dir();
     if local.is_dir() {
         return local;
     }

@@ -21,6 +21,7 @@ rayon.workspace = true
 roxmltree = "0.20"
 spektrafilm-math.workspace = true
 tiff = "0.10"
+tracing.workspace = true
 
 [build-dependencies]
 cc = { version = "1", optional = true }

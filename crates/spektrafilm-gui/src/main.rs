@@ -2401,11 +2401,8 @@ fn pick_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SPEKTRAFILM_DATA_DIR") {
         candidates.push(PathBuf::from(dir));
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        candidates.push(dir.join("..").join("Resources").join("data"));
-        candidates.push(dir.join("data"));
+    if let Some(dir) = spektrafilm_core::data::bundled_data_dir() {
+        candidates.push(dir);
     }
     candidates.push(PathBuf::from("data"));
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {

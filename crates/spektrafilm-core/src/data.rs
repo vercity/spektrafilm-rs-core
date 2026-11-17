@@ -13,3 +13,17 @@ pub use spektrafilm_math::spectral::{
 pub const LOG_EXPOSURE_MIN: f32 = -3.0;
 pub const LOG_EXPOSURE_MAX: f32 = 4.0;
 pub const LOG_EXPOSURE_LEN: usize = 256;
+use std::path::PathBuf;
+
+
+/// Locate the profiles and spectral data installed with this executable.
+pub fn bundled_data_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let binary_dir = exe.parent()?;
+    [
+        binary_dir.join("../Resources/data"),
+        binary_dir.join("data"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.join("profiles").is_dir())
+}

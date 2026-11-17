@@ -75,7 +75,7 @@ pub(crate) struct BundleOptions {
     #[arg(short, long)]
     output: PathBuf,
     /// Directory containing the stock profiles and spectral resources.
-    #[arg(long, default_value = "data")]
+    #[arg(long, default_value_os_t = crate::default_data_dir())]
     data_dir: PathBuf,
     #[command(flatten)]
     delivery: delivery::DeliveryOptions,

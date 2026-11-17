@@ -75,6 +75,7 @@ pub fn decode_with_options(path: &Path, options: DevelopOptions) -> Result<Image
                 .with_context(|| format!("correcting RAW lens for {}", path.display()))?;
         }
         apply_white_balance(&mut image, adaptation);
+        tracing::debug!("developed RAW image with LibRaw");
         return Ok(image);
     }
     let source =

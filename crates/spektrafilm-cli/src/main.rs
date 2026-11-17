@@ -19,6 +19,10 @@ use spektrafilm_math::image::ImageBuf;
 
 mod lut_bundle;
 
+fn default_data_dir() -> PathBuf {
+    spektrafilm_core::data::bundled_data_dir().unwrap_or_else(|| PathBuf::from("data"))
+}
+
 #[derive(Parser)]
 #[command(
     name = "spektrafilm",
@@ -71,13 +75,13 @@ enum Commands {
         #[arg(long, default_value = "1")]
         iters: usize,
         /// Path to the data directory.
-        #[arg(long, default_value = "data")]
+        #[arg(long, default_value_os_t = default_data_dir())]
         data_dir: PathBuf,
     },
     /// List available film and paper profiles.
     ListProfiles {
         /// Path to the data directory.
-        #[arg(long, default_value = "data")]
+        #[arg(long, default_value_os_t = default_data_dir())]
         data_dir: PathBuf,
     },
     /// Export a 3D CUBE LUT for use in other software.
@@ -102,7 +106,7 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
         /// Path to the data directory.
-        #[arg(long, default_value = "data")]
+        #[arg(long, default_value_os_t = default_data_dir())]
         data_dir: PathBuf,
     },
     /// Export a film and one or more papers as a CUBE LUT bundle.
