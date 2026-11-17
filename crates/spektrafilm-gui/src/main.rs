@@ -30,10 +30,12 @@ use spektrafilm_math::{
 };
 
 mod export_output;
+mod presets;
 mod raw_workflow;
 mod source_snapshot;
 
 use export_output::{StagedOutput, temporary_export_directory, write_preview_output};
+use presets::{FACTORY_FILM, FACTORY_PAPER, GuiPreset, Preferences};
 use raw_workflow::RawDevelopSettings;
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -96,7 +98,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "spektrafilm",
         options,
-        Box::new(|_| Ok(Box::new(App::new(backend, initial_image)))),
+        Box::new(|_| {
+            Ok(Box::new(App::new_with_preferences(
+                backend,
+                initial_image,
+                presets::config_dir(),
+            )))
+        }),
     )
 }
 
@@ -198,6 +206,8 @@ struct ProfileEntry {
     display: String,
 }
 
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 struct OutputDepths {
     tiff: u8,
     exr: u8,
@@ -287,6 +297,7 @@ fn has_hanatos_surface(film: &profile::Profile) -> bool {
 struct App {
     backend: Arc<dyn ComputeBackend>,
     data_dir: PathBuf,
+    preferences: Preferences,
     /// Profiles where `info.support == "film"`.
     films: Vec<ProfileEntry>,
     /// Profiles where `info.support == "paper"` (or other print-stage
@@ -334,6 +345,9 @@ struct App {
     pan: egui::Vec2,
     gray_canvas: bool,
     white_border: f32,
+    preview_interpolation: String,
+    film_channel_swap: [usize; 3],
+    print_channel_swap: [usize; 3],
     /// macOS-only: tag the wgpu CAMetalLayer's `colorspace` as sRGB on
     /// the first `update()` tick (it's not yet wired up at
     /// `App::new` time). Set to `true` once the call succeeds so we
@@ -423,25 +437,24 @@ struct ExportJob {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(backend: Arc<dyn ComputeBackend>, initial_image: Option<PathBuf>) -> Self {
+        Self::new_with_preferences(backend, initial_image, None)
+    }
+
+    fn new_with_preferences(
+        backend: Arc<dyn ComputeBackend>,
+        initial_image: Option<PathBuf>,
+        config_dir: Option<PathBuf>,
+    ) -> Self {
+        let (preferences, directory_error) = Preferences::open(config_dir);
         let data_dir = pick_data_dir();
         let (films, papers) = scan_profiles(&data_dir);
-        let film_name = pick_default_stock(&films, "kodak_gold_200");
-        // Load the default film once to derive two start-up choices:
-        //   - the paired print paper (`target_print`): each profile is
-        //     tuned against a specific paper, so a generic default gives a
-        //     colour-shifted preview (Kodak Gold pairs with Portra Endura,
-        //     not Fujifilm Crystal Archive).
-        //   - whether to scan the film directly: positive/slide stocks have
-        //     no print paper and must be scanned (see the film-change
-        //     handler in `controls_panel`).
+        let factory = GuiPreset::default();
+        let film_name = pick_default_stock(&films, FACTORY_FILM);
+        let print_name = pick_default_stock(&papers, FACTORY_PAPER);
         let film_profile = profile::load_profile_by_name(&data_dir, &film_name).ok();
-        let print_name = film_profile
-            .as_ref()
-            .and_then(|f| f.info.target_print.clone())
-            .filter(|t| papers.iter().any(|p| &p.stock == t))
-            .unwrap_or_else(|| pick_default_stock(&papers, "fujifilm_crystal_archive_typeii"));
-        let mut params = RuntimeParams::default();
+        let mut params = factory.params;
         params.io.scan_film = film_profile.as_ref().is_some_and(|f| f.is_positive());
         let film_dev_times = film_profile
             .as_ref()
@@ -452,6 +465,7 @@ impl App {
         let mut app = Self {
             backend,
             data_dir,
+            preferences,
             films,
             papers,
             film_name,
@@ -484,18 +498,203 @@ impl App {
             render_request: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
-            gray_canvas: false,
-            white_border: 0.0,
+            gray_canvas: factory.gray_canvas,
+            white_border: factory.white_padding,
+            preview_interpolation: factory.interpolation,
+            film_channel_swap: factory.film_channels,
+            print_channel_swap: factory.print_channels,
             render_job: None,
             status: String::from("Load an image to start."),
             #[cfg(target_os = "macos")]
             metal_colorspace_tagged: false,
             export_job: None,
         };
+        let startup = app
+            .preferences
+            .startup_preset()
+            .and_then(|preset| match preset {
+                Some(preset) => app.apply_preset(preset),
+                None => Ok(()),
+            });
         if let Some(p) = initial_image {
             app.load_image_from_path(&p);
         }
+        if let Some(error) = startup.err().or(directory_error) {
+            app.status = format!("{} GUI settings: {error:#}", app.status);
+        }
         app
+    }
+
+    fn current_preset(&self) -> GuiPreset {
+        let mut params = self.params.clone();
+        params.io.input_color_space = self.manual_input_color.color_space.into();
+        params.io.input_cctf_decoding = self.manual_input_color.cctf_encoding;
+        GuiPreset {
+            film: self.film_name.clone(),
+            paper: self.print_name.clone(),
+            params,
+            override_input_color: self.override_input_color,
+            saving_color: self.saving_color,
+            depths: self.output_depths,
+            raw_develop: self.raw_develop,
+            auto_preview: self.auto_preview,
+            display_transform: self.display_transform,
+            gray_canvas: self.gray_canvas,
+            white_padding: self.white_border,
+            interpolation: self.preview_interpolation.clone(),
+            film_channels: self.film_channel_swap,
+            print_channels: self.print_channel_swap,
+        }
+    }
+
+    fn apply_preset(&mut self, preset: GuiPreset) -> Result<()> {
+        anyhow::ensure!(
+            self.films.iter().any(|entry| entry.stock == preset.film),
+            "unknown preset film: {}",
+            preset.film
+        );
+        anyhow::ensure!(
+            self.papers.iter().any(|entry| entry.stock == preset.paper),
+            "unknown preset paper: {}",
+            preset.paper
+        );
+        let film = profile::load_profile_by_name(&self.data_dir, &preset.film)?;
+        let paper = profile::load_profile_by_name(&self.data_dir, &preset.paper)?;
+        let input_color = RasterColor::new(
+            &preset.params.io.input_color_space,
+            preset.params.io.input_cctf_decoding,
+        )
+        .context("unsupported preset input color space")?;
+
+        self.film_name = preset.film;
+        self.print_name = preset.paper;
+        self.film_dev_times.clone_from(&film.data.development_time);
+        self.print_dev_times
+            .clone_from(&paper.data.development_time);
+        self.hanatos_surface_available = has_hanatos_surface(&film);
+        self.params = preset.params;
+        self.params.settings.apply_hanatos2025_adaptation_surface &= self.hanatos_surface_available;
+        self.manual_input_color = input_color;
+        self.override_input_color = preset.override_input_color;
+        self.saving_color = preset.saving_color;
+        self.output_depths = preset.depths;
+        self.raw_develop = preset.raw_develop;
+        self.auto_preview = preset.auto_preview;
+        self.display_transform = preset.display_transform;
+        self.gray_canvas = preset.gray_canvas;
+        self.white_border = preset.white_padding;
+        self.preview_interpolation = preset.interpolation;
+        self.film_channel_swap = preset.film_channels;
+        self.print_channel_swap = preset.print_channels;
+        self.sync_input_color();
+        self.output_tex = None;
+        self.request_render();
+        Ok(())
+    }
+
+    fn refresh_film_selection(&mut self) {
+        self.film_dev_times = Vec::new();
+        self.hanatos_surface_available = false;
+        self.params.film_render.development_time = None;
+        if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name) {
+            // The Python GUI keeps the selected paper on a film change.
+            self.params.io.scan_film = film.is_positive();
+            self.film_dev_times = film.data.development_time.clone();
+            self.hanatos_surface_available = has_hanatos_surface(&film);
+            self.params.film_render.halation.halation_strength = None;
+            self.params.film_render.halation.halation_first_sigma_um = None;
+            self.params.film_render.dir_couplers.gamma_samelayer_rgb = None;
+            self.params
+                .film_render
+                .dir_couplers
+                .gamma_interlayer_r_to_gb = None;
+            self.params
+                .film_render
+                .dir_couplers
+                .gamma_interlayer_g_to_rb = None;
+            self.params
+                .film_render
+                .dir_couplers
+                .gamma_interlayer_b_to_rg = None;
+        }
+        self.params.settings.apply_hanatos2025_adaptation_surface &= self.hanatos_surface_available;
+        self.request_render();
+    }
+
+    fn load_preset(&mut self, path: &Path) -> Result<()> {
+        self.apply_preset(GuiPreset::read(path)?)
+    }
+
+    fn restore_factory(&mut self) -> Result<()> {
+        let mut factory = GuiPreset {
+            film: pick_default_stock(&self.films, FACTORY_FILM),
+            paper: pick_default_stock(&self.papers, FACTORY_PAPER),
+            ..GuiPreset::default()
+        };
+        factory.params.io.scan_film =
+            profile::load_profile_by_name(&self.data_dir, &factory.film)?.is_positive();
+        self.preferences.clear_startup()?;
+        self.apply_preset(factory)
+    }
+
+    fn remember_dialog(&mut self, key: &str, path: &Path) {
+        if let Err(error) = self.preferences.remember_dialog(key, path) {
+            tracing::warn!(%error, "could not remember the dialog directory");
+        }
+    }
+
+    fn preset_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Presets", |ui| {
+            if ui.button("Load preset…").clicked() {
+                ui.close_menu();
+                if let Some(path) = self
+                    .preferences
+                    .dialog("load_preset")
+                    .add_filter("JSON", &["json"])
+                    .pick_file()
+                {
+                    self.remember_dialog("load_preset", &path);
+                    self.status = match self.load_preset(&path) {
+                        Ok(()) => format!("Loaded preset {}", path.display()),
+                        Err(error) => format!("Load preset error: {error:#}"),
+                    };
+                }
+            }
+            if ui.button("Save preset…").clicked() {
+                ui.close_menu();
+                if let Some(mut path) = self
+                    .preferences
+                    .dialog("save_preset")
+                    .add_filter("JSON", &["json"])
+                    .set_file_name("gui_state.json")
+                    .save_file()
+                {
+                    if path.extension().is_none() {
+                        path.set_extension("json");
+                    }
+                    self.remember_dialog("save_preset", &path);
+                    self.status = match self.current_preset().write(&path) {
+                        Ok(()) => format!("Saved preset {}", path.display()),
+                        Err(error) => format!("Save preset error: {error:#}"),
+                    };
+                }
+            }
+            ui.separator();
+            if ui.button("Save as startup default").clicked() {
+                ui.close_menu();
+                self.status = match self.preferences.save_startup(&self.current_preset()) {
+                    Ok(()) => "Saved GUI startup default.".into(),
+                    Err(error) => format!("Startup preset error: {error:#}"),
+                };
+            }
+            if ui.button("Restore factory defaults").clicked() {
+                ui.close_menu();
+                self.status = match self.restore_factory() {
+                    Ok(()) => "Restored factory defaults.".into(),
+                    Err(error) => format!("Restore defaults error: {error:#}"),
+                };
+            }
+        });
     }
 
     fn load_image_from_path(&mut self, path: &Path) {
@@ -876,7 +1075,9 @@ impl App {
             }
             None => "spektrafilm.png".into(),
         };
-        let Some(mut path) = rfd::FileDialog::new()
+        let Some(mut path) = self
+            .preferences
+            .dialog("save_output")
             .add_filter("Image", &["png", "tif", "tiff", "exr", "jpg", "jpeg"])
             .set_file_name(&default_name)
             .save_file()
@@ -887,6 +1088,7 @@ impl App {
         if path.extension().is_none() {
             path.set_extension("png");
         }
+        self.remember_dialog("save_output", &path);
         match self.save_to_path(&path) {
             Ok(()) => {
                 self.status = format!(
@@ -958,7 +1160,9 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("spektrafilm");
         let default_name = format!("{stem}_{}_spektra_f64.png", self.film_name);
-        let Some(mut out_path) = rfd::FileDialog::new()
+        let Some(mut out_path) = self
+            .preferences
+            .dialog("export_output")
             .add_filter("Image", &["png", "tif", "tiff", "exr", "jpg", "jpeg"])
             .set_file_name(&default_name)
             .save_file()
@@ -968,6 +1172,7 @@ impl App {
         if out_path.extension().is_none() {
             out_path.set_extension("png");
         }
+        self.remember_dialog("export_output", &out_path);
         self.start_f64_export(ctx, source, cli_path, out_path);
     }
 
@@ -1105,7 +1310,7 @@ impl App {
         // ── File ────────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             if ui.button("Open…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
+                if let Some(path) = self.preferences.dialog("open_input")
                     .add_filter(
                         "Image",
                         &[
@@ -1117,6 +1322,7 @@ impl App {
                     )
                     .pick_file()
                 {
+                    self.remember_dialog("open_input", &path);
                     self.load_image_from_path(&path);
                 }
             }
@@ -1151,6 +1357,7 @@ impl App {
                 }
             }
         });
+        self.preset_menu(ui);
         ui.horizontal(|ui| {
             let loaded = self.image.is_some();
             if ui
@@ -1217,32 +1424,7 @@ impl App {
                 let film_changed =
                     profile_combo(ui, "film", "Film stock", &self.films, &mut self.film_name);
                 if film_changed {
-                    self.film_dev_times = Vec::new();
-                    self.hanatos_surface_available = false;
-                    self.params.film_render.development_time = None;
-                    if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name)
-                    {
-                        // Slide/positive stocks have no print paper — they
-                        // are scanned directly. Negatives print onto their
-                        // paired `target_print`. Auto-follow the film type
-                        // so switching stocks doesn't leave a wrong (or, for
-                        // a paperless slide, a failed) render.
-                        self.params.io.scan_film = film.is_positive();
-                        self.film_dev_times = film.data.development_time.clone();
-                        self.hanatos_surface_available = has_hanatos_surface(&film);
-                        if let Some(target) = film.info.target_print.as_deref()
-                            && self.papers.iter().any(|p| p.stock == target)
-                            && self.print_name != target
-                        {
-                            self.print_name = target.to_string();
-                            self.print_dev_times =
-                                profile_dev_times(&self.data_dir, &self.print_name);
-                            self.params.print_render.development_time = None;
-                        }
-                    }
-                    self.params.settings.apply_hanatos2025_adaptation_surface &=
-                        self.hanatos_surface_available;
-                    self.request_render();
+                    self.refresh_film_selection();
                 }
                 // B&W stocks are profiled at several development times —
                 // pick one (longer = more contrast). Hidden for the

@@ -3832,6 +3832,7 @@ dependencies = [
  "raw-window-handle",
  "rayon",
  "rfd",
+ "serde",
  "serde_json",
  "spektrafilm-core",
  "spektrafilm-gpu",

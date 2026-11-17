@@ -1,7 +1,9 @@
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use spektrafilm_io::raw::{DevelopOptions, WhiteBalance};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum Balance {
     #[default]
     AsShot,
@@ -21,9 +23,12 @@ impl Balance {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub(super) struct RawDevelopSettings {
+    #[serde(rename = "white_balance")]
     balance: Balance,
+    #[serde(rename = "temperature")]
     kelvin: f64,
     tint: f64,
     lens_correction: bool,
