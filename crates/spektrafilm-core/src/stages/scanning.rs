@@ -381,15 +381,8 @@ pub(crate) fn apply_output_cctf(rgb: &mut ImageBuf, io: &crate::params::IoParams
 /// product of 4-decimal-rounded sRGB matrices isn't exactly the
 /// identity in f64.
 fn rgb_to_rgb_identity_matrix(name: &str) -> [[f64; 3]; 3] {
-    let xyz_to_rgb = output_colorspace_from_xyz_f64(name);
-    let rgb_to_xyz = match name {
-        "sRGB" => colorspace::SRGB_TO_XYZ_F64,
-        "ProPhoto RGB" => colorspace::PROPHOTO_TO_XYZ_F64,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::REC2020_TO_XYZ_F64,
-        "ACES2065-1" => colorspace::ACES_TO_XYZ_F64,
-        _ => colorspace::SRGB_TO_XYZ_F64,
-    };
-    colorspace::mat3_mul3_f64(&xyz_to_rgb, &rgb_to_xyz)
+    let space = colorspace::RgbSpace::from_name(name).unwrap_or(colorspace::RgbSpace::Srgb);
+    colorspace::mat3_mul3_f64(&space.from_xyz(), &space.to_xyz())
 }
 
 pub fn process(
@@ -414,14 +407,10 @@ pub fn select_illuminant_f64(name: &str) -> &'static [f64] {
     viewing_illuminant(name).samples_f64
 }
 
-fn output_colorspace_from_xyz_f64(name: &str) -> [[f64; 3]; 3] {
-    match name {
-        "sRGB" => colorspace::XYZ_TO_SRGB_F64,
-        "ProPhoto RGB" => colorspace::XYZ_TO_PROPHOTO_F64,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::XYZ_TO_REC2020_F64,
-        "ACES2065-1" => colorspace::XYZ_TO_ACES_F64,
-        _ => colorspace::XYZ_TO_SRGB_F64,
-    }
+pub(crate) fn output_colorspace_from_xyz_f64(name: &str) -> [[f64; 3]; 3] {
+    colorspace::RgbSpace::from_name(name)
+        .unwrap_or(colorspace::RgbSpace::Srgb)
+        .from_xyz()
 }
 
 #[cfg(test)]

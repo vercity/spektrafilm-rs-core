@@ -1,7 +1,7 @@
 //! Output gamut compression — port of upstream spektrafilm's
 //! `utils/gamut_compression.compress_rgb` (oklch / oklrab / cam16ucs / aces_rgc).
 //!
-//! The scan produces linear RGB in the output color space (sRGB). Colors
+//! The scan produces linear RGB in the chosen output color space. Colors
 //! outside the output cube would otherwise be hard-clipped to `[0, 1]` at
 //! encode. The `oklch` compressor instead reduces *perceptual chroma*
 //! smoothly: linear RGB → XYZ → OkLab → OkLch `(L, C, h)`, look up the
@@ -10,31 +10,15 @@
 //! lightness. A one-sided lightness compression first rolls super-bright
 //! highlights (`L > white`) back into range.
 //!
-//! Ported (sRGB output): `oklch`, `oklrab`, upstream's default `cam16ucs`
-//! (full CIECAM16), and `aces_rgc` (per-channel). `jzazbz` remains a follow-up.
-//! Gated behind
-//! `io.output_gamut_compress` (default off → no change).
+//! Supports `oklch`, `oklrab`, `cam16ucs` (default), and `aces_rgc` via
+//! `io.output_gamut_compress`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::params::OutputGamutCompressParams;
+use spektrafilm_math::colorspace::RgbSpace;
 
-// sRGB linear RGB ↔ XYZ (colour-science's rounded sRGB matrices, D65; no CAT
-// since the conversion uses the colourspace's own whitepoint).
-const SRGB_RGB_TO_XYZ: [[f64; 3]; 3] = [
-    [0.4124, 0.3576, 0.1805],
-    [0.2126, 0.7152, 0.0722],
-    [0.0193, 0.1192, 0.9505],
-];
-const SRGB_XYZ_TO_RGB: [[f64; 3]; 3] = [
-    [3.2406, -1.5372, -0.4986],
-    [-0.9689, 1.8758, 0.0415],
-    [0.0557, -0.204, 1.057],
-];
-// sRGB (D65) whitepoint as XYZ at Y=1, from the exact xy = (0.3127, 0.329)
-// — matches colour's `_xy_to_xyz_unit_y(whitepoint)`.
-const SRGB_WHITE_XYZ: [f64; 3] = [0.3127 / 0.329, 1.0, (1.0 - 0.3127 - 0.329) / 0.329];
+use crate::params::OutputGamutCompressParams;
 
 // OkLab (Ottosson) matrices, exactly as colour-science stores them.
 const M1_XYZ_TO_LMS: [[f64; 3]; 3] = [
@@ -133,7 +117,7 @@ fn h_grid(j: usize) -> f64 {
 }
 
 /// Perceptual space the chroma reduction runs in.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum Space {
     Oklch,
     /// OkLab with the Ottosson Lr-rebased lightness on the L axis.
@@ -142,24 +126,24 @@ enum Space {
 }
 
 impl Space {
-    /// linear sRGB → perceptual reconstruction coords `[L, a, b]`.
+    /// Linear output RGB → perceptual coordinates `[L, a, b]`.
     #[inline]
-    fn from_rgb(self, rgb: [f64; 3]) -> [f64; 3] {
-        let xyz = mat_vec(&SRGB_RGB_TO_XYZ, rgb);
+    fn rgb_to_lab(self, rgb: [f64; 3], target: RgbSpace, view: Cam16White) -> [f64; 3] {
+        let xyz = mat_vec(&target.to_xyz(), rgb);
         match self {
             // oklrab shares OkLab coords; only the C_max lookup index differs.
             Space::Oklch | Space::Oklrab => xyz_to_oklab(xyz),
-            Space::Cam16ucs => xyz_to_cam16ucs(xyz),
+            Space::Cam16ucs => xyz_to_cam16ucs(xyz, view),
         }
     }
-    /// perceptual reconstruction coords `[L, a, b]` → linear sRGB.
+    /// Perceptual coordinates `[L, a, b]` → linear output RGB.
     #[inline]
-    fn to_rgb(self, lab: [f64; 3]) -> [f64; 3] {
+    fn lab_to_rgb(self, lab: [f64; 3], target: RgbSpace, view: Cam16White) -> [f64; 3] {
         let xyz = match self {
             Space::Oklch | Space::Oklrab => oklab_to_xyz(lab),
-            Space::Cam16ucs => cam16ucs_to_xyz(lab),
+            Space::Cam16ucs => cam16ucs_to_xyz(lab, view),
         };
-        mat_vec(&SRGB_XYZ_TO_RGB, xyz)
+        mat_vec(&target.from_xyz(), xyz)
     }
     /// Reconstruction lightness `L` → C_max-table lookup index. Identity except
     /// oklrab, which indexes the table by Ottosson's rebased `Lr`.
@@ -179,9 +163,7 @@ impl Space {
         }
     }
     /// `(l_min, l_max, chroma_upper)` — the C_max table's lightness-axis
-    /// bounds and the bisection's chroma ceiling, fixed per space for the
-    /// sRGB output cube. Owned by `Space` so the table cache can key by
-    /// space alone.
+    /// bounds and the bisection's chroma ceiling in this perceptual space.
     fn table_geometry(self) -> (f64, f64, f64) {
         match self {
             Space::Oklch | Space::Oklrab => (0.02, 1.0, 0.5),
@@ -204,6 +186,8 @@ enum Kind {
 #[derive(Clone)]
 pub struct OutputGamutCompress {
     kind: Kind,
+    target: RgbSpace,
+    cam16_white: Cam16White,
     knee: (f64, f64, f64),
     lightness: Option<(f64, f64, f64)>,
     /// Perceptual lightness of the output white (1.0 for OkLab, ~100 for CAM16-UCS).
@@ -224,6 +208,8 @@ impl OutputGamutCompress {
     pub fn identity() -> Self {
         Self {
             kind: Kind::Off,
+            target: RgbSpace::Srgb,
+            cam16_white: Cam16White::D65,
             knee: (0.0, 1.0, 1.0),
             lightness: None,
             l_white: 1.0,
@@ -237,12 +223,7 @@ impl OutputGamutCompress {
         self.kind != Kind::Off
     }
 
-    /// Build from params for the given output color space. `off` is a silent
-    /// identity; `oklch`/`cam16ucs` (sRGB only) build their `C_max` table. An
-    /// unported-but-valid algorithm (`jzazbz`/`oklrab`/`aces_rgc`), an unknown
-    /// algorithm, or a non-sRGB output all log an error and fall back to
-    /// identity (so colors pass through uncompressed rather than silently
-    /// appearing to be handled).
+    /// Build the perceptual boundary for the requested linear output RGB cube.
     pub fn build(params: &OutputGamutCompressParams, output_color_space: &str) -> Self {
         let knee = (
             params.knee[0] as f64,
@@ -256,6 +237,8 @@ impl OutputGamutCompress {
         if params.algorithm == "aces_rgc" {
             return Self {
                 kind: Kind::AcesRgc,
+                target: RgbSpace::Srgb,
+                cam16_white: Cam16White::D65,
                 knee,
                 lightness: None,
                 l_white: 1.0,
@@ -266,17 +249,9 @@ impl OutputGamutCompress {
         }
         let space = match params.algorithm.as_str() {
             "off" => return Self::identity(),
-            "oklch" if output_color_space == "sRGB" => Space::Oklch,
-            "oklrab" if output_color_space == "sRGB" => Space::Oklrab,
-            "cam16ucs" if output_color_space == "sRGB" => Space::Cam16ucs,
-            algo @ ("oklch" | "oklrab" | "cam16ucs") => {
-                tracing::error!(
-                    algorithm = algo,
-                    output = output_color_space,
-                    "output gamut compression: only sRGB output is supported; disabling"
-                );
-                return Self::identity();
-            }
+            "oklch" => Space::Oklch,
+            "oklrab" => Space::Oklrab,
+            "cam16ucs" => Space::Cam16ucs,
             other @ "jzazbz" => {
                 tracing::error!(
                     algorithm = other,
@@ -292,19 +267,24 @@ impl OutputGamutCompress {
                 return Self::identity();
             }
         };
-        // Perceptual white: OkLab white sits at L=1; CAM16-UCS Jp at the output
-        // white (~100 under the configured viewing conditions). The white is
-        // the exact D65 chromaticity (matching Python's `_output_cs_whitepoint_xyz`
-        // → `_xy_to_xyz_unit_y`), NOT the rounded sRGB matrix's column sums.
+        let Some(target) = RgbSpace::from_name(output_color_space) else {
+            tracing::error!(
+                output = output_color_space,
+                "unknown output space for gamut compression"
+            );
+            return Self::identity();
+        };
+        let cam16_white = Cam16White::new(target);
         let l_white = match space {
-            // OkLab white sits at L=1, and Lr(1)=1, so both are 1.0.
             Space::Oklch | Space::Oklrab => 1.0,
-            Space::Cam16ucs => xyz_to_cam16ucs(SRGB_WHITE_XYZ)[0],
+            Space::Cam16ucs => xyz_to_cam16ucs(target.white_xyz(), cam16_white)[0],
         };
         let (l_min, l_max, _) = space.table_geometry();
-        let cmax = cmax_table_cached(space);
+        let cmax = cmax_table_cached(space, target, cam16_white);
         Self {
             kind: Kind::Perceptual(space),
+            target,
+            cam16_white,
             knee,
             lightness,
             l_white,
@@ -314,11 +294,19 @@ impl OutputGamutCompress {
         }
     }
 
+    /// Shaders currently implement the perceptual transforms for sRGB.
+    pub(crate) fn requires_staged_rendering(&self) -> bool {
+        matches!(self.kind, Kind::Perceptual(_)) && self.target != RgbSpace::Srgb
+    }
+
     /// GPU-pass inputs for the active compressor (mode id matching
     /// `gamut_compress.wgsl`, knee/lightness coefficients, table geometry
     /// and the baked `C_max` table). `None` when the compressor is off —
     /// callers skip the pass entirely.
     pub fn gpu_params(&self) -> Option<spektrafilm_gpu::GamutGpuParams<'_>> {
+        if self.requires_staged_rendering() {
+            return None;
+        }
         let mode = match self.kind {
             Kind::Off => return None,
             Kind::AcesRgc => 0,
@@ -376,7 +364,7 @@ impl OutputGamutCompress {
             Kind::AcesRgc => return self.compress_aces_rgc(rgb),
             Kind::Perceptual(s) => s,
         };
-        let lab = space.from_rgb(rgb);
+        let lab = space.rgb_to_lab(rgb, self.target, self.cam16_white);
         // One-sided lightness compression first (so C_max is looked up at the
         // corrected L), normalized by the perceptual white.
         let mut l = lab[0];
@@ -393,7 +381,11 @@ impl OutputGamutCompress {
         let safe = c_max.max(1e-9);
         let d_comp = reinhard_knee(c / safe, self.knee.0, self.knee.1, self.knee.2);
         let c_new = d_comp * safe;
-        space.to_rgb([l, c_new * h.cos(), c_new * h.sin()])
+        space.lab_to_rgb(
+            [l, c_new * h.cos(), c_new * h.sin()],
+            self.target,
+            self.cam16_white,
+        )
     }
 
     /// ACES Reference Gamut Compression v1.3: per-channel Reinhard knee on the
@@ -417,9 +409,8 @@ impl OutputGamutCompress {
 // ─────────────────────────────────────────────────────────────────────────
 // CAM16-UCS (upstream's default `cam16ucs` method).
 //
-// Fixed viewing conditions: XYZ_w = output (sRGB/D65) white, L_A = 64 cd/m²,
-// Y_b = 20, Average surround. Every viewing-condition-dependent quantity is
-// therefore constant and precomputed (extracted from colour-science). The
+// Viewing conditions: output white, L_A = 64 cd/m², Y_b = 20, average
+// surround. The white-dependent terms are computed once. The
 // per-pixel path is the CIECAM16 forward/inverse + the Luo 2006 UCS transform.
 // XYZ here is at Y=1; CIECAM16 works in the Y=100 domain, hence the ×/÷100.
 // ─────────────────────────────────────────────────────────────────────────
@@ -441,18 +432,44 @@ const CAM16_M16I: [[f64; 3]; 3] = [
         1.0499644368778496,
     ],
 ];
-const CAM16_D_RGB: [f64; 3] = [1.0228770275436545, 0.9852074782801457, 0.9285450586783286];
 const CAM16_F_L: f64 = 0.6839903845696502;
 const CAM16_N: f64 = 0.2;
 const CAM16_N_BB: f64 = 1.0003040045593807;
 const CAM16_N_CB: f64 = 1.0003040045593807;
 const CAM16_Z: f64 = 1.9272135954999579;
-const CAM16_A_W: f64 = 37.16907530221132;
 const CAM16_C: f64 = 0.69;
 const CAM16_N_C: f64 = 1.0;
 // Luo 2006 CAM16-UCS coefficients (K_L=1.0, c1, c2).
 const UCS_C1: f64 = 0.007;
 const UCS_C2: f64 = 0.0228;
+
+#[derive(Clone, Copy)]
+struct Cam16White {
+    adaptation: [f64; 3],
+    response: f64,
+}
+
+impl Cam16White {
+    const D65: Self = Self {
+        adaptation: [1.0228770275436545, 0.9852074782801457, 0.9285450586783286],
+        response: 37.16907530221132,
+    };
+
+    fn new(target: RgbSpace) -> Self {
+        if target.white_xy() == RgbSpace::Srgb.white_xy() {
+            return Self::D65;
+        }
+        let rgb = mat_vec(&CAM16_M16, target.white_xyz().map(|v| v * 100.0));
+        let degree = 1.0 - (-106.0_f64 / 92.0).exp() / 3.6;
+        let adaptation = rgb.map(|v| degree * (100.0 / v) + 1.0 - degree);
+        let [r, g, b] = cam16_padc_forward(std::array::from_fn(|i| rgb[i] * adaptation[i]));
+        let response = (2.0 * r + g + b / 20.0 - 0.305) * CAM16_N_BB;
+        Self {
+            adaptation,
+            response,
+        }
+    }
+}
 
 #[inline]
 fn atan2_deg(y: f64, x: f64) -> f64 {
@@ -481,13 +498,13 @@ fn cam16_padc_inverse(rgb: [f64; 3]) -> [f64; 3] {
 }
 
 /// XYZ (Y=1) → CAM16-UCS `(Jp, ap, bp)`.
-fn xyz_to_cam16ucs(xyz: [f64; 3]) -> [f64; 3] {
+fn xyz_to_cam16ucs(xyz: [f64; 3], white: Cam16White) -> [f64; 3] {
     let xyz100 = [xyz[0] * 100.0, xyz[1] * 100.0, xyz[2] * 100.0];
     let rgb = mat_vec(&CAM16_M16, xyz100);
     let rgb_c = [
-        rgb[0] * CAM16_D_RGB[0],
-        rgb[1] * CAM16_D_RGB[1],
-        rgb[2] * CAM16_D_RGB[2],
+        rgb[0] * white.adaptation[0],
+        rgb[1] * white.adaptation[1],
+        rgb[2] * white.adaptation[2],
     ];
     let [ra, ga, ba] = cam16_padc_forward(rgb_c);
     let a = ra - 12.0 * ga / 11.0 + ba / 11.0;
@@ -495,7 +512,7 @@ fn xyz_to_cam16ucs(xyz: [f64; 3]) -> [f64; 3] {
     let h = atan2_deg(b, a);
     let e_t = 0.25 * ((2.0 + h * std::f64::consts::PI / 180.0).cos() + 3.8);
     let a_resp = (2.0 * ra + ga + ba / 20.0 - 0.305) * CAM16_N_BB;
-    let jj = 100.0 * (a_resp / CAM16_A_W).powf(CAM16_C * CAM16_Z);
+    let jj = 100.0 * (a_resp / white.response).powf(CAM16_C * CAM16_Z);
     let denom = ra + ga + 21.0 * ba / 20.0;
     let t = if denom != 0.0 {
         (50000.0 / 13.0) * CAM16_N_C * CAM16_N_CB * (e_t * (a * a + b * b).sqrt()) / denom
@@ -511,7 +528,7 @@ fn xyz_to_cam16ucs(xyz: [f64; 3]) -> [f64; 3] {
 }
 
 /// CAM16-UCS `(Jp, ap, bp)` → XYZ (Y=1).
-fn cam16ucs_to_xyz(jab: [f64; 3]) -> [f64; 3] {
+fn cam16ucs_to_xyz(jab: [f64; 3], white: Cam16White) -> [f64; 3] {
     let [jp, ap, bp] = jab;
     let mp = (ap * ap + bp * bp).sqrt();
     let h = atan2_deg(bp, ap);
@@ -522,7 +539,7 @@ fn cam16ucs_to_xyz(jab: [f64; 3]) -> [f64; 3] {
     let t = (cc / ((j_prime / 100.0).sqrt() * (1.64 - 0.29f64.powf(CAM16_N)).powf(0.73)))
         .powf(1.0 / 0.9);
     let e_t = 0.25 * ((2.0 + h * std::f64::consts::PI / 180.0).cos() + 3.8);
-    let a_resp = CAM16_A_W * (jj / 100.0).powf(1.0 / (CAM16_C * CAM16_Z));
+    let a_resp = white.response * (jj / 100.0).powf(1.0 / (CAM16_C * CAM16_Z));
     let p1 = if t != 0.0 {
         (50000.0 / 13.0) * CAM16_N_C * CAM16_N_CB * e_t / t
     } else {
@@ -542,9 +559,9 @@ fn cam16ucs_to_xyz(jab: [f64; 3]) -> [f64; 3] {
     let ba = (460.0 * p2 - 220.0 * a - 6300.0 * b) / 1403.0;
     let rgb_c = cam16_padc_inverse([ra, ga, ba]);
     let rgb = [
-        rgb_c[0] / CAM16_D_RGB[0],
-        rgb_c[1] / CAM16_D_RGB[1],
-        rgb_c[2] / CAM16_D_RGB[2],
+        rgb_c[0] / white.adaptation[0],
+        rgb_c[1] / white.adaptation[1],
+        rgb_c[2] / white.adaptation[2],
     ];
     let xyz100 = mat_vec(&CAM16_M16I, rgb);
     [xyz100[0] / 100.0, xyz100[1] / 100.0, xyz100[2] / 100.0]
@@ -571,22 +588,16 @@ fn cam16_opponent_inverse(p1: f64, p2: f64, p3: f64, h: f64) -> (f64, f64) {
     }
 }
 
-/// Process-wide `C_max` table cache, keyed by perceptual space. The bake's
-/// other inputs come from `Space::table_geometry`, so the space alone
-/// identifies the table. The build runs outside the lock — a racing
-/// double-build is harmless and cheaper than serializing on it.
-fn cmax_table_cached(space: Space) -> Arc<Vec<f64>> {
-    static CACHE: OnceLock<Mutex<HashMap<u8, Arc<Vec<f64>>>>> = OnceLock::new();
-    let key = match space {
-        Space::Oklch => 0u8,
-        Space::Oklrab => 1,
-        Space::Cam16ucs => 2,
-    };
+/// Cache baked boundaries by perceptual space and output RGB primaries.
+fn cmax_table_cached(space: Space, target: RgbSpace, view: Cam16White) -> Arc<Vec<f64>> {
+    type Tables = HashMap<(Space, RgbSpace), Arc<Vec<f64>>>;
+    static CACHE: OnceLock<Mutex<Tables>> = OnceLock::new();
+    let key = (space, target);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(table) = cache.lock().unwrap().get(&key) {
         return table.clone();
     }
-    let table = Arc::new(build_cmax_table(space));
+    let table = Arc::new(build_cmax_table(space, target, view));
     cache.lock().unwrap().insert(key, table.clone());
     table
 }
@@ -594,7 +605,7 @@ fn cmax_table_cached(space: Space) -> Arc<Vec<f64>> {
 /// Bisect the max in-gamut chroma at each `(L, h)` grid node for the given
 /// perceptual space, mirroring `_build_polar_perceptual_c_max_table`. Built
 /// once per space (see `cmax_table_cached`).
-fn build_cmax_table(space: Space) -> Vec<f64> {
+fn build_cmax_table(space: Space, target: RgbSpace, view: Cam16White) -> Vec<f64> {
     use rayon::prelude::*;
     let (l_min, l_max, chroma_upper) = space.table_geometry();
     let mut table = vec![0.0f64; N_L * N_H];
@@ -613,7 +624,7 @@ fn build_cmax_table(space: Space) -> Vec<f64> {
                 let mut hi = chroma_upper;
                 for _ in 0..N_BISECT {
                     let mid = (lo + hi) * 0.5;
-                    let rgb = space.to_rgb([l, mid * cos_h, mid * sin_h]);
+                    let rgb = space.lab_to_rgb([l, mid * cos_h, mid * sin_h], target, view);
                     let in_gamut = rgb.iter().all(|&v| v >= -1e-6 && v <= 1.0 + 1e-6);
                     if in_gamut {
                         lo = mid;
@@ -717,6 +728,28 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    #[test]
+    fn cam16ucs_uses_the_destination_primaries_and_white() {
+        let params = OutputGamutCompressParams::default();
+        for (target, expected) in [
+            (
+                "ITU-R BT.2020",
+                [0.999_107_053, 0.486_623_383, 0.528_226_888],
+            ),
+            (
+                "ProPhoto RGB",
+                [0.998_866_418, 0.503_254_590, 0.555_874_980],
+            ),
+        ] {
+            let comp = OutputGamutCompress::build(&params, target);
+            let rgb = comp.compress([2.0, 0.1, 0.3]);
+            for (actual, expected) in rgb.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6, "{target}: {rgb:?}");
+            }
+            assert!(comp.requires_staged_rendering());
+        }
     }
 
     /// Regression guard: oklrab reference rows from `compress_rgb_oklrab_chroma`.

@@ -615,15 +615,24 @@ impl Default for IoParams {
 /// `algorithm = "off"` passes input chromaticities through unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputGamutCompressParams {
+    #[serde(default = "default_true")]
+    pub active: bool,
     #[serde(default = "default_xy")]
     pub algorithm: String,
     #[serde(default = "default_gamut_knee")]
     pub knee: [f32; 3],
 }
 
+impl InputGamutCompressParams {
+    pub(crate) fn effective_algorithm(&self) -> &str {
+        if self.active { &self.algorithm } else { "off" }
+    }
+}
+
 impl Default for InputGamutCompressParams {
     fn default() -> Self {
         Self {
+            active: true,
             algorithm: "xy".into(),
             knee: [0.0, 1.0, 6.0],
         }

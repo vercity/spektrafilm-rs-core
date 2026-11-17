@@ -175,7 +175,7 @@ fn write_raster_inner(
     }
 
     // Build metadata before creating the destination.
-    let icc = color.map(color::make_icc).transpose()?;
+    let icc = color.map(color::make_icc).transpose()?.flatten();
     let empty = RasterMetadata::default();
     let metadata = options.source_metadata.unwrap_or(&empty);
     let file = BufWriter::new(File::create(path)?);
@@ -371,6 +371,34 @@ mod tests {
             let decoded = decoded?;
             assert_eq!(decoded.image.data, data);
             assert_eq!(decoded.color, RasterColor::new("ACES2065-1", false));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vgamut_tiff_and_vlog_exr_keep_their_transfer_metadata() -> Result<()> {
+        let data = [-0.125, 1.25, 0.5].map(from_f64);
+        let image = ImageBuf::from_data(1, 1, data.to_vec());
+        for (extension, cctf_encoding) in [("tiff", false), ("exr", true)] {
+            let path = std::env::temp_dir().join(format!(
+                "spektrafilm-vgamut-{}.{extension}",
+                std::process::id()
+            ));
+            write_raster(
+                &path,
+                &image,
+                &RasterWriteOptions {
+                    bit_depth: Some(32),
+                    color_space: Some("V-Gamut"),
+                    cctf_encoding,
+                    ..RasterWriteOptions::default()
+                },
+            )?;
+            let decoded = read_raster(&path);
+            std::fs::remove_file(path)?;
+            let decoded = decoded?;
+            assert_eq!(decoded.image.data, data);
+            assert_eq!(decoded.color, RasterColor::new("V-Gamut", cctf_encoding));
         }
         Ok(())
     }

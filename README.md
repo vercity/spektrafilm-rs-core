@@ -99,7 +99,9 @@ Use `--raw-lens-correction` to apply matching lens calibration on RAW inputs.
 
 A calibrated SDR cube uses the same spectral pipeline as CPU photo processing.
 The domain is `[0, 1]` on each channel. The default input is linear ProPhoto RGB,
-or use `--input-encoding srgb` for sRGB-encoded input. The output is SDR sRGB.
+or use `--input-encoding srgb` for sRGB-encoded input and `--input-encoding vlog`
+for Panasonic V-Gamut/V-Log input with about eight stops above 18% gray.
+The output is SDR sRGB.
 The cube retains pointwise DIR and disables automatic exposure, optical blur,
 grain, and other effects that depend on neighboring pixels or the full frame.
 
@@ -111,6 +113,9 @@ grain, and other effects that depend on neighboring pixels or the full frame.
 `process --params` controls the color space and decoding for untagged TIFFs.
 Recognized file tags supply the input color space and transfer function.
 Untagged PNG and JPEG use encoded sRGB. Untagged EXR uses linear sRGB.
+For untagged V-Log TIFFs, set `io.input_color_space` to `"V-Gamut"` and
+`io.input_cctf_decoding` to `true`. Linear V-Gamut TIFFs carry ICC metadata.
+V-Log EXR files written by spektrafilm preserve their transfer metadata.
 The `--raw-out` buffer and floating-point image formats retain signed values
 and highlights above 1. Integer image files clip to their representable range.
 

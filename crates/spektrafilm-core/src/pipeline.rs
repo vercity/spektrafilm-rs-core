@@ -234,30 +234,43 @@ impl Pipeline {
             match params.settings.rgb_to_raw_method.as_str() {
                 "hanatos2025" => {
                     let spectra_lut = spectral_service::load_spectra_lut(data_dir)?;
-                    let window_params: Vec<f64> =
-                        film.data.hanatos2025_adaptation_window_params.clone();
-                    let tc_lut = if params.settings.apply_hanatos2025_adaptation_window
+                    let window_params = &film.data.hanatos2025_adaptation_window_params;
+                    let blur_sigma = f64::from(params.settings.spectral_gaussian_blur);
+                    let mut tc_lut = if params.settings.apply_hanatos2025_adaptation_window
                         && window_params.len() >= 4
                     {
-                        spectral_service::compute_tc_lut_with_window(
+                        spectral_service::windowed_tc_lut(
                             &spectra_lut,
                             &sensitivity,
-                            &window_params,
+                            window_params,
                             ref_illuminant_f64,
+                            blur_sigma,
                         )
+                    } else if blur_sigma > 0.0 {
+                        let mut blurred = sensitivity.clone();
+                        spectral_service::blur_spectral_sensitivity(&mut blurred, blur_sigma);
+                        spectral_service::compute_tc_lut(&spectra_lut, &blurred)
                     } else {
                         spectral_service::compute_tc_lut(&spectra_lut, &sensitivity)
                     };
+                    let white_xy = spektrafilm_math::spectral::illuminant_to_xy(ref_illuminant);
+                    if params.settings.apply_hanatos2025_adaptation_surface {
+                        spectral_service::apply_exposure_surface(
+                            &mut tc_lut,
+                            &film.data.hanatos2025_adaptation_surface_params,
+                            white_xy,
+                        )?;
+                    }
 
                     // Bake input gamut compression into the LUT at build time, around
                     // the film reference illuminant (the runtime's achromatic axis).
                     // The per-pixel path then stays compression-agnostic.
                     let input_gamut = crate::input_gamut::InputGamutCompress::build(
-                        &params.io.input_gamut_compress.algorithm,
+                        params.io.input_gamut_compress.effective_algorithm(),
                         params.io.input_gamut_compress.knee,
                     )?;
                     let tc_lut = if input_gamut.is_active() {
-                        let (rx, ry) = spektrafilm_math::spectral::illuminant_to_xy(ref_illuminant);
+                        let (rx, ry) = white_xy;
                         input_gamut.remap(&tc_lut, [rx, ry])
                     } else {
                         tc_lut
@@ -273,7 +286,7 @@ impl Pipeline {
                         ref_illuminant_f64,
                     );
                     let input_gamut = crate::input_gamut::InputGamutCompress::build(
-                        &params.io.input_gamut_compress.algorithm,
+                        params.io.input_gamut_compress.effective_algorithm(),
                         params.io.input_gamut_compress.knee,
                     )?;
                     let tc_lut = if input_gamut.is_active() {
@@ -592,6 +605,7 @@ impl Pipeline {
         // rendering handles the internal print and scan LUTs.
         if !backend.is_gpu()
             || (self.tc_lut.is_none() && self.mallett_core.is_none())
+            || self.output_gamut.requires_staged_rendering()
             || self.params.settings.use_scanner_lut
             || (!self.params.io.scan_film && self.params.settings.use_enlarger_lut)
         {
@@ -870,15 +884,8 @@ impl Pipeline {
             viewing_white,
             output_white,
         );
-        let base_xyz_to_rgb = match self.params.io.output_color_space.as_str() {
-            "sRGB" => spektrafilm_math::colorspace::XYZ_TO_SRGB_F64,
-            "ProPhoto RGB" => spektrafilm_math::colorspace::XYZ_TO_PROPHOTO_F64,
-            "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => {
-                spektrafilm_math::colorspace::XYZ_TO_REC2020_F64
-            }
-            "ACES2065-1" => spektrafilm_math::colorspace::XYZ_TO_ACES_F64,
-            _ => spektrafilm_math::colorspace::XYZ_TO_SRGB_F64,
-        };
+        let base_xyz_to_rgb =
+            stages::scanning::output_colorspace_from_xyz_f64(&self.params.io.output_color_space);
         let mut scan_xyz_to_rgb = [[0.0f64; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {

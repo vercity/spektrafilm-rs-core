@@ -163,13 +163,17 @@ impl RawOptions {
 enum LutInputEncoding {
     LinearProphoto,
     Srgb,
+    #[value(name = "vlog", alias = "v-log")]
+    VLog,
 }
 
 impl LutInputEncoding {
-    fn color_space(self) -> &'static str {
+    fn color_space(self) -> spektrafilm_math::colorspace::RgbSpace {
+        use spektrafilm_math::colorspace::RgbSpace;
         match self {
-            Self::LinearProphoto => "ProPhoto RGB",
-            Self::Srgb => "sRGB",
+            Self::LinearProphoto => RgbSpace::ProPhoto,
+            Self::Srgb => RgbSpace::Srgb,
+            Self::VLog => RgbSpace::VGamut,
         }
     }
 }
@@ -458,13 +462,14 @@ fn cmd_export_lut(
     let transfer = match input_encoding {
         LutInputEncoding::LinearProphoto => "linear",
         LutInputEncoding::Srgb => "sRGB",
+        LutInputEncoding::VLog => "V-Log",
     };
     let mut cube_data = String::new();
     writeln!(&mut cube_data, "# Created by spektrafilm-rs")?;
     writeln!(
         &mut cube_data,
         "# Input {} ({transfer}) -> output sRGB SDR",
-        input_encoding.color_space()
+        input_encoding.color_space().name()
     )?;
     writeln!(
         &mut cube_data,
@@ -486,8 +491,10 @@ fn cmd_export_lut(
 
 fn lut_runtime_params(input_encoding: LutInputEncoding) -> RuntimeParams {
     let mut params = RuntimeParams::default();
-    params.io.input_color_space = input_encoding.color_space().into();
-    params.io.input_cctf_decoding = matches!(input_encoding, LutInputEncoding::Srgb);
+    params.io.input_color_space = input_encoding.color_space().name().into();
+    // Sample the native code domain. V-Log's code 1.0 has eight stops
+    // of headroom above 18% gray, giving unit gain with the upstream auto setting.
+    params.io.input_cctf_decoding = !matches!(input_encoding, LutInputEncoding::LinearProphoto);
 
     // Match Python's per-pixel LUT mode. Optical, stochastic and image-wise
     // operations are disabled, while pointwise DIR stays enabled.

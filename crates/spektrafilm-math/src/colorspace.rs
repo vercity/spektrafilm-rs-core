@@ -2,7 +2,6 @@
 ///
 /// All matrices are row-major: output[i] = dot(matrix[i], input).
 /// Source: IEC 61966-2-1 (sRGB), ICC profiles, CIE standards.
-
 use crate::precision::{Scalar, from_f64, srgb_decode, srgb_encode};
 
 /// Component transfer functions for the RGB spaces supported by the pipeline.
@@ -11,18 +10,13 @@ pub enum Cctf {
     Srgb,
     ProPhoto,
     Bt2020,
+    VLog,
     Linear,
 }
 
 impl Cctf {
     pub fn for_rgb_space(name: &str) -> Option<Self> {
-        match name {
-            "sRGB" => Some(Self::Srgb),
-            "ProPhoto RGB" => Some(Self::ProPhoto),
-            "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => Some(Self::Bt2020),
-            "ACES2065-1" => Some(Self::Linear),
-            _ => None,
-        }
+        RgbSpace::from_name(name).map(RgbSpace::transfer)
     }
 
     pub fn encode(self, x: Scalar) -> Scalar {
@@ -33,6 +27,8 @@ impl Cctf {
             Self::ProPhoto => x.powf(from_f64(1.0 / 1.8)),
             Self::Bt2020 if x < from_f64(0.018) => x * from_f64(4.5),
             Self::Bt2020 => from_f64(1.099) * x.powf(from_f64(0.45)) - from_f64(0.099),
+            Self::VLog if x < from_f64(0.01) => from_f64(5.6) * x + from_f64(0.125),
+            Self::VLog => from_f64(0.241514) * (x + from_f64(0.00873)).log10() + from_f64(0.598206),
             Self::Linear => x,
         }
     }
@@ -44,7 +40,116 @@ impl Cctf {
             Self::ProPhoto => x.powf(from_f64(1.8)),
             Self::Bt2020 if x < from_f64(0.08124794403514046) => x / from_f64(4.5),
             Self::Bt2020 => ((x + from_f64(0.099)) / from_f64(1.099)).powf(from_f64(1.0 / 0.45)),
+            Self::VLog if x < from_f64(0.181) => (x - from_f64(0.125)) / from_f64(5.6),
+            Self::VLog => {
+                from_f64(10.0).powf((x - from_f64(0.598206)) / from_f64(0.241514))
+                    - from_f64(0.00873)
+            }
             Self::Linear => x,
+        }
+    }
+}
+
+/// RGB primaries, reference white and their conventional transfer function.
+/// Buffers in any space can also carry linear samples.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RgbSpace {
+    Srgb,
+    ProPhoto,
+    Rec2020,
+    Aces2065,
+    VGamut,
+}
+
+impl RgbSpace {
+    pub const ALL: [Self; 5] = [
+        Self::Srgb,
+        Self::ProPhoto,
+        Self::Rec2020,
+        Self::Aces2065,
+        Self::VGamut,
+    ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "sRGB" => Self::Srgb,
+            "ProPhoto RGB" => Self::ProPhoto,
+            "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => Self::Rec2020,
+            "ACES2065-1" => Self::Aces2065,
+            "V-Gamut" | "Panasonic V-Log" | "V-Log" | "vlog" => Self::VGamut,
+            _ => return None,
+        })
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Srgb => "sRGB",
+            Self::ProPhoto => "ProPhoto RGB",
+            Self::Rec2020 => "ITU-R BT.2020",
+            Self::Aces2065 => "ACES2065-1",
+            Self::VGamut => "V-Gamut",
+        }
+    }
+
+    pub const fn transfer(self) -> Cctf {
+        match self {
+            Self::Srgb => Cctf::Srgb,
+            Self::ProPhoto => Cctf::ProPhoto,
+            Self::Rec2020 => Cctf::Bt2020,
+            Self::Aces2065 => Cctf::Linear,
+            Self::VGamut => Cctf::VLog,
+        }
+    }
+
+    pub const fn primaries(self) -> [[f64; 2]; 3] {
+        match self {
+            Self::Srgb => [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+            Self::ProPhoto => [[0.7347, 0.2653], [0.1596, 0.8404], [0.0366, 0.0001]],
+            Self::Rec2020 => [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]],
+            Self::Aces2065 => [[0.7347, 0.2653], [0.0, 1.0], [0.0001, -0.077]],
+            Self::VGamut => [[0.73, 0.28], [0.165, 0.84], [0.10, -0.03]],
+        }
+    }
+
+    pub const fn white_xy(self) -> [f64; 2] {
+        match self {
+            Self::ProPhoto => [0.3457, 0.3585],
+            Self::Aces2065 => [0.32168, 0.33767],
+            _ => [0.3127, 0.329],
+        }
+    }
+
+    pub fn white_xyz(self) -> [f64; 3] {
+        let [x, y] = self.white_xy();
+        xy_to_xyz_f64(x, y)
+    }
+
+    pub const fn to_xyz(self) -> [[f64; 3]; 3] {
+        match self {
+            Self::Srgb => SRGB_TO_XYZ_F64,
+            Self::ProPhoto => PROPHOTO_TO_XYZ_F64,
+            Self::Rec2020 => REC2020_TO_XYZ_F64,
+            Self::Aces2065 => ACES_TO_XYZ_F64,
+            // Panasonic V-Gamut reference coefficients used by colour-science.
+            Self::VGamut => [
+                [0.679644, 0.152211, 0.118600],
+                [0.260686, 0.774894, -0.035580],
+                [-0.009310, -0.004612, 1.102980],
+            ],
+        }
+    }
+
+    pub const fn from_xyz(self) -> [[f64; 3]; 3] {
+        match self {
+            Self::Srgb => XYZ_TO_SRGB_F64,
+            Self::ProPhoto => XYZ_TO_PROPHOTO_F64,
+            Self::Rec2020 => XYZ_TO_REC2020_F64,
+            Self::Aces2065 => XYZ_TO_ACES_F64,
+            Self::VGamut => [
+                [1.589012, -0.313204, -0.180965],
+                [-0.534053, 1.396011, 0.102458],
+                [0.011179, 0.003194, 0.905535],
+            ],
         }
     }
 }
@@ -472,6 +577,21 @@ mod tests {
                 "roundtrip failed for {v}: encoded={encoded}, decoded={decoded}"
             );
         }
+    }
+
+    #[test]
+    fn vlog_matches_panasonic_code_values() {
+        let transfer = RgbSpace::VGamut.transfer();
+        for (linear, code) in [
+            (-0.01, 0.069),
+            (0.0, 0.125),
+            (0.18, 0.423_311_448_760_136),
+            (1.0, 0.599_117_700_158_145_9),
+        ] {
+            assert!((transfer.encode(from_f64(linear)) - from_f64(code)).abs() < from_f64(1e-6));
+            assert!((transfer.decode(from_f64(code)) - from_f64(linear)).abs() < from_f64(1e-6));
+        }
+        assert!(transfer.decode(from_f64(1.0)) > from_f64(46.0));
     }
 
     #[test]

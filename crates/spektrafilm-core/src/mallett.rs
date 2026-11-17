@@ -516,11 +516,13 @@ const M_CS_ACES2065_1: [[f64; 3]; 3] = [
 /// Input colour space → linear sRGB (colour's `RGB_to_RGB` with CAT02). The
 /// space names and the ProPhoto default mirror `colorspace_to_xyz_f64`.
 pub fn input_cs_to_srgb(color_space: &str) -> [[f64; 3]; 3] {
-    match color_space {
-        "sRGB" => M_CS_SRGB,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => M_CS_REC2020,
-        "ACES2065-1" => M_CS_ACES2065_1,
-        _ => M_CS_PROPHOTO,
+    use spektrafilm_math::colorspace::{RgbSpace, mat3_mul3_f64};
+    match RgbSpace::from_name(color_space).unwrap_or(RgbSpace::ProPhoto) {
+        RgbSpace::Srgb => M_CS_SRGB,
+        RgbSpace::Rec2020 => M_CS_REC2020,
+        RgbSpace::Aces2065 => M_CS_ACES2065_1,
+        RgbSpace::ProPhoto => M_CS_PROPHOTO,
+        RgbSpace::VGamut => mat3_mul3_f64(&RgbSpace::Srgb.from_xyz(), &RgbSpace::VGamut.to_xyz()),
     }
 }
 

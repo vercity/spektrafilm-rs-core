@@ -896,50 +896,29 @@ const K75P_ILLUMINANT_XYZ_F64: [f64; 3] = [0.947089788128642, 1.0, 1.05719006915
 /// Get the native white point XYZ for a named colorspace.
 /// Uses xy chromaticity → XYZ conversion to match Python colour-science exactly.
 pub fn colorspace_white_xyz(name: &str) -> [f32; 3] {
-    match name {
-        // sRGB: whitepoint xy = (0.3127, 0.329) per colour-science
-        "sRGB" => colorspace::xy_to_xyz(0.3127, 0.329),
-        // ProPhoto: whitepoint = D50 xy = (0.3457, 0.3585)
-        "ProPhoto RGB" => colorspace::xy_to_xyz(0.3457, 0.3585),
-        // Rec.2020: whitepoint = D65 xy = (0.3127, 0.329)
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::xy_to_xyz(0.3127, 0.329),
-        // ACES: whitepoint xy = (0.32168, 0.33767)
-        "ACES2065-1" => colorspace::xy_to_xyz(0.32168, 0.33767),
-        _ => colorspace::xy_to_xyz(0.3457, 0.3585), // ProPhoto default
-    }
+    let [x, y] = colorspace::RgbSpace::from_name(name)
+        .unwrap_or(colorspace::RgbSpace::ProPhoto)
+        .white_xy();
+    colorspace::xy_to_xyz(x as f32, y as f32)
 }
 
 /// f64 variant: native white point XYZ for a named colorspace.
 pub fn colorspace_white_xyz_f64(name: &str) -> [f64; 3] {
-    match name {
-        "sRGB" => colorspace::xy_to_xyz_f64(0.3127, 0.329),
-        "ProPhoto RGB" => colorspace::xy_to_xyz_f64(0.3457, 0.3585),
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::xy_to_xyz_f64(0.3127, 0.329),
-        "ACES2065-1" => colorspace::xy_to_xyz_f64(0.32168, 0.33767),
-        _ => colorspace::xy_to_xyz_f64(0.3457, 0.3585),
-    }
+    colorspace::RgbSpace::from_name(name)
+        .unwrap_or(colorspace::RgbSpace::ProPhoto)
+        .white_xyz()
 }
 
 /// Get the RGB→XYZ matrix for a named colorspace.
 pub fn colorspace_to_xyz(name: &str) -> [[f32; 3]; 3] {
-    match name {
-        "sRGB" => colorspace::SRGB_TO_XYZ,
-        "ProPhoto RGB" => colorspace::PROPHOTO_TO_XYZ,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::REC2020_TO_XYZ,
-        "ACES2065-1" => colorspace::ACES_TO_XYZ,
-        _ => colorspace::PROPHOTO_TO_XYZ,
-    }
+    colorspace_to_xyz_f64(name).map(|row| row.map(|v| v as f32))
 }
 
 /// f64 variant: RGB→XYZ matrix for a named colorspace.
 pub fn colorspace_to_xyz_f64(name: &str) -> [[f64; 3]; 3] {
-    match name {
-        "sRGB" => colorspace::SRGB_TO_XYZ_F64,
-        "ProPhoto RGB" => colorspace::PROPHOTO_TO_XYZ_F64,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::REC2020_TO_XYZ_F64,
-        "ACES2065-1" => colorspace::ACES_TO_XYZ_F64,
-        _ => colorspace::PROPHOTO_TO_XYZ_F64,
-    }
+    colorspace::RgbSpace::from_name(name)
+        .unwrap_or(colorspace::RgbSpace::ProPhoto)
+        .to_xyz()
 }
 
 /// Compute the reference illuminant's XYZ (for CAT02 target white).

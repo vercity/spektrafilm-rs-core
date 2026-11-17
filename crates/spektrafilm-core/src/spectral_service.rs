@@ -235,6 +235,16 @@ pub fn compute_tc_lut_with_window(
     window_params: &[f64],
     illuminant: &[f64],
 ) -> TcLut {
+    windowed_tc_lut(spectra_lut, sensitivity, window_params, illuminant, 0.0)
+}
+
+pub(crate) fn windowed_tc_lut(
+    spectra_lut: &SpectraLut,
+    sensitivity: &[[f64; 3]],
+    window_params: &[f64],
+    illuminant: &[f64],
+    blur_sigma: f64,
+) -> TcLut {
     let n_wl = spectra_lut
         .n_wavelengths
         .min(sensitivity.len())
@@ -303,20 +313,98 @@ pub fn compute_tc_lut_with_window(
         }
     }
     // Build sens*window as (n_wl × 3) row-major.
-    let mut sw_flat = vec![0.0f64; n_wl * 3];
-    for wl in 0..n_wl {
-        for c in 0..3 {
-            sw_flat[wl * 3 + c] = sensitivity[wl][c] * window_normalized[wl][c];
-        }
-    }
+    let mut weighted_sensitivity: Vec<[f64; 3]> = sensitivity[..n_wl]
+        .iter()
+        .zip(window_normalized)
+        .map(|(sensitivity, window)| std::array::from_fn(|c| sensitivity[c] * window[c]))
+        .collect();
+    blur_spectral_sensitivity(&mut weighted_sensitivity, blur_sigma);
     let mut data = vec![0.0f64; n_pix * channels];
-    dgemm_no_transpose(&spec_f64, &sw_flat, &mut data, n_pix, channels, n_wl);
+    dgemm_no_transpose(
+        &spec_f64,
+        weighted_sensitivity.as_flattened(),
+        &mut data,
+        n_pix,
+        channels,
+        n_wl,
+    );
 
     TcLut {
         size,
         channels,
         data,
     }
+}
+
+/// Move the Gaussian from the spectra to the weighted sensitivity before the
+/// dot product. SciPy's reflected (half-sample symmetric) convolution has a
+/// symmetric matrix, so this produces the same result with one 81-sample pass.
+pub(crate) fn blur_spectral_sensitivity(sensitivity: &mut [[f64; 3]], sigma: f64) {
+    let radius = (4.0 * sigma + 0.5) as isize;
+    if radius <= 0 || sensitivity.is_empty() {
+        return;
+    }
+    let kernel: Vec<f64> = (-radius..=radius)
+        .map(|offset| (-0.5 * (offset as f64 / sigma).powi(2)).exp())
+        .collect();
+    let sum: f64 = kernel.iter().sum();
+    let original = sensitivity.to_vec();
+    let len = original.len() as isize;
+    let period = 2 * len;
+    for (wl, result) in sensitivity.iter_mut().enumerate() {
+        *result = [0.0; 3];
+        for (offset, weight) in (-radius..=radius).zip(&kernel) {
+            let index = (wl as isize + offset).rem_euclid(period);
+            let reflected = index.min(period - 1 - index) as usize;
+            for (out, value) in result.iter_mut().zip(original[reflected]) {
+                *out += value * (weight / sum);
+            }
+        }
+    }
+}
+
+/// Apply the profile's white-centered quartic exposure correction in stops.
+pub(crate) fn apply_exposure_surface(
+    lut: &mut TcLut,
+    params: &[Vec<f64>],
+    white_xy: (f64, f64),
+) -> Result<(), String> {
+    if params.len() != 3 || params.iter().any(|row| row.len() != 15) {
+        return Err("Hanatos exposure surface needs three rows of 15 coefficients".into());
+    }
+    let (cx, cy) = spectral::xy_to_tc(white_xy.0, white_xy.1);
+    let denom = (lut.size - 1) as f64;
+    for (i, cell) in lut.data.chunks_exact_mut(3).enumerate() {
+        let x = (i / lut.size) as f64 / denom - cx;
+        let y = (i % lut.size) as f64 / denom - cy;
+        let (xx, yy) = (x * x, y * y);
+        let monomials = [
+            x,
+            y,
+            xx,
+            yy,
+            x * y,
+            xx * x,
+            yy * y,
+            xx * y,
+            x * yy,
+            xx * xx,
+            yy * yy,
+            xx * x * y,
+            xx * yy,
+            x * yy * y,
+        ];
+        for (value, coeff) in cell.iter_mut().zip(params) {
+            let raw: f64 = monomials
+                .iter()
+                .zip(&coeff[1..])
+                .map(|(term, c)| term * c)
+                .sum();
+            let stops = raw / (1.0 + (raw / 2.0).powi(2)).sqrt();
+            *value *= stops.exp2();
+        }
+    }
+    Ok(())
 }
 
 /// Compute the midgray normalization factor for Hanatos2025.

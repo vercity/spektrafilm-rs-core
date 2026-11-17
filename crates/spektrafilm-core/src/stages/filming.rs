@@ -628,13 +628,7 @@ pub fn process(
 }
 
 pub fn input_colorspace_to_xyz(name: &str) -> [[f32; 3]; 3] {
-    match name {
-        "sRGB" => colorspace::SRGB_TO_XYZ,
-        "ProPhoto RGB" => colorspace::PROPHOTO_TO_XYZ,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::REC2020_TO_XYZ,
-        "ACES2065-1" => colorspace::ACES_TO_XYZ,
-        _ => colorspace::PROPHOTO_TO_XYZ,
-    }
+    spectral::colorspace_to_xyz(name)
 }
 
 pub(crate) fn select_illuminant(name: &str) -> &'static [f32] {

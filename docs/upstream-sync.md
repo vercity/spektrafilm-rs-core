@@ -112,6 +112,41 @@ PNG、JPEG、TIFF、EXR 共用读写。文件中可识别的色域和传递函�
 
 工作区默认精度（GUI 单列）通过 103 项，f64 通过 101 项，GUI 通过 3 项。GUI 子进程测试同时检查 32 位选项转发和大量日志排空。Metal 实测编码及线性输入的常驻路径，CUDA 通过编译检查。
 
+## 色彩与光谱选项
+
+基于 `fe18fe8`，对照本地 `/Users/ougu/Downloads/spektrafilm-main` 的 Python 0.3.4（`3bb2c2d`）和 colour-science 0.4.7。
+
+- 照片渲染、图像元数据和单 LUT 共用 RGB 色彩空间定义。V-Gamut/V-Log 可通过 `io.input_color_space` 和 `io.input_cctf_decoding` 处理无标签 TIFF。线性 V-Gamut TIFF 写入 ICC，V-Log EXR 通过标准原色坐标和项目自定义的传递函数标签往返。编码 V-Log 的 TIFF、PNG、JPEG 沿用无 ICC 写入，TIFF 再读时需要显式指定空间和解码。
+- CAM16-UCS 根据目标空间的原色和白点构建色域边界，OkLCh 和 OkLRab 也使用目标空间的矩阵。非 sRGB 的感知色域压缩走分段渲染，由 CPU 执行这一步。
+- Hanatos 应用 profile 的 3×15 系数曝光校正，并支持沿波长轴的高斯模糊。模糊的 sigma 单位与 Python 的实际调用一致，为波长采样间隔。输入侧 `input_gamut_compress.active=false` 生效。放大机支持 `enlarger.illuminant="TH-KG3-L"`，缺少数据库中性滤片组合时使用配置的中性滤片。
+
+### 对照验证
+
+用 Ektar 100 / Ultra Endura 做 32×24 合成图，线性输入每像素为 `[0.035 + 0.65*x/31, 0.06 + 0.60*y/23, 0.08 + 0.4*((x+y)%2)]`。色彩空间缺省使用线性 ProPhoto RGB 输入和线性 sRGB 输出。V-Log 输入用 colour-science 编码后存为无标签 TIFF32。关闭自动测光、DIR、卤光、高光增强、颗粒、眩光、锐化和内部打印／扫描 LUT，保留默认输出 CAM16-UCS 及中性滤片查表。Python 使用 `SimulationPipeline.process` 的同名阶段，Rust 使用 f64 CLI 的阶段转储与 `--raw-out`。下表为相对 Python 的最大绝对误差。
+
+| 用例 | 比对阶段 | `fe18fe8` | 本轮 CPU f64 |
+|---|---|---:|---:|
+| 默认 sRGB | 最终线性 RGB | 1.89e-9 | 1.89e-9，与修改前逐字节一致 |
+| Rec.2020 / CAM16-UCS | 最终线性 RGB | 6.28e-2 | 1.88e-9 |
+| ProPhoto RGB / CAM16-UCS | 最终线性 RGB | 2.15e-2 | 1.89e-9 |
+| V-Log 输入，Hanatos / Mallett | 胶片 log E | 6.03e-1 / 9.98 | 2.66e-15 / 7.79e-14 |
+| V-Log 输出 | 最终编码 RGB | 1.68 | 3.56e-10 |
+| Hanatos 校正面 + 光谱模糊（sigma 1.25） | 胶片 log E | 4.61e-1 | 3.22e-15 |
+| 光谱模糊，关闭光谱窗口 | 胶片 log E | 6.07e-2 | 3.89e-15 |
+| `TH-KG3-L` | 相纸 log E | 2.20e-2 | 2.11e-15 |
+| 关闭输入色域压缩 | 胶片 log E | 3.09e-1 | 3.72e-15 |
+
+25³ V-Log → sRGB 单 LUT 使用同一胶片／相纸，与上游 `BundleSpec(topology="1lut", input_color_space="vlog", output_color_space="srgb", resolution=25)` 逐节点比较。全部通道最大误差 `6.76e-5`，P99 `6.18e-5`。对原生 V-Log 18% 中灰进行三线性采样，Rust 输出亮度 Y 为 `0.1579288`，Python 为 `0.1579216`，相对 18% 均约低 0.189 档，满足上游 0.5 档容差。
+
+```bash
+target/debug/spektrafilm-f64 export-lut --input-encoding vlog \
+  --film kodak_ektar_100 --paper kodak_ultra_endura --size 25 -o /tmp/vlog.cube
+```
+
+Apple Silicon 的 Metal/wgpu f32 端到端验证覆盖 Rec.2020、ProPhoto、V-Log 输入与输出、Hanatos 校正面和模糊组合、`TH-KG3-L`，相对 Python 的最终 RGB 最大绝对误差为 `6.65e-6`。默认 workspace 测试通过 109 项，CLI 和相关库在 f64 下通过 104 项。CUDA feature 通过编译检查，硬件待测。
+
+后续仍有输入 OkLCh、输出 JzAzBz、其他相机 Log 和非 sRGB 感知压缩的 GPU 常驻路径。GUI 工作流及 2／3／4-LUT 仍按独立任务推进。
+
 ## P3 进阶交付和持续验证
 
-单 LUT 达标后，先稳定胶片 CMY 的 2-LUT 接口，再做 3／4-LUT、曝光 shaper、OCIO 和其他交付格式。输入／输出进阶色域算法、Hanatos adaptation surface、自定义 profile 形状校验各自验收。CI 增加 CPU f32／f64 回归和任意工作目录下的打包冒烟测试，Metal、CUDA 用对应硬件测画质。出处见 [现有发布流程](../.github/workflows/release.yml)。
+单 LUT 达标后，先稳定胶片 CMY 的 2-LUT 接口，再做 3／4-LUT、曝光 shaper、OCIO 和其他交付格式。剩余色域算法和自定义 profile 形状校验各自验收。CI 增加 CPU f32／f64 回归和任意工作目录下的打包冒烟测试，Metal、CUDA 用对应硬件测画质。出处见 [现有发布流程](../.github/workflows/release.yml)。
