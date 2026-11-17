@@ -70,7 +70,7 @@ jobs:
 
   macos:
     name: macOS
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -79,10 +79,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install LibRaw
+        run: |
+          brew install libraw
+          brew list --versions libraw
+
       - name: Package app bundle
         shell: bash
         run: |
           bash scripts/package_macos_app.sh
+
+      - name: Smoke test unpacked app
+        run: bash scripts/smoke_macos_package.sh dist/spektrafilm-macos.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
