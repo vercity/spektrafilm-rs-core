@@ -3764,9 +3764,11 @@ name = "spektrafilm-cli"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "image",
+ "rustfft",
  "serde",
  "serde_json",
  "spektrafilm-core",

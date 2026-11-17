@@ -571,7 +571,14 @@ impl BundleWriter<'_> {
         let live = self
             .baker
             .encode(&samples_for_runtime.run(pipeline, Tap::RgbOut)?)?;
-        qa::evaluate(self.directory, &paths, samples, &live, self.baker.output)
+        let frame = qa::Frame {
+            input: self.baker.input,
+            output: self.baker.output,
+            gain: self.baker.gain,
+        };
+        let mut metrics = qa::evaluate(self.directory, &paths, samples, &live, frame)?;
+        metrics.gamut_edge_stress(frame, pipeline);
+        Ok(metrics)
     }
 }
 
@@ -715,7 +722,7 @@ pub(crate) fn export(options: BundleOptions) -> Result<()> {
     fs::write(staging.path().join(LICENSE_FILENAME), LICENSE)?;
     delivery::prepare_bundle(staging.path(), &options.delivery)?;
     if options.qa {
-        qa::write_report(staging.path(), report)?;
+        qa::write_report(staging.path(), &options.film, report)?;
     }
     let archive = delivery::finish_bundle(staging.path(), destination, &options.delivery)?;
     ensure!(
@@ -863,7 +870,7 @@ fn write_readme(
     if writer.options.qa {
         writeln!(
             readme,
-            "\n`qa.json` compares sequential interpolation and single-CUBE resampling against direct simulation."
+            "\n`qa.json` compares sequential interpolation and single-CUBE resampling against direct simulation. Open the per-paper `qa/*/report.html` for structure, noise and gamut edge diagnostics."
         )?;
     }
     writeln!(

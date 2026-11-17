@@ -12,6 +12,10 @@ use spektrafilm_math::colorspace::XYZ_TO_REC2020_F64;
 
 use super::transport::Encoding;
 
+mod diagnostics;
+mod gamut_edge;
+mod report;
+
 const SAMPLE_COUNT: usize = 50_000;
 const RNG_SEED: u64 = 20_260_515;
 
@@ -95,18 +99,16 @@ impl Cube {
 
     fn trilinear(&self, rgb: [f64; 3]) -> [f64; 3] {
         let ([r, g, b], [fr, fg, fb]) = self.cell(rgb);
-        let mut result = [0.0; 3];
-        for (db, wb) in [1.0 - fb, fb].into_iter().enumerate() {
-            for (dg, wg) in [1.0 - fg, fg].into_iter().enumerate() {
-                for (dr, wr) in [1.0 - fr, fr].into_iter().enumerate() {
-                    let corner = self.get([r + dr, g + dg, b + db]);
-                    for (out, component) in result.iter_mut().zip(corner) {
-                        *out += component * wr * wg * wb;
-                    }
-                }
-            }
-        }
-        result
+        let mix =
+            |a: [f64; 3], b: [f64; 3], t| std::array::from_fn(|i| a[i] * (1.0 - t) + b[i] * t);
+        let plane = |b| {
+            mix(
+                mix(self.get([r, g, b]), self.get([r + 1, g, b]), fr),
+                mix(self.get([r, g + 1, b]), self.get([r + 1, g + 1, b]), fr),
+                fg,
+            )
+        };
+        mix(plane(b), plane(b + 1), fb)
     }
 
     fn tetrahedral(&self, rgb: [f64; 3]) -> [f64; 3] {
@@ -206,6 +208,16 @@ struct InterpolationMetrics {
 pub(super) struct Metrics {
     sequential: InterpolationMetrics,
     resampled: InterpolationMetrics,
+    diagnostics: diagnostics::Diagnostics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_gamut_edge_stress: Option<gamut_edge::Outcome>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Frame {
+    pub(super) input: Encoding,
+    pub(super) output: Encoding,
+    pub(super) gain: f64,
 }
 
 pub(super) fn evaluate(
@@ -213,7 +225,7 @@ pub(super) fn evaluate(
     paths: &[&str],
     samples: &[[f64; 3]],
     expected: &[[f64; 3]],
-    output: Encoding,
+    frame: Frame,
 ) -> Result<Metrics> {
     ensure!(!paths.is_empty(), "QA needs at least one CUBE");
     ensure!(
@@ -232,6 +244,7 @@ pub(super) fn evaluate(
             .iter()
             .fold(input, |value, cube| interpolate(cube, value))
     };
+    let output = frame.output;
     let expected: Vec<_> = expected
         .iter()
         .map(|&rgb| qa_coordinates(rgb, output))
@@ -242,26 +255,54 @@ pub(super) fn evaluate(
             apply_chain(input, Cube::tetrahedral),
         )
     })?;
-    let resampled = if cubes.len() == 1 {
-        sequential
+    // Python QA uses this effective CUBE for both the off-grid measurement
+    // and the structural diagnostics. The sequential section measures the
+    // actual host order separately.
+    let single = cubes.len() == 1;
+    let effective = if single {
+        cubes.into_iter().next().expect("one CUBE")
     } else {
-        // The Python QA suite evaluates a virtual CUBE made by applying
-        // each stage trilinearly at the bundle's original grid nodes.
         let size = cubes[0].size;
-        let cube = Cube {
+        let step = 1.0 / (size - 1) as f64;
+        let code = |i| if i == size - 1 { 1.0 } else { i as f64 * step };
+        let grid = (0..size).flat_map(|b| {
+            (0..size).flat_map(move |g| (0..size).map(move |r| [code(r), code(g), code(b)]))
+        });
+        Cube {
             size,
-            data: super::cube_grid(size as u32)
+            data: grid
                 .map(|input| apply_chain(input, Cube::trilinear))
                 .collect(),
-        };
+        }
+    };
+    let resampled = if single {
+        sequential
+    } else {
         measure(samples, &expected, output, |input| {
-            (cube.trilinear(input), cube.tetrahedral(input))
+            (effective.trilinear(input), effective.tetrahedral(input))
         })?
     };
     Ok(Metrics {
         sequential,
         resampled,
+        diagnostics: diagnostics::evaluate(&effective, frame),
+        output_gamut_edge_stress: None,
     })
+}
+
+impl Metrics {
+    pub(super) fn gamut_edge_stress(
+        &mut self,
+        frame: Frame,
+        pipeline: &spektrafilm_core::pipeline::LutPipeline,
+    ) {
+        self.output_gamut_edge_stress = Some(match gamut_edge::evaluate(frame, pipeline) {
+            Ok(panels) => gamut_edge::Outcome::Panels(panels),
+            Err(error) => gamut_edge::Outcome::Error {
+                error: format!("{error:#}"),
+            },
+        });
+    }
 }
 
 fn measure(
@@ -306,7 +347,14 @@ fn measure(
     })
 }
 
-pub(super) fn write_report(directory: &Path, prints: Vec<(String, Metrics)>) -> Result<()> {
+pub(super) fn write_report(
+    directory: &Path,
+    film: &str,
+    prints: Vec<(String, Metrics)>,
+) -> Result<()> {
+    for (paper, metrics) in &prints {
+        report::write_html(directory, film, paper, metrics)?;
+    }
     let prints = prints
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -335,7 +383,15 @@ fn to_xyz_qa(code: [f64; 3], output: Encoding) -> [f64; 3] {
     let linear = output
         .decode(code)
         .map(|value| value / output.output_gain());
-    mat_vec(output.space().to_xyz(), linear)
+    mat_vec(to_xyz_matrix(output), linear)
+}
+
+fn to_xyz_matrix(encoding: Encoding) -> [[f64; 3]; 3] {
+    encoding.space().to_xyz()
+}
+
+fn from_xyz_matrix(encoding: Encoding) -> [[f64; 3]; 3] {
+    encoding.space().from_xyz()
 }
 
 struct QaCoordinates {

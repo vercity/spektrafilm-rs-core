@@ -190,6 +190,31 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
         assert!(method["delta_itp_p99"].is_number());
     }
 
+    let diagnostics = &prints["kodak_2383"]["diagnostics"];
+    assert!(diagnostics["monotonicity"]["centerline_violations"].is_number());
+    assert!(diagnostics["jacobian_condition"]["p95"].is_number());
+    assert!(diagnostics["total_variation"]["axial_highband_ratio_mean"].is_number());
+    assert_eq!(diagnostics["gamut_face_folds"]["triangles"], 96);
+    assert!(
+        diagnostics["noise_sensitivity"]["input_samples"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let charts = prints["kodak_2383"]["output_gamut_edge_stress"]
+        .as_array()
+        .unwrap();
+    assert_eq!(charts.len(), 3);
+    assert_eq!(charts[1]["target"], "DCI-P3");
+    assert!(charts[1]["oog_fraction_saturated_row"].as_f64().unwrap() > 0.0);
+    assert!(charts[1].get("image_png").is_none());
+    let reports: Vec<_> = fs::read_dir(output.join("qa")).unwrap().collect();
+    assert_eq!(reports.len(), 1);
+    let html = fs::read_to_string(reports[0].as_ref().unwrap().path().join("report.html")).unwrap();
+    assert!(html.contains("kodak_2383"));
+    assert_eq!(html.matches("data:image/png;base64,").count(), 3);
+    assert!(html.contains("Noise sensitivity"));
+
     let invalid = temp.path().join("invalid-index");
     let rejected = export("2lut", &invalid, &["--qa", "--qa-print-index", "2"]);
     assert!(!rejected.status.success());

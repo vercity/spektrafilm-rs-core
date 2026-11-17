@@ -86,7 +86,7 @@ fn zip_contains_canonical_combination_and_sidecar_files_and_ocio_uses_canonical_
     }
 
     let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
-    assert_eq!(archive.len(), 39);
+    assert_eq!(archive.len(), 41);
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
         let expected = fs::read(directory.join(entry.enclosed_name().unwrap())).unwrap();
