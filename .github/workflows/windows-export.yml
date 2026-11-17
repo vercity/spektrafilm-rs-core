@@ -1,0 +1,21 @@
+name: Windows export verification
+
+on:
+  push:
+    paths:
+      - .github/workflows/windows-export.yml
+      - Cargo.lock
+      - crates/spektrafilm-gui/**
+      - crates/spektrafilm-io/**
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p spektrafilm-gui -p spektrafilm-io

@@ -2846,30 +2846,35 @@ fn run_f64_export(
     staged.publish()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod f64_export_tests {
     use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, sync::OnceLock};
 
-    fn export_child(directory: &Path, body: &str) -> PathBuf {
-        let script = directory.join("export-child.sh");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n[ \"$1\" = process ] && [ \"$3\" = -o ] || exit 24\n\
-                 case \"$4\" in *.tiff) ;; *) exit 25 ;; esac\n\
-                 {body}\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        script
-    }
-
-    fn run_child(script: &Path, input: &Path, target: &Path, cancel: &AtomicBool) -> Result<()> {
+    fn run_child(input: &Path, target: &Path, cancel: &AtomicBool) -> Result<()> {
+        static FIXTURE: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let fixture_name = format!("export-child{}", std::env::consts::EXE_SUFFIX);
+        let directory = FIXTURE.get_or_init(|| {
+            let directory = tempfile::tempdir().unwrap();
+            let source =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/f64_export_child.rs");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let result = std::process::Command::new(rustc)
+                .arg("--edition=2024")
+                .arg(source)
+                .arg("-o")
+                .arg(directory.path().join(&fixture_name))
+                .output()
+                .expect("start rustc for f64 export fixture");
+            assert!(
+                result.status.success(),
+                "compile f64 export fixture: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            directory
+        });
         run_f64_export(
-            script,
+            &directory.path().join(fixture_name),
             input,
             target,
             Some(32),
@@ -2885,32 +2890,27 @@ mod f64_export_tests {
     #[test]
     fn successful_child_creates_or_replaces_target() {
         let directory = tempfile::tempdir().unwrap();
-        let script = export_child(directory.path(), r#"printf complete > "$4""#);
         let target = directory.path().join("rendered frame.tiff");
         let cancel = AtomicBool::new(false);
-        run_child(&script, Path::new("unused"), &target, &cancel).unwrap();
+        run_child(Path::new("complete"), &target, &cancel).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"complete");
 
         fs::write(&target, b"previous contents").unwrap();
-        run_child(&script, Path::new("unused"), &target, &cancel).unwrap();
+        run_child(Path::new("complete"), &target, &cancel).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"complete");
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
     fn failed_child_leaves_existing_and_absent_targets_intact() {
         let directory = tempfile::tempdir().unwrap();
-        let script = export_child(
-            directory.path(),
-            r#"printf partial > "$4"; printf 'encoder failed' >&2; exit 23"#,
-        );
         let target = directory.path().join("rendered.tiff");
         let cancel = AtomicBool::new(false);
         for existing in [false, true] {
             if existing {
                 fs::write(&target, b"previous contents").unwrap();
             }
-            let error = run_child(&script, Path::new("unused"), &target, &cancel).unwrap_err();
+            let error = run_child(Path::new("fail"), &target, &cancel).unwrap_err();
             assert!(error.to_string().contains("exited 23 — encoder failed"));
             if existing {
                 assert_eq!(fs::read(&target).unwrap(), b"previous contents");
@@ -2919,7 +2919,7 @@ mod f64_export_tests {
             }
             assert_eq!(
                 fs::read_dir(directory.path()).unwrap().count(),
-                1 + usize::from(existing)
+                usize::from(existing)
             );
         }
     }
@@ -2927,10 +2927,6 @@ mod f64_export_tests {
     #[test]
     fn cancelling_child_after_write_leaves_targets_intact() {
         let directory = tempfile::tempdir().unwrap();
-        let script = export_child(
-            directory.path(),
-            r#"printf partial > "$4"; : > "$2"; exec sleep 30"#,
-        );
         let marker = directory.path().join("staged-output-written");
         let target = directory.path().join("rendered.tiff");
 
@@ -2940,7 +2936,7 @@ mod f64_export_tests {
             }
             let cancel = AtomicBool::new(false);
             let (written, while_writing, result) = std::thread::scope(|scope| {
-                let export = scope.spawn(|| run_child(&script, &marker, &target, &cancel));
+                let export = scope.spawn(|| run_child(&marker, &target, &cancel));
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !marker.is_file() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(10));
@@ -2965,7 +2961,7 @@ mod f64_export_tests {
             fs::remove_file(&marker).unwrap();
             assert_eq!(
                 fs::read_dir(directory.path()).unwrap().count(),
-                1 + usize::from(existing)
+                usize::from(existing)
             );
         }
     }
@@ -2973,22 +2969,41 @@ mod f64_export_tests {
     #[test]
     fn failed_publish_leaves_destination_directory_intact() {
         let directory = tempfile::tempdir().unwrap();
-        let script = export_child(directory.path(), r#"printf complete > "$4""#);
         let target = directory.path().join("rendered.tiff");
         fs::create_dir(&target).unwrap();
         let marker = target.join("keep");
         fs::write(&marker, b"keep").unwrap();
 
-        let error = run_child(
-            &script,
-            Path::new("unused"),
-            &target,
-            &AtomicBool::new(false),
-        )
-        .unwrap_err();
+        let error = run_child(Path::new("complete"), &target, &AtomicBool::new(false)).unwrap_err();
         assert!(error.to_string().starts_with("publishing output to "));
         assert_eq!(fs::read(&marker).unwrap(), b"keep");
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_destination_retains_previous_contents() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("locked.tiff");
+        fs::write(&target, b"previous contents").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&target)
+            .unwrap();
+
+        let result = run_child(Path::new("complete"), &target, &AtomicBool::new(false));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("publishing output to ")
+        );
+        drop(lock);
+        assert_eq!(fs::read(&target).unwrap(), b"previous contents");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
 
