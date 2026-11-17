@@ -29,6 +29,7 @@ use spektrafilm_math::{
     image::ImageBuf,
 };
 
+mod development_animation;
 mod export_output;
 mod paper_back;
 mod presets;
@@ -629,6 +630,7 @@ impl App {
         self.film_channel_swap = preset.film_channels;
         self.print_channel_swap = preset.print_channels;
         self.sync_input_color();
+        self.viewer.clear_output();
         self.output_tex = None;
         self.request_render();
         Ok(())
@@ -1104,8 +1106,12 @@ impl App {
                             .then(|| simulation_color(&self.params)),
                     )
                 };
-                self.output_tex = Some(make_texture(ctx, preview));
-                self.viewer.layer = Layer::Output;
+                self.viewer.show_output(
+                    ctx,
+                    &mut self.output_tex,
+                    preview,
+                    &self.preview_interpolation,
+                );
                 self.status = format!(
                     "{} {} × {} ({:.1} MP)",
                     mode.label(),
@@ -2156,8 +2162,13 @@ impl App {
                     let color = self
                         .display_transform
                         .then(|| simulation_color(&self.params));
-                    self.output_tex =
-                        Some(make_texture(ctx, make_preview_texture_data(output, color)));
+                    let texture = make_preview_texture_data(output, color);
+                    self.viewer.replace_output(
+                        ctx,
+                        &mut self.output_tex,
+                        texture,
+                        &self.preview_interpolation,
+                    );
                 }
             }
             ui.checkbox(&mut self.gray_canvas, "18% gray canvas");
@@ -2240,6 +2251,8 @@ impl eframe::App for App {
             }
         }
 
+        self.viewer
+            .advance_output(ctx, &mut self.output_tex, &self.preview_interpolation);
         egui::CentralPanel::default().show(ctx, |ui| {
             self.viewer
                 .layers(ui, self.image.is_some(), self.output_tex.is_some());
@@ -2652,16 +2665,6 @@ fn make_preview_texture_data(
             }
         });
     PreviewTextureData { size: [w, h], rgba }
-}
-
-/// Upload the prepared sRGB preview texture.
-fn make_texture(ctx: &egui::Context, preview: PreviewTextureData) -> egui::TextureHandle {
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(preview.size, &preview.rgba);
-    ctx.load_texture(
-        "spektrafilm-output",
-        color_image,
-        egui::TextureOptions::LINEAR,
-    )
 }
 
 /// Locate the f64-built `spektrafilm` CLI binary. Search order:
