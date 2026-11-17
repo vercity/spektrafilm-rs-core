@@ -42,10 +42,16 @@ pub(super) struct GuiPreset {
 
 impl Default for GuiPreset {
     fn default() -> Self {
+        let mut params = RuntimeParams::default();
+        // Python's GUI applies these in params_mapper._apply_settings.
+        // RuntimeParams::default stays suitable for direct spectral library/CLI use.
+        params.settings.use_enlarger_lut = true;
+        params.settings.use_scanner_lut = true;
+        params.settings.use_fast_stats = true;
         Self {
             film: FACTORY_FILM.into(),
             paper: FACTORY_PAPER.into(),
-            params: RuntimeParams::default(),
+            params,
             override_input_color: false,
             saving_color: SRGB_DISPLAY,
             depths: OutputDepths::default(),
@@ -569,6 +575,11 @@ mod tests {
         assert_eq!(flat.params.settings.preview_max_size, 800);
         assert_eq!(flat.white_padding, 0.05);
         assert_eq!(flat.print_channels, [2, 0, 1]);
+        assert!(flat.params.settings.use_enlarger_lut);
+        assert!(flat.params.settings.use_scanner_lut);
+        assert!(flat.params.settings.use_fast_stats);
+        assert_eq!(flat.params.settings.lut_resolution, 17);
+        assert!(!RuntimeParams::default().settings.use_fast_stats);
         assert!(!flat.auto_preview);
 
         let nested = GuiPreset::from_json(&json!({

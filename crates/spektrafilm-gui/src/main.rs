@@ -1299,13 +1299,11 @@ impl App {
         // the Cancel button (and `on_exit`) can kill the child cleanly
         // instead of letting it orphan after the GUI window closes.
         //
-        // f64 CPU export uses the selected scan scale with the spectral LUTs.
+        // f64 CPU export uses the same spectral and grain settings as Scan.
         let film = self.film_name.clone();
         let paper = self.print_name.clone();
         let mut params = self.params.clone();
         params.settings.preview_mode = false;
-        params.settings.use_enlarger_lut = true;
-        params.settings.use_scanner_lut = true;
         let bit_depth = self.bit_depth_for(&out_path);
         let developed_raw = if raw::is_raw(source.path()) {
             self.image.clone()

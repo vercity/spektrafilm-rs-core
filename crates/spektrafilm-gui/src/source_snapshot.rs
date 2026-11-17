@@ -211,6 +211,7 @@ cp "$2" "$4"
         app.film_name = "film-A".into();
         app.print_name = "paper-A".into();
         app.params.camera.exposure_compensation_ev = 1.25;
+        app.params.settings.use_scanner_lut = false;
         let source = app.source.as_ref().unwrap().clone();
         let first_snapshot = source.path().to_path_buf();
         app.start_f64_export(&ctx, source, child, output.clone());
@@ -238,6 +239,9 @@ cp "$2" "$4"
             serde_json::from_reader(File::open(directory.path().join("params.json")).unwrap())
                 .unwrap();
         assert_eq!(params.camera.exposure_compensation_ev, 1.25);
+        assert!(params.settings.use_enlarger_lut);
+        assert!(!params.settings.use_scanner_lut);
+        assert!(params.settings.use_fast_stats);
         assert!(!first_snapshot.exists());
     }
 }
