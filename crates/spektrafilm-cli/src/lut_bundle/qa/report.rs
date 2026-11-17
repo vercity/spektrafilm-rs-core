@@ -154,6 +154,7 @@ fn model_usage(html: &mut String, metrics: &Metrics) -> Result<()> {
         )?;
     }
     html.push_str("</svg><figcaption>Higher density is higher on the chart. The vertical line marks 0 EV and red dots mark input encoding clipping.</figcaption></figure>");
+    model_curves(html, metrics)?;
     html.push_str("<h3>OkLab hue twist</h3><p>Largest input-to-output hue changes in four input chroma bands. Inputs above 0.6 OkLab chroma are outside the test’s visible-color envelope.</p>");
     metric_table(html, &serde_json::to_value(&metrics.hue_twist_oklab)?)?;
     html.push_str("</section>\n<section><h2>Red–green plane slices</h2><p>Red increases left to right and green bottom to top. Each panel fixes the input blue value and shows the output on an sRGB display.</p>");
@@ -168,6 +169,102 @@ fn model_usage(html: &mut String, metrics: &Metrics) -> Result<()> {
         )?;
     }
     html.push_str("</div></section>");
+    Ok(())
+}
+
+fn model_curves(html: &mut String, metrics: &Metrics) -> Result<()> {
+    use spektrafilm_math::spectral::{CMF_X_F64, CMF_Y_F64, CMF_Z_F64};
+
+    let characteristic = &metrics.characteristic_curve;
+    html.push_str("<h3>Characteristic curves</h3><p>Encoded density across each input channel at five fixed neutral densities (0.2–1.0). The neutral sweep varies all three input channels together.</p>");
+    metric_table(html, &serde_json::to_value(characteristic)?)?;
+    html.push_str(r#"<div class="panels">"#);
+    for (axis, title) in ["Red input", "Green input", "Blue input"]
+        .into_iter()
+        .enumerate()
+    {
+        figure_density_curve_open(html, title)?;
+        for (sweep, opacity) in characteristic
+            .sweeps
+            .iter()
+            .zip([0.32, 0.50, 1.0, 0.65, 0.40])
+        {
+            figure_density_lines(
+                html,
+                &sweep.channels[axis],
+                opacity,
+                Some(sweep.pin_density),
+            )?;
+        }
+        write!(html, "</svg><figcaption>{title}</figcaption></figure>")?;
+    }
+    figure_density_curve_open(html, "Neutral input")?;
+    figure_density_lines(html, &characteristic.neutral, 1.0, None)?;
+    html.push_str("</svg><figcaption>Neutral input</figcaption></figure></div>");
+
+    let white = &metrics.planckian_sweep;
+    html.push_str("<h3>Daylight and Planckian white sweep</h3><p>Chromaticity after the LUT. Bends over 30° between successive temperatures are flagged.</p>");
+    metric_table(html, &serde_json::to_value(white)?)?;
+    let project = |[x, y]: [f64; 2]| (x * 220.0 + 2.0, 186.0 - y * 208.0);
+    html.push_str(r#"<figure><svg viewBox="0 0 190 190" role="img" aria-label="White output chromaticity across daylight temperatures and the CIE locus" style="max-width:23rem"><polygon fill="none" stroke="currentColor" opacity=".35" points=""#);
+    for ((x, y), z) in CMF_X_F64.into_iter().zip(CMF_Y_F64).zip(CMF_Z_F64) {
+        let (x, y) = project(super::curves::chromaticity([x, y, z]));
+        write!(html, "{x:.3} {y:.3} ")?;
+    }
+    html.push_str(r#""/><polyline fill="none" stroke="currentColor" points=""#);
+    for xy in white.output_xy {
+        let (x, y) = project(xy);
+        write!(html, "{x:.3} {y:.3} ")?;
+    }
+    html.push_str(r#""/>"#);
+    for (i, xy) in white.output_xy.into_iter().enumerate() {
+        let (x, y) = project(xy);
+        let temperature = 2700.0 + i as f64 * 7300.0 / (white.output_xy.len() - 1) as f64;
+        write!(
+            html,
+            r#"<circle cx="{x:.3}" cy="{y:.3}" r="1" fill="currentColor"><title>{temperature:.0} K</title></circle>"#
+        )?;
+    }
+    html.push_str("</svg><figcaption>Output CIE xy over the spectral locus. Each point shows its temperature on hover.</figcaption></figure>");
+    Ok(())
+}
+
+fn figure_density_curve_open(html: &mut String, title: &str) -> Result<()> {
+    write!(
+        html,
+        r#"<figure><svg viewBox="0 0 129 129" role="img" aria-label="{title} versus encoded output density"><path d="M1 1 V128 H128" fill="none" stroke="currentColor" opacity=".5"/>"#
+    )?;
+    Ok(())
+}
+
+fn figure_density_lines(
+    html: &mut String,
+    line: &[[f64; 3]],
+    opacity: f64,
+    pin: Option<f64>,
+) -> Result<()> {
+    for (channel, (label, color)) in [
+        ("Red", "#dc5252"),
+        ("Green", "#32a86a"),
+        ("Blue", "#5580d8"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        write!(
+            html,
+            r#"<polyline fill="none" stroke="{color}" opacity="{opacity}" points=""#
+        )?;
+        for (i, value) in line.iter().enumerate() {
+            let x = 1.0 + i as f64 * 126.0 / (line.len() - 1) as f64;
+            write!(html, "{x:.2} {:.2} ", 127.0 - value[channel] * 31.5)?;
+        }
+        write!(html, r#""><title>{label} output"#)?;
+        if let Some(pin) = pin {
+            write!(html, " at density {pin:.1}")?;
+        }
+        html.push_str("</title></polyline>");
+    }
     Ok(())
 }
 

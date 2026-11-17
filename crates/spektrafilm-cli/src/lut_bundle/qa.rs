@@ -12,6 +12,7 @@ use spektrafilm_math::colorspace::XYZ_TO_REC2020_F64;
 
 use super::transport::Encoding;
 
+mod curves;
 mod diagnostics;
 mod gamut_edge;
 mod model_usage;
@@ -210,6 +211,8 @@ pub(super) struct Metrics {
     sequential: InterpolationMetrics,
     resampled: InterpolationMetrics,
     diagnostics: diagnostics::Diagnostics,
+    characteristic_curve: curves::Characteristic,
+    planckian_sweep: curves::Planckian,
     dynamic_range_usage: model_usage::DynamicRange,
     hue_twist_oklab: model_usage::HueTwist,
     rg_plane_slices: model_usage::RgPlanes,
@@ -290,6 +293,8 @@ pub(super) fn evaluate(
         sequential,
         resampled,
         diagnostics: diagnostics::evaluate(&effective, frame),
+        characteristic_curve: curves::characteristic(&effective),
+        planckian_sweep: curves::planckian(&effective, frame),
         dynamic_range_usage: model_usage::dynamic_range(&effective, frame),
         hue_twist_oklab: model_usage::hue_twist(&effective, frame),
         rg_plane_slices: model_usage::rg_planes(&effective, frame)?,

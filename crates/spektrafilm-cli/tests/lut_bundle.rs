@@ -216,6 +216,8 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
     assert!(qa_report["dynamic_range_usage"]["midgray_offset_stops"].is_number());
     assert!(qa_report["hue_twist_oklab"]["max_hue_rotation_deg"].is_number());
     assert_eq!(qa_report["rg_plane_slices"]["n_slices"], 5);
+    assert!(qa_report["characteristic_curve"]["system_gamma_at_mid"].is_number());
+    assert_eq!(qa_report["planckian_sweep"]["cct_range_k"], "2700-10000");
     assert_eq!(html.matches("data:image/png;base64,").count(), 8);
     assert!(html.contains("Noise sensitivity"));
     assert!(html.contains("Dynamic range usage"));
