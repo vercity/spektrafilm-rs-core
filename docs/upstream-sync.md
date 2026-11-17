@@ -292,6 +292,22 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 
 默认精度工作区通过 135 项测试，启用 CLI／GUI f64 后通过 138 项。CUDA feature 通过编译检查。非 sRGB／JzAzBz GPU 常驻、散射和分层颗粒、CUDA 硬件以及 RAW 去马赛克与高光质量仍是剩余对齐项。额外相机编码、HLG 和外部 shaper 按目标宿主扩展，QA 的 HTML 图表也仍待移植。
 
+### Python 0.3.4 剩余功能验收
+
+本轮从已合入 `main` 的 `30cbaa1` 开始，使用下载的 Python 0.3.4。分项验收后更新此表。
+
+| 项目 | 验收条件和当前进度 |
+|---|---|
+| GUI 色彩和 RAW 开发 | 对照带标签及无标签 TIFF、宽色域色块、Bayer 与 X-Trans。预览采用显示变换，Scan／Save／f64 Export 保留各自的像素和色彩标签。对照白平衡、Lensfun、旋转和重新开发，保护源图快照及原子替换。进行中。 |
+| GUI 预设、默认片纸和交互 | 对照原版 JSON、启动默认值、恢复出厂设置、记忆目录、负片与正片切换、预览采样、颗粒控件和图层／相纸动画。待验收。 |
+| LUT 编码和命令 | 对照原版启用的输入／输出注册表、Rec.709 原色、HDR 增益、OCIO 处理器以及 TOML、参数覆盖、默认拓扑和列表命令。进行中。 |
+| LUT QA | 按同一文件、片纸和采样点复算 D65 ΔE00、ΔITP、单调性、色域和噪声等诊断，并验证 HTML 输出。进行中。 |
+| 4-LUT 画质 | 对照两端逐段与重采样结果。65³ Ektar 100／Ultra Endura V-Log→sRGB 三线性／四面体逐段最大 ΔE00 为 6.65／6.28，两端一致，样本仍超出最大值 2.0 的门槛。 |
+| 运行时阶段接口 | 对照 `rgb_pre` 与 `cmy_print` 等普通渲染阶段、胶片直扫的可达路径和跳过上游后所需的像素尺寸。进行中。 |
+| 自定义 profile 保存 | 已验收。公共 `save_profile` 写回片纸 JSON，保留许可信息、波段空值和黑白片多显影时间，替换前先完整写入同目录暂存文件。Portra 400、Portra Endura 由 Python 原版读取并通过验证，光谱及密度数组形状、空值位置一致，有限数值的最大差为 `1.78e-15`。Rust 额外覆盖 Double-X 与保存失败后保留原件。 |
+| RAW 与其他文件细节 | 对照 LibRaw 的去马赛克、高光和非直线镜头校正，以及 MakerNote、内嵌缩略图与通用 EXR 元数据。待验收。 |
+| GPU 和发布验证 | 对照 Metal／wgpu 的色域压缩、散射和颗粒。另需 CUDA、Lumix 和 Windows 文件取消／替换实测。待验收。 |
+
 ### 审阅验证范围
 
 Rust GUI 的 3 项回归通过，Python GUI 参数映射通过 16 项。Python builder／combination 测试为 127 通过、1 失败，失败用例要求已安装发行包的 provenance 版本，本次通过 `PYTHONPATH` 读取源码得到 `0+unknown`。Python GUI 的交互窗口与持久化套件未实测，临时环境缺少 Qt／Napari。上述导出失败和尺寸是同一 f64 CLI 路径的实测。其余工作流差距根据 GUI 源码审阅。

@@ -1,19 +1,19 @@
-/// Film and paper profile loading from JSON.
+/// Film and paper profiles stored as JSON.
 ///
 /// Mirrors Python `profiles/io.py`. Profiles contain spectral sensitivity data,
 /// density curves, and metadata for each film stock and paper type.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use spektrafilm_math::spectral::N_WAVELENGTHS;
-use std::path::Path;
+use std::{io::Write, path::Path};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Profile {
     pub metadata: ProfileMetadata,
     pub info: ProfileInfo,
     pub data: ProfileData,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProfileMetadata {
     #[serde(default)]
     pub version: String,
@@ -29,7 +29,7 @@ pub struct ProfileMetadata {
     pub datasource: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProfileInfo {
     pub stock: Option<String>,
     pub name: Option<String>,
@@ -87,7 +87,7 @@ fn default_d50() -> String {
     "D50".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProfileData {
     #[serde(default)]
     pub wavelengths: Vec<f64>,
@@ -107,7 +107,8 @@ pub struct ProfileData {
     #[serde(
         rename = "base_density",
         default,
-        deserialize_with = "deser_base_density_rows"
+        deserialize_with = "deser_base_density_rows",
+        serialize_with = "serialize_base_density_rows"
     )]
     pub base_density_rows: Vec<Vec<f64>>,
     /// Resolved base+fog spectrum (the selected development-time column of
@@ -127,11 +128,15 @@ pub struct ProfileData {
     /// Parametric fit of the density curves (sum-of-CDFs per channel), used by
     /// the print-curve morph. Absent on older profiles. On B&W profiles the
     /// first axis indexes development time instead of channels.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub density_curves_model: Option<DensityCurvesModel>,
     /// Development-time family axis (minutes), one entry per density-curves
     /// column on B&W profiles. Empty for colour profiles.
-    #[serde(default, deserialize_with = "deser_zero_vec")]
+    #[serde(
+        default,
+        deserialize_with = "deser_zero_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub development_time: Vec<f64>,
 }
 
@@ -140,7 +145,7 @@ pub struct ProfileData {
 /// `centers`, `amplitudes`, `sigmas` are each `[n_channels][n_layers]`. Each
 /// channel's density is `sum_i amplitudes[i] * Phi((x - centers[i]) / sigmas[i])`,
 /// where `Phi` is the (sign-flipped for positive stocks) standard-normal CDF.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DensityCurvesModel {
     #[serde(default)]
     pub model_type: String,
@@ -245,6 +250,18 @@ where
             Row::Many(xs) => xs.into_iter().map(|x| x.unwrap_or(f64::NAN)).collect(),
         })
         .collect())
+}
+
+fn serialize_base_density_rows<S>(rows: &[Vec<f64>], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if rows.iter().all(|row| row.len() == 1) {
+        // Python colour profiles store base+fog as one scalar per wavelength.
+        serializer.collect_seq(rows.iter().map(|row| row[0]))
+    } else {
+        rows.serialize(serializer)
+    }
 }
 
 impl Profile {
@@ -358,6 +375,32 @@ pub fn load_profile(path: &Path) -> Result<Profile, ProfileError> {
     let idx = development_time_index(&profile.data.development_time, None);
     profile.data.base_density = base_density_column(&profile.data.base_density_rows, idx);
     Ok(profile)
+}
+
+/// Write a film or paper profile in the stock JSON schema.
+///
+/// Save the original profile before resolving a selected development time for
+/// rendering. Missing spectral measurements are written as JSON `null`.
+pub fn save_profile(path: &Path, profile: &Profile) -> Result<(), ProfileError> {
+    validate_profile(profile)?;
+    validate_profile_for_save(profile)?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let io_error = |error| ProfileError::Write(path.display().to_string(), error);
+    let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(io_error)?;
+    {
+        let mut writer = std::io::BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, profile)
+            .map_err(|error| ProfileError::Encode(path.display().to_string(), error))?;
+        writer.write_all(b"\n").map_err(io_error)?;
+        writer.flush().map_err(io_error)?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| io_error(error.error))?;
+    Ok(())
 }
 
 /// Load a profile by stock name from a data directory.
@@ -551,12 +594,88 @@ fn validate_profile(profile: &Profile) -> Result<(), ProfileError> {
     Ok(())
 }
 
+fn validate_profile_for_save(profile: &Profile) -> Result<(), ProfileError> {
+    let data = &profile.data;
+    let invalid = |field| ProfileError::Validation(format!("{field} contains non-finite values"));
+    for (field, values) in [
+        ("wavelengths", data.wavelengths.as_slice()),
+        ("log_exposure", &data.log_exposure),
+        ("development_time", &data.development_time),
+        (
+            "hanatos2025_adaptation_window_params",
+            &data.hanatos2025_adaptation_window_params,
+        ),
+        (
+            "log_sensitivity_density_over_min",
+            std::slice::from_ref(&profile.info.log_sensitivity_density_over_min),
+        ),
+    ] {
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(invalid(field));
+        }
+    }
+    for (field, rows) in [
+        ("density_curves", &data.density_curves),
+        (
+            "hanatos2025_adaptation_surface_params",
+            &data.hanatos2025_adaptation_surface_params,
+        ),
+    ] {
+        if rows.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(invalid(field));
+        }
+    }
+    if data
+        .density_curves_layers
+        .iter()
+        .flatten()
+        .flatten()
+        .any(|value| !value.is_finite())
+    {
+        return Err(invalid("density_curves_layers"));
+    }
+    if let Some(model) = &data.density_curves_model {
+        for (field, rows) in [
+            ("centers", &model.centers),
+            ("amplitudes", &model.amplitudes),
+            ("sigmas", &model.sigmas),
+        ] {
+            if rows.iter().flatten().any(|value| !value.is_finite()) {
+                return Err(invalid(field));
+            }
+        }
+    }
+    // Non-finite spectral values may only be the NaN sentinel for an
+    // unmeasured band. Serializing infinity as null would discard real data.
+    for (field, rows) in [
+        ("log_sensitivity", &data.log_sensitivity),
+        ("channel_density", &data.channel_density),
+        ("base_density", &data.base_density_rows),
+    ] {
+        if rows.iter().flatten().any(|value| value.is_infinite()) {
+            return Err(invalid(field));
+        }
+    }
+    if data
+        .midscale_neutral_density
+        .iter()
+        .any(|value| value.is_infinite())
+    {
+        return Err(invalid("midscale_neutral_density"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
     #[error("loading profile {0}: {1}")]
     Io(String, std::io::Error),
     #[error("parsing profile {0}: {1}")]
     Parse(String, serde_json::Error),
+    #[error("writing profile {0}: {1}")]
+    Write(String, std::io::Error),
+    #[error("encoding profile {0}: {1}")]
+    Encode(String, serde_json::Error),
     #[error("invalid profile: {0}")]
     Validation(String),
 }
@@ -586,6 +705,58 @@ mod tests {
             return None;
         }
         Some(load_profile(&path).unwrap())
+    }
+
+    #[test]
+    fn saves_colour_and_bw_profiles_in_the_stock_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        for (stock, is_bw) in [("kodak_gold_200", false), ("kodak_doublex", true)] {
+            let mut profile = data_profile(stock).unwrap();
+            profile.info.name = Some(format!("{stock} custom"));
+            profile.data.log_sensitivity[0][0] = f64::NAN;
+            let path = directory.path().join(format!("{stock}.json"));
+            save_profile(&path, &profile).unwrap();
+
+            let json: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+            assert!(json["data"]["log_sensitivity"][0][0].is_null());
+            assert_eq!(json["data"]["base_density"][50].is_array(), is_bw);
+            assert_eq!(json["data"].get("development_time").is_some(), is_bw);
+
+            let loaded = load_profile(&path).unwrap();
+            assert_eq!(loaded.info.name, profile.info.name);
+            assert_eq!(loaded.metadata.license, profile.metadata.license);
+            assert_eq!(loaded.data.development_time, profile.data.development_time);
+            assert!(loaded.data.log_sensitivity[0][0].is_nan());
+            let time = loaded.data.development_time.last().copied();
+            let rendered = resolve_for_render(loaded, time);
+            let original = resolve_for_render(profile, time);
+            for (resaved, previous) in rendered
+                .data
+                .density_curves
+                .iter()
+                .flatten()
+                .zip(original.data.density_curves.iter().flatten())
+            {
+                assert!((resaved - previous).abs() < 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn saving_an_invalid_profile_preserves_the_previous_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.json");
+        let mut profile = data_profile("kodak_gold_200").unwrap();
+        save_profile(&path, &profile).unwrap();
+        let previous = std::fs::read(&path).unwrap();
+        profile.data.log_sensitivity[0][0] = f64::INFINITY;
+        assert!(matches!(
+            save_profile(&path, &profile),
+            Err(ProfileError::Validation(_))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), previous);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
