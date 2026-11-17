@@ -246,6 +246,38 @@ fn depth_control(ui: &mut egui::Ui, label: &str, current: &mut u8, choices: &[u8
         });
 }
 
+const IDENTITY_CHANNELS: [usize; 3] = [0, 1, 2];
+
+fn channel_order_control(ui: &mut egui::Ui, label: &str, order: &mut [usize; 3]) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        order.iter_mut().fold(false, |changed, index| {
+            ui.add(egui::DragValue::new(index).range(0..=2)).changed() || changed
+        })
+    })
+    .inner
+}
+
+fn nonnegative_controls<T: egui::emath::Numeric, const N: usize>(
+    ui: &mut egui::Ui,
+    label: &str,
+    fields: &mut [T; N],
+) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        fields.iter_mut().fold(false, |changed, field| {
+            ui.add(
+                egui::DragValue::new(field)
+                    .speed(0.05)
+                    .range(0.0..=f64::INFINITY),
+            )
+            .changed()
+                || changed
+        })
+    })
+    .inner
+}
+
 const SRGB_DISPLAY: RasterColor = RasterColor {
     color_space: "sRGB",
     cctf_encoding: true,
@@ -835,6 +867,7 @@ impl App {
         let data_dir = self.data_dir.clone();
         let params = self.params.clone();
         let display_transform = self.display_transform;
+        let channel_orders = [self.film_channel_swap, self.print_channel_swap];
         let raw_input_destination =
             (self.override_input_color && self.source_is_raw()).then_some(self.manual_input_color);
         let mut pipeline_cache = self.pipeline_cache.take();
@@ -867,6 +900,7 @@ impl App {
                         &data_dir,
                         &film_name,
                         &print_name,
+                        channel_orders,
                         params,
                     )?;
                     let pipeline_build_ms = t_total.elapsed().as_secs_f32() * 1000.0;
@@ -1202,6 +1236,7 @@ impl App {
             None
         };
         let rotation = self.source_rotation;
+        let channel_orders = [self.film_channel_swap, self.print_channel_swap];
         let use_params_input_color = self.override_input_color;
         let saving_color = self.saving_color;
         let data_dir = self.data_dir.clone();
@@ -1227,6 +1262,7 @@ impl App {
                         saving_color: Some(saving_color),
                         rotation: if developed_raw.is_some() { 0 } else { rotation },
                         developed_raw: developed_raw.as_deref(),
+                        channel_orders: Some(channel_orders),
                     },
                     &cancel_for_worker,
                 );
@@ -1673,6 +1709,10 @@ impl App {
                 let mut changed = false;
                 changed |= ui.checkbox(&mut g.active, "Active").changed();
                 changed |= ui
+                    .checkbox(&mut g.sublayers_active, "Model emulsion sublayers")
+                    .on_hover_text("Used by the CPU grain model in full-resolution exports.")
+                    .changed();
+                changed |= ui
                     .add(
                         egui::Slider::new(&mut g.agx_particle_area_um2, 0.05..=1.0)
                             .text("Particle area (µm²)"),
@@ -1681,9 +1721,37 @@ impl App {
                 changed |= ui
                     .add(egui::Slider::new(&mut g.blur, 0.0..=3.0).text("Post-blur σ"))
                     .changed();
+                changed |=
+                    nonnegative_controls(ui, "RGB particle scale", &mut g.agx_particle_scale);
+                changed |= nonnegative_controls(
+                    ui,
+                    "Sublayer particle scale",
+                    &mut g.agx_particle_scale_layers,
+                );
+                changed |= nonnegative_controls(ui, "Minimum grain density", &mut g.density_min);
+                changed |= nonnegative_controls(ui, "Grain uniformity", &mut g.uniformity);
                 changed |= ui
-                    .add(egui::Slider::new(&mut g.n_sub_layers, 1..=4).text("Sub-layers"))
+                    .add(
+                        egui::DragValue::new(&mut g.blur_dye_clouds_um)
+                            .speed(0.1)
+                            .range(0.0..=f32::INFINITY)
+                            .suffix(" µm")
+                            .prefix("Dye cloud blur "),
+                    )
                     .changed();
+                changed |= nonnegative_controls(
+                    ui,
+                    "Microstructure blur / clump size",
+                    &mut g.micro_structure,
+                );
+                if !g.sublayers_active {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut g.n_sub_layers, 1..=4)
+                                .text("Aggregate grain sublayers"),
+                        )
+                        .changed();
+                }
                 if changed {
                     self.request_render();
                 }
@@ -1802,6 +1870,19 @@ impl App {
                 }
             });
 
+        egui::CollapsingHeader::new("Dye-density channels").show(ui, |ui| {
+            let film_changed =
+                channel_order_control(ui, "Film C/M/Y order", &mut self.film_channel_swap);
+            let print_changed = ui
+                .add_enabled_ui(!self.params.io.scan_film, |ui| {
+                    channel_order_control(ui, "Print C/M/Y order", &mut self.print_channel_swap)
+                })
+                .inner;
+            if film_changed || print_changed {
+                self.request_render();
+            }
+        });
+
         // ── Color management ────────────────────────────────────────────
         egui::CollapsingHeader::new("Color management")
             .default_open(false)
@@ -1852,6 +1933,9 @@ impl App {
                             changed |= ui.selectable_value(in_algo, opt.to_string(), opt).changed();
                         }
                     });
+                changed |= ui.checkbox(&mut self.params.io.input_gamut_compress.active, "Enable input gamut compression").changed();
+                changed |= nonnegative_controls(ui, "Input gamut knee", &mut self.params.io.input_gamut_compress.knee);
+                changed |= nonnegative_controls(ui, "Output gamut knee", &mut self.params.io.output_gamut_compress.knee);
                 // CAT16 (vs CAT02) for the input chromatic adaptation feeding
                 // Hanatos — better blue/violet behavior; matches upstream >=0.3.3.
                 changed |= ui
@@ -2364,22 +2448,29 @@ fn render_pipeline(
     data_dir: &Path,
     film_name: &str,
     print_name: &str,
+    channel_orders: [[usize; 3]; 2],
     params: RuntimeParams,
 ) -> Result<Pipeline, String> {
-    let key = render_pipeline_cache_key(film_name, print_name, &params);
+    let key = render_pipeline_cache_key(film_name, print_name, channel_orders, &params);
     if let Some(cached) = cache.as_ref().filter(|cached| cached.key == key) {
         return Ok(cached.pipeline.clone().with_params(params));
     }
 
-    let film = profile::load_profile_by_name(data_dir, film_name)
+    let mut film = profile::load_profile_by_name(data_dir, film_name)
+        .map_err(|e| format!("film profile '{film_name}': {e}"))?;
+    profile::reorder_channel_density(&mut film, channel_orders[0])
         .map_err(|e| format!("film profile '{film_name}': {e}"))?;
     let effective_print_name = if params.io.scan_film {
         film_name
     } else {
         print_name
     };
-    let print = profile::load_profile_by_name(data_dir, effective_print_name)
+    let mut print = profile::load_profile_by_name(data_dir, effective_print_name)
         .map_err(|e| format!("print profile '{effective_print_name}': {e}"))?;
+    if !params.io.scan_film {
+        profile::reorder_channel_density(&mut print, channel_orders[1])
+            .map_err(|e| format!("print profile '{effective_print_name}': {e}"))?;
+    }
     let pipeline = Pipeline::new_with_spectral(film, print, params, data_dir)
         .map_err(|e| format!("pipeline build: {e}"))?;
     *cache = Some(PipelineCache {
@@ -2389,8 +2480,14 @@ fn render_pipeline(
     Ok(pipeline)
 }
 
-fn render_pipeline_cache_key(film_name: &str, print_name: &str, params: &RuntimeParams) -> String {
+fn render_pipeline_cache_key(
+    film_name: &str,
+    print_name: &str,
+    channel_orders: [[usize; 3]; 2],
+    params: &RuntimeParams,
+) -> String {
     serde_json::json!({
+        "channel_orders": channel_orders,
         "film": film_name,
         "print": print_name,
         "camera_filter_uv": params.camera.filter_uv,
@@ -2611,6 +2708,7 @@ struct ExportImageOptions<'a> {
     saving_color: Option<RasterColor>,
     rotation: u8,
     developed_raw: Option<&'a ImageBuf>,
+    channel_orders: Option<[[usize; 3]; 2]>,
 }
 
 /// Run the f64 CLI against a staged output and publish after it exits
@@ -2678,6 +2776,17 @@ fn run_f64_export(
     if image.rotation != 0 {
         cmd.arg("--rotate-quarter-turns")
             .arg(image.rotation.to_string());
+    }
+    if let Some([film, print]) = image.channel_orders {
+        for (flag, order) in [
+            ("--film-channel-order", film),
+            ("--print-channel-order", print),
+        ] {
+            if order != IDENTITY_CHANNELS {
+                cmd.arg(flag)
+                    .arg(format!("{},{},{}", order[0], order[1], order[2]));
+            }
+        }
     }
     if image.use_params_input_color {
         cmd.arg("--use-params-input-color");
@@ -3088,6 +3197,63 @@ mod preview_tests {
             }
         }
         assert_eq!(app.output_image.as_ref().unwrap().data, image.data);
+    }
+
+    #[test]
+    fn applying_channel_order_rebuilds_cached_print_and_film_profiles() {
+        let app = App::new(Arc::new(CpuBackend), None);
+        let mut cache = None;
+        let mut params = app.params.clone();
+        params.settings.rgb_to_raw_method = "mallett2019".into();
+        let baseline = render_pipeline(
+            &mut cache,
+            &app.data_dir,
+            &app.film_name,
+            &app.print_name,
+            [IDENTITY_CHANNELS; 2],
+            params.clone(),
+        )
+        .unwrap();
+        let orders = [[2, 1, 0], [1, 0, 2]];
+        let changed = render_pipeline(
+            &mut cache,
+            &app.data_dir,
+            &app.film_name,
+            &app.print_name,
+            orders,
+            params,
+        )
+        .unwrap();
+        for ((original, changed), order) in [
+            (&baseline.film, &changed.film),
+            (&baseline.print, &changed.print),
+        ]
+        .into_iter()
+        .zip(orders)
+        {
+            assert!(
+                original
+                    .data
+                    .log_sensitivity
+                    .iter()
+                    .flatten()
+                    .zip(changed.data.log_sensitivity.iter().flatten())
+                    .all(|(before, after)| before.to_bits() == after.to_bits())
+            );
+            for (prior, reordered) in original
+                .data
+                .channel_density
+                .iter()
+                .zip(&changed.data.channel_density)
+            {
+                assert!(
+                    reordered
+                        .iter()
+                        .zip(order)
+                        .all(|(actual, index)| actual.to_bits() == prior[index].to_bits())
+                );
+            }
+        }
     }
 
     fn fixture_path(name: &str) -> TempPath {

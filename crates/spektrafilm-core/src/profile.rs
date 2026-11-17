@@ -362,6 +362,35 @@ impl Profile {
 }
 
 /// Load a profile from a JSON file on disk.
+/// Reorder the profile's spectral dye-density columns without changing its
+/// sensitivity, curve, base-density, or stock calibration data.
+pub fn reorder_channel_density(
+    profile: &mut Profile,
+    order: [usize; 3],
+) -> Result<(), ProfileError> {
+    if order == [0, 1, 2] {
+        return Ok(());
+    }
+    if profile.data.channel_density.is_empty()
+        || !order.iter().all(|&index| index < 3)
+        || !profile
+            .data
+            .channel_density
+            .iter()
+            .all(|row| row.len() == 3)
+    {
+        return Err(ProfileError::Validation(
+            "dye-density channel order requires a three-channel profile and indices in 0..=2"
+                .into(),
+        ));
+    }
+    for row in &mut profile.data.channel_density {
+        let reordered = order.map(|index| row[index]);
+        row.copy_from_slice(&reordered);
+    }
+    Ok(())
+}
+
 pub fn load_profile(path: &Path) -> Result<Profile, ProfileError> {
     let file =
         std::fs::File::open(path).map_err(|e| ProfileError::Io(path.display().to_string(), e))?;

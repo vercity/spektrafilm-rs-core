@@ -162,6 +162,27 @@ fn rotates_raster_samples_before_rendering() {
 }
 
 #[test]
+fn film_channel_order_accepts_python_presets_and_rejects_invalid_indices() {
+    let fixture = ProcessFixture::new();
+    let direct = fixture.process(true, "mallett2019", &[]);
+    assert!(direct.status.success(), "{direct:?}");
+    let baseline = fs::read(fixture.0.join("pixels.bin")).unwrap();
+
+    let changed = fixture.process(true, "mallett2019", &["--film-channel-order", "2,0,1"]);
+    assert!(changed.status.success(), "{changed:?}");
+    assert_ne!(baseline, fs::read(fixture.0.join("pixels.bin")).unwrap());
+
+    for invalid in ["1,2", "0,1,3"] {
+        assert!(
+            !fixture
+                .process(true, "mallett2019", &["--film-channel-order", invalid])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
 fn spectral_initialization_failure_returns_an_error_without_outputs() {
     let fixture = ProcessFixture::new();
     for (method, cause) in [

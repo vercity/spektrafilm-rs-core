@@ -116,6 +116,12 @@ struct ProcessImageOptions {
     rotate_quarter_turns: u8,
     #[arg(long, hide = true, conflicts_with_all = ["raw_white_balance", "raw_lens_correction"])]
     developed_raw: Option<PathBuf>,
+    /// Reorder film dye-density channels as three indices separated by commas.
+    #[arg(long, value_parser = parse_channel_order)]
+    film_channel_order: Option<[usize; 3]>,
+    /// Reorder printing dye-density channels as three indices separated by commas.
+    #[arg(long, value_parser = parse_channel_order)]
+    print_channel_order: Option<[usize; 3]>,
     /// Use the input space and transfer from --params. Develop RAW into that space.
     #[arg(long)]
     use_params_input_color: bool,
@@ -125,6 +131,23 @@ struct ProcessImageOptions {
     /// Apply the saving color space's transfer. Specify false to save linear samples.
     #[arg(long, requires = "save_color_space")]
     save_cctf_encoding: Option<bool>,
+}
+
+fn parse_channel_order(value: &str) -> Result<[usize; 3], String> {
+    let invalid = || "expected three comma-separated indices in 0..=2".to_string();
+    let mut values = value.split(',');
+    let mut order = [0; 3];
+    for slot in &mut order {
+        *slot = values
+            .next()
+            .and_then(|part| part.parse::<usize>().ok())
+            .filter(|&index| index < 3)
+            .ok_or_else(invalid)?;
+    }
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    Ok(order)
 }
 
 #[derive(Args)]
@@ -307,8 +330,11 @@ fn cmd_process(
 
     // Load profiles
     let t = Instant::now();
-    let film = profile::load_profile_by_name(data_dir, film_name)
+    let mut film = profile::load_profile_by_name(data_dir, film_name)
         .with_context(|| format!("loading film profile: {film_name}"))?;
+    if let Some(order) = &image_options.film_channel_order {
+        profile::reorder_channel_density(&mut film, *order)?;
+    }
 
     let print_stock = if params.io.scan_film {
         film_name.to_string()
@@ -322,8 +348,15 @@ fn cmd_process(
         );
     };
 
-    let print = profile::load_profile_by_name(data_dir, &print_stock)
+    let mut print = profile::load_profile_by_name(data_dir, &print_stock)
         .with_context(|| format!("loading print profile: {print_stock}"))?;
+    if let Some(order) = image_options
+        .print_channel_order
+        .as_ref()
+        .filter(|_| !params.io.scan_film)
+    {
+        profile::reorder_channel_density(&mut print, *order)?;
+    }
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
 
     let t = Instant::now();
