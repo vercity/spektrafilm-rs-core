@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+libraw = ["dep:cc", "dep:pkg-config"]
 precision-f64 = ["spektrafilm-math/precision-f64"]
 
 [dependencies]
@@ -20,3 +21,7 @@ rayon.workspace = true
 roxmltree = "0.20"
 spektrafilm-math.workspace = true
 tiff = "0.10"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }

@@ -24,6 +24,9 @@ use spektrafilm_math::{
     precision::{Scalar, from_f32, from_f64},
 };
 
+#[cfg(feature = "libraw")]
+mod libraw;
+
 /// The shared RAW decoder returns linear pixels in ACES AP0.
 pub const INPUT_COLOR_SPACE: &str = "ACES2065-1";
 
@@ -63,6 +66,17 @@ pub fn decode(path: &Path) -> Result<ImageBuf> {
 pub fn decode_with_options(path: &Path, options: DevelopOptions) -> Result<ImageBuf> {
     let white_balance = options.white_balance;
     let adaptation = white_balance.adaptation()?;
+    #[cfg(feature = "libraw")]
+    if let Some(mut image) = libraw::develop(path, matches!(white_balance, WhiteBalance::AsShot))? {
+        if options.lens_correction {
+            let source = RawSource::new(path)
+                .with_context(|| format!("opening RAW image {}", path.display()))?;
+            crate::lens::apply(&source, &mut image)
+                .with_context(|| format!("correcting RAW lens for {}", path.display()))?;
+        }
+        apply_white_balance(&mut image, adaptation);
+        return Ok(image);
+    }
     let source =
         RawSource::new(path).with_context(|| format!("opening RAW image {}", path.display()))?;
     let params = RawDecodeParams::default();
@@ -164,6 +178,11 @@ pub fn decode_with_options(path: &Path, options: DevelopOptions) -> Result<Image
         crate::lens::apply(&source, &mut image)
             .with_context(|| format!("correcting RAW lens for {}", path.display()))?;
     }
+    apply_white_balance(&mut image, adaptation);
+    Ok(image)
+}
+
+fn apply_white_balance(image: &mut ImageBuf, adaptation: Option<[[f64; 3]; 3]>) {
     if let Some(matrix) = adaptation {
         image.data.par_chunks_exact_mut(3).for_each(|rgb| {
             let input = [rgb[0] as f64, rgb[1] as f64, rgb[2] as f64];
@@ -172,7 +191,6 @@ pub fn decode_with_options(path: &Path, options: DevelopOptions) -> Result<Image
             }
         });
     }
-    Ok(image)
 }
 
 impl WhiteBalance {

@@ -9,6 +9,7 @@ name = "spektrafilm-gui"
 path = "src/main.rs"
 
 [features]
+libraw = ["spektrafilm-io/libraw"]
 precision-f64 = [
     "spektrafilm-math/precision-f64",
     "spektrafilm-core/precision-f64",

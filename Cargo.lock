@@ -3850,11 +3850,13 @@ name = "spektrafilm-io"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "cc",
  "chrono",
  "exr",
  "image",
  "lensfun",
  "moxcms",
+ "pkg-config",
  "png",
  "rawler",
  "rayon",

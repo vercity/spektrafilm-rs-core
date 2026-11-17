@@ -50,6 +50,24 @@ Windows builds use the WGSL/wgpu backend by default. The CPU fallback path avoid
 
 WGSL is the default GPU backend and can be selected explicitly with `SPEKTRAFILM_BACKEND=wgpu`. An experimental native CUDA backend can be built with `--features spektrafilm-gpu/cuda-backend` and selected with `SPEKTRAFILM_BACKEND=cuda`. It uses CUDA 12 driver/NVRTC bindings through dynamic loading, so the NVIDIA driver and NVRTC runtime DLLs must be available. Set `SPEKTRAFILM_CUDA_DEVICE=1` (or another zero-based index) to pick a non-default CUDA device. Both GPU paths have a resident preview implementation: front pass, highlight boost, camera diffusion, camera lens blur, halation, DIR couplers, grain, density curves, enlarger diffusion, print/scan spectral reductions, glare, output gamut compression, scanner lens blur, unsharp, and one readback.
 
+### LibRaw decoder
+
+Enable the `libraw` feature to use LibRaw 0.22 or later for RAW development.
+This uses the Python app's 16-bit linear ACES settings for demosaicing and
+highlights. Files unsupported by LibRaw can still use the built-in decoder.
+
+With LibRaw headers and libraries available to `pkg-config`:
+
+```bash
+cargo build --release -p spektrafilm-cli --bin spektrafilm-f64 --features libraw,precision-f64
+cargo build --release -p spektrafilm-gui --features libraw
+```
+
+For a custom installation, specify the include and library directories with
+`SPEKTRAFILM_LIBRAW_INCLUDE_DIR` and `SPEKTRAFILM_LIBRAW_LIBRARY_DIR`.
+Use `SPEKTRAFILM_LIBRAW_LIBRARY_NAME` if the library's link name differs
+from `raw_r`. The dynamic library must be available at runtime.
+
 ## Usage
 
 ### GUI
