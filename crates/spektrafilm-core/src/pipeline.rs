@@ -14,7 +14,7 @@ use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::spectral::TcLut;
 
 mod lut;
-pub use lut::{FilmCmy, LutPipeline, LutSampleError};
+pub use lut::{FilmCmy, FilmLogExposure, LutPipeline, LutSampleError, PrintLogExposure};
 
 fn stage_timings_enabled() -> bool {
     std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some()

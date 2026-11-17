@@ -10,7 +10,7 @@ use crate::params::RuntimeParams;
 use crate::profile::Profile;
 use crate::stages::{filming, printing, scanning};
 
-/// Invalid input buffer or a non-finite result from a LUT stage.
+/// Invalid samples, non-finite results, or a stage unavailable in this pipeline.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LutSampleError {
     #[error("expected a non-empty {width}×{height}×3 sample buffer, got {samples} values")]
@@ -21,6 +21,8 @@ pub enum LutSampleError {
     },
     #[error("non-finite LUT sample at channel index {0}")]
     NonFiniteSample(usize),
+    #[error("direct film scanning has no print exposure stage")]
+    NoPrintStage,
 }
 
 fn validate_samples(image: &ImageBuf) -> Result<(), LutSampleError> {
@@ -51,6 +53,36 @@ impl FilmCmy {
     pub fn new(density: ImageBuf) -> Result<Self, LutSampleError> {
         validate_samples(&density)?;
         Ok(Self(density))
+    }
+
+    pub fn as_image(&self) -> &ImageBuf {
+        &self.0
+    }
+}
+
+/// Camera exposure in log10 units at the `log_e_film` boundary.
+#[derive(Clone, Debug)]
+pub struct FilmLogExposure(ImageBuf);
+
+impl FilmLogExposure {
+    pub fn new(exposure: ImageBuf) -> Result<Self, LutSampleError> {
+        validate_samples(&exposure)?;
+        Ok(Self(exposure))
+    }
+
+    pub fn as_image(&self) -> &ImageBuf {
+        &self.0
+    }
+}
+
+/// Calibrated print exposure in log10 units at the `log_e_print` boundary.
+#[derive(Clone, Debug)]
+pub struct PrintLogExposure(ImageBuf);
+
+impl PrintLogExposure {
+    pub fn new(exposure: ImageBuf) -> Result<Self, LutSampleError> {
+        validate_samples(&exposure)?;
+        Ok(Self(exposure))
     }
 
     pub fn as_image(&self) -> &ImageBuf {
@@ -100,11 +132,14 @@ impl LutPipeline {
         Pipeline::new_with_spectral(film, print, params, data_dir).map(Self)
     }
 
-    /// Collect `cmy_film` from `rgb_in`, before exposing the print.
-    pub fn collect_film_cmy(&self, rgb: &ImageBuf) -> Result<FilmCmy, LutSampleError> {
+    /// Collect `log_e_film` from `rgb_in`.
+    pub fn collect_film_log_exposure(
+        &self,
+        rgb: &ImageBuf,
+    ) -> Result<FilmLogExposure, LutSampleError> {
         validate_samples(rgb)?;
         let pipeline = &self.0;
-        let log_raw = filming::expose(
+        FilmLogExposure::new(filming::expose(
             rgb,
             &pipeline.film,
             &pipeline.params,
@@ -113,50 +148,93 @@ impl LutPipeline {
             pipeline.mallett_core.as_ref(),
             filming::select_illuminant(&pipeline.front_illuminant),
             1.0,
-        );
+        ))
+    }
+
+    /// Inject `log_e_film` and collect `cmy_film`.
+    pub fn develop_film_log_exposure(
+        &self,
+        exposure: &FilmLogExposure,
+    ) -> Result<FilmCmy, LutSampleError> {
+        let pipeline = &self.0;
         FilmCmy::new(filming::develop(
-            &log_raw,
+            exposure.as_image(),
             &pipeline.film,
             &pipeline.params,
             &CpuBackend,
         ))
     }
 
+    /// Collect `cmy_film` from `rgb_in`, before exposing the print.
+    pub fn collect_film_cmy(&self, rgb: &ImageBuf) -> Result<FilmCmy, LutSampleError> {
+        self.develop_film_log_exposure(&self.collect_film_log_exposure(rgb)?)
+    }
+
+    /// Inject `cmy_film` and collect the calibrated `log_e_print` for the selected paper.
+    pub fn collect_print_log_exposure(
+        &self,
+        cmy: &FilmCmy,
+    ) -> Result<PrintLogExposure, LutSampleError> {
+        let pipeline = &self.0;
+        if pipeline.params.io.scan_film {
+            return Err(LutSampleError::NoPrintStage);
+        }
+        PrintLogExposure::new(printing::expose_calibrated(
+            cmy.as_image(),
+            &pipeline.film,
+            &pipeline.print,
+            &pipeline.params,
+            &CpuBackend,
+            pipeline.print_illuminant_slice(),
+            pipeline.print_exposure_factor(),
+            pipeline.preflash_raw(),
+            1.0,
+        ))
+    }
+
+    /// Inject `log_e_print`, develop the paper and collect `rgb_out` with no file clipping.
+    pub fn inject_print_log_exposure(
+        &self,
+        exposure: &PrintLogExposure,
+    ) -> Result<ImageBuf, LutSampleError> {
+        let pipeline = &self.0;
+        if pipeline.params.io.scan_film {
+            return Err(LutSampleError::NoPrintStage);
+        }
+        let print_cmy = printing::develop(
+            exposure.as_image(),
+            &pipeline.print,
+            &pipeline.params,
+            &CpuBackend,
+        );
+        self.scan(&print_cmy, &pipeline.print)
+    }
+
     /// Inject physical `cmy_film` and collect `rgb_out` with no file clipping.
     pub fn inject_film_cmy(&self, cmy: &FilmCmy) -> Result<ImageBuf, LutSampleError> {
+        if self.0.params.io.scan_film {
+            return self.scan(cmy.as_image(), &self.0.film);
+        }
+        let exposure = self.collect_print_log_exposure(cmy)?;
+        crate::stages::dump_if_env("SPEKTRAFILM_DUMP_PRINT_LOG_RAW", exposure.as_image());
+        self.inject_print_log_exposure(&exposure)
+    }
+
+    fn scan(&self, density: &ImageBuf, profile: &Profile) -> Result<ImageBuf, LutSampleError> {
         let pipeline = &self.0;
-        let color_ref = ColorReference::identity();
-        let scan = |density, profile| {
-            scanning::process(
-                density,
-                profile,
-                &pipeline.params,
-                &CpuBackend,
-                &color_ref,
-                &pipeline.output_gamut,
-            )
-        };
-        let rgb = if pipeline.params.io.scan_film {
-            scan(cmy.as_image(), &pipeline.film)
-        } else {
-            let paper_cmy = printing::process_with_calibration(
-                cmy.as_image(),
-                &pipeline.film,
-                &pipeline.print,
-                &pipeline.params,
-                &CpuBackend,
-                pipeline.print_illuminant_slice(),
-                pipeline.print_exposure_factor(),
-                pipeline.preflash_raw(),
-                color_ref.printing_exposure_correction,
-            );
-            scan(&paper_cmy, &pipeline.print)
-        };
+        let rgb = scanning::process(
+            density,
+            profile,
+            &pipeline.params,
+            &CpuBackend,
+            &ColorReference::identity(),
+            &pipeline.output_gamut,
+        );
         validate_samples(&rgb)?;
         Ok(rgb)
     }
 
-    /// Run the same two stages as one RGB-to-RGB transform.
+    /// Compose the stages into one RGB-to-RGB transform.
     pub fn process(&self, rgb: &ImageBuf) -> Result<ImageBuf, LutSampleError> {
         self.inject_film_cmy(&self.collect_film_cmy(rgb)?)
     }
@@ -190,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn two_lut_stages_are_pointwise_and_match_python() {
+    fn lut_stages_are_pointwise_and_match_python() {
         let data_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
         let film = load_profile_by_name(&data_dir, "kodak_portra_400").unwrap();
         let mut params = RuntimeParams::default();
@@ -227,7 +305,28 @@ mod tests {
 
         // Physical stages from the local Python 0.3.4 fixture with
         // debug.lut_mode, pointwise DIR and no input/output CCTF.
-        let cmy = primary.collect_film_cmy(&rgb).unwrap();
+        let film_log_e = primary.collect_film_log_exposure(&rgb).unwrap();
+        compare_samples(
+            film_log_e.as_image(),
+            [
+                [0.013730455967, 0.003554345656, -0.029008360180],
+                [0.501828432626, -0.174612239179, -0.643336676285],
+                [-0.338661364457, 0.189841357734, 0.366778921100],
+                [0.863788534843, 0.698565498239, 0.434009285209],
+                [-10.0, -10.0, -10.0],
+                [0.028072568863, 0.460930279541, 0.547258572933],
+            ],
+            "film log exposure",
+        );
+        assert_eq!(
+            film_log_e.as_image().data,
+            alternate
+                .collect_film_log_exposure(&rgb)
+                .unwrap()
+                .as_image()
+                .data
+        );
+        let cmy = primary.develop_film_log_exposure(&film_log_e).unwrap();
         assert_eq!(
             (cmy.as_image().width, cmy.as_image().height),
             (rgb.width, rgb.height)
@@ -249,8 +348,36 @@ mod tests {
             alternate.collect_film_cmy(&rgb).unwrap().as_image().data
         );
 
-        let primary_rgb = primary.inject_film_cmy(&cmy).unwrap();
-        let alternate_rgb = alternate.inject_film_cmy(&cmy).unwrap();
+        let primary_log_e = primary.collect_print_log_exposure(&cmy).unwrap();
+        let alternate_log_e = alternate.collect_print_log_exposure(&cmy).unwrap();
+        compare_samples(
+            primary_log_e.as_image(),
+            [
+                [0.154903809324, 0.155087081343, 0.181728474736],
+                [-0.056072948799, 0.321488781332, 0.667568556169],
+                [0.368237850742, 0.026401289295, -0.034092344230],
+                [-0.127852703836, -0.071806113407, 0.077678535860],
+                [0.822550198021, 0.870996773288, 0.893298216303],
+                [0.191366703644, -0.062528009081, -0.065967606365],
+            ],
+            "Portra Endura log exposure",
+        );
+        compare_samples(
+            alternate_log_e.as_image(),
+            [
+                [0.142695647717, 0.037253102327, 0.013588939575],
+                [-0.203177092874, 0.217126963281, 0.614684556034],
+                [0.430447506067, -0.123114813978, -0.299602507471],
+                [-0.286279563183, -0.275467277565, -0.115274536836],
+                [0.935675261285, 0.821406544111, 0.835568173739],
+                [0.205555749649, -0.251112832955, -0.346017894385],
+            ],
+            "2393 log exposure",
+        );
+        let primary_rgb = primary.inject_print_log_exposure(&primary_log_e).unwrap();
+        let alternate_rgb = alternate
+            .inject_print_log_exposure(&alternate_log_e)
+            .unwrap();
         compare_samples(
             &primary_rgb,
             [
@@ -274,6 +401,14 @@ mod tests {
                 [0.043470105791, 0.325583553368, 0.388335009430],
             ],
             "2393 RGB",
+        );
+        assert_eq!(
+            cmy.as_image().data,
+            primary.collect_film_cmy(&rgb).unwrap().as_image().data
+        );
+        assert_eq!(
+            primary.inject_film_cmy(&cmy).unwrap().data,
+            primary_rgb.data
         );
         assert_eq!(primary.process(&rgb).unwrap().data, primary_rgb.data);
         assert_eq!(
@@ -312,6 +447,64 @@ mod tests {
             [[0.002972186270, 0.003843016747, 0.005848866145]],
             "signed CMY headroom",
         );
+        compare_samples(
+            primary
+                .collect_print_log_exposure(&signed)
+                .unwrap()
+                .as_image(),
+            [[1.032195331876, 0.922516931547, 0.684925430339]],
+            "signed CMY to print log exposure",
+        );
+        let exposure =
+            PrintLogExposure::new(image(2, 1, [[-1.25, -0.5, 0.125], [-0.25, 0.125, 0.5]]))
+                .unwrap();
+        compare_samples(
+            &primary.inject_print_log_exposure(&exposure).unwrap(),
+            [
+                [0.831551173030, 0.615408038192, 0.092841287700],
+                [0.436466211118, 0.104979488138, 0.014201160539],
+            ],
+            "signed print log exposure to RGB",
+        );
+    }
+
+    #[test]
+    fn direct_film_scan_has_film_stages_only() {
+        let data_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let film = load_profile_by_name(&data_dir, "fujifilm_velvia_100").unwrap();
+        let mut params = RuntimeParams::default();
+        params.io.input_color_space = "sRGB".into();
+        params.io.output_cctf_encoding = false;
+        params.io.scan_film = true;
+        let pipeline = LutPipeline::new(film.clone(), film, params, &data_dir).unwrap();
+        let input = image(2, 1, [[0.1875; 3], [0.75, 0.125, 0.015625]]);
+        let film_log_e = pipeline.collect_film_log_exposure(&input).unwrap();
+        compare_samples(
+            film_log_e.as_image(),
+            [
+                [0.018387797569, 0.007025824172, 0.002523777667],
+                [0.532237576840, -0.054943502551, -0.598520510517],
+            ],
+            "Velvia film log exposure",
+        );
+        let cmy = pipeline.develop_film_log_exposure(&film_log_e).unwrap();
+        compare_samples(
+            &pipeline.inject_film_cmy(&cmy).unwrap(),
+            [
+                [0.195181017200, 0.186054908116, 0.187937771010],
+                [0.551674792953, 0.156071380553, 0.012955102840],
+            ],
+            "Velvia scan RGB",
+        );
+        assert_eq!(
+            pipeline.collect_print_log_exposure(&cmy).unwrap_err(),
+            LutSampleError::NoPrintStage
+        );
+        let exposure = PrintLogExposure::new(image(1, 1, [[-0.5; 3]])).unwrap();
+        assert_eq!(
+            pipeline.inject_print_log_exposure(&exposure).unwrap_err(),
+            LutSampleError::NoPrintStage
+        );
     }
 
     #[test]
@@ -333,7 +526,15 @@ mod tests {
         }
         let density = image(1, 1, [[0.0, f64::NAN, 1.0]]);
         assert_eq!(
-            FilmCmy::new(density).unwrap_err(),
+            FilmCmy::new(density.clone()).unwrap_err(),
+            LutSampleError::NonFiniteSample(1)
+        );
+        assert_eq!(
+            FilmLogExposure::new(density.clone()).unwrap_err(),
+            LutSampleError::NonFiniteSample(1)
+        );
+        assert_eq!(
+            PrintLogExposure::new(density).unwrap_err(),
             LutSampleError::NonFiniteSample(1)
         );
     }

@@ -14,6 +14,8 @@ use spektrafilm_io::{
 };
 use spektrafilm_math::image::ImageBuf;
 
+mod lut_bundle;
+
 #[derive(Parser)]
 #[command(
     name = "spektrafilm",
@@ -98,6 +100,8 @@ enum Commands {
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
     },
+    /// Export a film and one or more papers as a CUBE LUT bundle.
+    ExportLutBundle(lut_bundle::BundleOptions),
 }
 
 #[derive(Args)]
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
         Commands::ListProfiles { data_dir } => {
             cmd_list_profiles(&data_dir);
         }
+        Commands::ExportLutBundle(options) => lut_bundle::export(options)?,
         Commands::ExportLut {
             film,
             paper,

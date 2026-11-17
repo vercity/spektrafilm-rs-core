@@ -110,6 +110,27 @@ grain, and other effects that depend on neighboring pixels or the full frame.
     --film kodak_gold_200 --paper kodak_portra_endura --size 33 -o gold.cube
 ```
 
+Use `export-lut-bundle` to share the film stages across several papers.
+`--topology` selects `1lut`, `2lut`, `3lut`, or `4lut`. The new directory
+contains the CUBEs, a `bundle.json` recording their order and numeric ranges,
+and the license. The bundle defaults to the Python `auto` input headroom.
+Select `--stops-above-midgray native` for unit input gain or pass a stop count.
+
+```bash
+./target/release/spektrafilm-f64 export-lut-bundle \
+    --film kodak_ektar_100 --paper kodak_ultra_endura --paper kodak_portra_endura \
+    --topology 2lut --size 33 --input-encoding srgb --output-encoding srgb \
+    --qa --ocio-config --zip ektar.zip -o ektar
+```
+
+`--qa` reports trilinear and tetrahedral errors for the written CUBE chain
+and for a single CUBE resampled from that chain. `--combinations` also bakes
+contiguous stage combinations. Use `--format 3dl` or `--format hald-png` for
+sidecar files.
+Hald PNG requires a square-number cube size, such as 36.
+`--target lumix_realtime_vlog` uses the Lumix CUBE header with V-Log input
+and a 1-LUT bundle.
+
 `process --params` controls the color space and decoding for untagged TIFFs.
 Recognized file tags supply the input color space and transfer function.
 Untagged PNG and JPEG use encoded sRGB. Untagged EXR uses linear sRGB.

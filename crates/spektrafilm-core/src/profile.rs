@@ -3,6 +3,7 @@
 /// Mirrors Python `profiles/io.py`. Profiles contain spectral sensitivity data,
 /// density curves, and metadata for each film stock and paper type.
 use serde::Deserialize;
+use spektrafilm_math::spectral::N_WAVELENGTHS;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -485,33 +486,66 @@ fn validate_profile(profile: &Profile) -> Result<(), ProfileError> {
             "density_curves length must match log_exposure length".into(),
         ));
     }
-    if profile.is_bw() {
-        // B&W: one sensitivity/dye channel; density-curve columns index the
-        // development-time family (validated against its length when present).
-        if data.log_sensitivity.iter().any(|r| r.len() != 1) {
-            return Err(ProfileError::Validation(
-                "bw profile log_sensitivity must have exactly 1 channel".into(),
-            ));
+    // Rendering indexes the shared 81-band illuminants and observer tables.
+    // Missing wavelength labels, base+fog and neutral metadata are allowed.
+    for (field, rows) in [
+        ("log_sensitivity", data.log_sensitivity.len()),
+        ("channel_density", data.channel_density.len()),
+    ] {
+        if rows != N_WAVELENGTHS {
+            return Err(ProfileError::Validation(format!(
+                "{field} must have {N_WAVELENGTHS} wavelength rows, found {rows}"
+            )));
         }
-        if data.channel_density.iter().any(|r| r.len() != 1) {
-            return Err(ProfileError::Validation(
-                "bw profile channel_density must have exactly 1 channel".into(),
-            ));
+    }
+    for (field, rows) in [
+        ("wavelengths", data.wavelengths.len()),
+        ("base_density", data.base_density_rows.len()),
+        (
+            "midscale_neutral_density",
+            data.midscale_neutral_density.len(),
+        ),
+    ] {
+        if rows != 0 && rows != N_WAVELENGTHS {
+            return Err(ProfileError::Validation(format!(
+                "{field} must have {N_WAVELENGTHS} entries when provided, found {rows}"
+            )));
         }
-        let n_times = data.development_time.len().max(1);
-        if data.density_curves.iter().any(|r| r.len() != n_times) {
-            return Err(ProfileError::Validation(
-                "bw profile density_curves columns must match development_time length".into(),
-            ));
+    }
+    let n_channels = if profile.is_bw() { 1 } else { 3 };
+    // Density curves for B&W index the development-time family.
+    let curve_columns = if profile.is_bw() {
+        data.development_time.len().max(1)
+    } else {
+        n_channels
+    };
+    for (field, rows, columns) in [
+        ("log_sensitivity", &data.log_sensitivity, n_channels),
+        ("channel_density", &data.channel_density, n_channels),
+        ("density_curves", &data.density_curves, curve_columns),
+    ] {
+        if let Some((row, values)) = rows.iter().enumerate().find(|(_, v)| v.len() != columns) {
+            return Err(ProfileError::Validation(format!(
+                "{field} row {} must have {columns} columns, found {}",
+                row + 1,
+                values.len()
+            )));
         }
-        if data
-            .base_density_rows
-            .iter()
-            .any(|r| r.len() != 1 && r.len() != n_times)
-        {
-            return Err(ProfileError::Validation(
-                "bw profile base_density columns must be 1 or match development_time".into(),
-            ));
+    }
+
+    let base_columns = if profile.is_bw() { curve_columns } else { 1 };
+    for (row, values) in data.base_density_rows.iter().enumerate() {
+        if values.len() != 1 && values.len() != base_columns {
+            let expected = if base_columns == 1 {
+                "1 column".to_string()
+            } else {
+                format!("1 or {base_columns} columns")
+            };
+            return Err(ProfileError::Validation(format!(
+                "base_density row {} must have {expected}, found {}",
+                row + 1,
+                values.len()
+            )));
         }
     }
     Ok(())
@@ -552,6 +586,65 @@ mod tests {
             return None;
         }
         Some(load_profile(&path).unwrap())
+    }
+
+    #[test]
+    fn rejects_incompatible_profile_axes_and_channel_rows() {
+        let Some(color) = data_profile("kodak_portra_400") else {
+            return;
+        };
+        let mut profile = color.clone();
+        profile.data.log_sensitivity.pop();
+        assert_eq!(
+            validate_profile(&profile).unwrap_err().to_string(),
+            "invalid profile: log_sensitivity must have 81 wavelength rows, found 80"
+        );
+
+        let mut profile = color.clone();
+        profile.data.channel_density[6].pop();
+        assert_eq!(
+            validate_profile(&profile).unwrap_err().to_string(),
+            "invalid profile: channel_density row 7 must have 3 columns, found 2"
+        );
+
+        let mut profile = color.clone();
+        profile.data.density_curves[0].push(0.0);
+        assert_eq!(
+            validate_profile(&profile).unwrap_err().to_string(),
+            "invalid profile: density_curves row 1 must have 3 columns, found 4"
+        );
+
+        let mut profile = color.clone();
+        profile.data.base_density_rows[0].push(0.0);
+        assert_eq!(
+            validate_profile(&profile).unwrap_err().to_string(),
+            "invalid profile: base_density row 1 must have 1 column, found 2"
+        );
+
+        let mut profile = color;
+        profile.data.wavelengths.remove(0);
+        assert_eq!(
+            validate_profile(&profile).unwrap_err().to_string(),
+            "invalid profile: wavelengths must have 81 entries when provided, found 80"
+        );
+        profile.data.wavelengths.clear();
+        profile.data.base_density_rows.clear();
+        profile.data.midscale_neutral_density.clear();
+        assert!(validate_profile(&profile).is_ok());
+    }
+
+    #[test]
+    fn shipped_profiles_have_compatible_shapes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/profiles");
+        let mut count = 0;
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                load_profile(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                count += 1;
+            }
+        }
+        assert!(count > 0, "no bundled profiles found");
     }
 
     /// B&W profiles carry whole-field nulls, single-channel arrays, and a

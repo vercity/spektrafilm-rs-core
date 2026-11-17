@@ -194,6 +194,49 @@ struct ProfileEntry {
     display: String,
 }
 
+struct OutputDepths {
+    tiff: u8,
+    exr: u8,
+    png: u8,
+}
+
+impl Default for OutputDepths {
+    fn default() -> Self {
+        Self {
+            tiff: 16,
+            exr: 16,
+            png: 8,
+        }
+    }
+}
+
+impl OutputDepths {
+    fn for_path(&self, path: &Path) -> Option<u8> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        match extension.as_str() {
+            "tif" | "tiff" => Some(self.tiff),
+            "exr" => Some(self.exr),
+            "png" => Some(self.png),
+            _ => None,
+        }
+    }
+}
+
+fn depth_control(ui: &mut egui::Ui, label: &str, current: &mut u8, choices: &[u8]) {
+    egui::ComboBox::from_label(label)
+        .selected_text(format!("{current} bit"))
+        .show_ui(ui, |ui| {
+            for &depth in choices {
+                ui.selectable_value(current, depth, format!("{depth} bit"));
+            }
+        });
+}
+
+fn has_hanatos_surface(film: &profile::Profile) -> bool {
+    let params = &film.data.hanatos2025_adaptation_surface_params;
+    params.len() == 3 && params.iter().all(|channel| channel.len() == 15)
+}
+
 struct App {
     backend: Arc<dyn ComputeBackend>,
     data_dir: PathBuf,
@@ -208,11 +251,12 @@ struct App {
     /// non-trivial only for B&W stocks. Drives the dev-time pickers.
     film_dev_times: Vec<f64>,
     print_dev_times: Vec<f64>,
+    hanatos_surface_available: bool,
     params: RuntimeParams,
     source: Option<Arc<source_snapshot::SourceSnapshot>>,
     image: Option<Arc<ImageBuf>>,
     source_metadata: RasterMetadata,
-    output_bit_depth: u8,
+    output_depths: OutputDepths,
     /// Saveable output for the current image and settings.
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
@@ -234,6 +278,8 @@ struct App {
     zoom: f32,
     /// Pan offset (screen pixels) added to the preview centre.
     pan: egui::Vec2,
+    gray_canvas: bool,
+    white_border: f32,
     /// macOS-only: tag the wgpu CAMetalLayer's `colorspace` as sRGB on
     /// the first `update()` tick (it's not yet wired up at
     /// `App::new` time). Set to `true` once the call succeeds so we
@@ -357,11 +403,12 @@ impl App {
             print_name,
             film_dev_times,
             print_dev_times,
+            hanatos_surface_available: film_profile.as_ref().is_some_and(has_hanatos_surface),
             params,
             source: None,
             image: None,
             source_metadata: RasterMetadata::default(),
-            output_bit_depth: 16,
+            output_depths: OutputDepths::default(),
             output_image: None,
             output_tex: None,
             pipeline_cache: None,
@@ -375,6 +422,8 @@ impl App {
             render_request: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
+            gray_canvas: false,
+            white_border: 0.0,
             render_job: None,
             status: String::from("Load an image to start."),
             #[cfg(target_os = "macos")]
@@ -544,9 +593,11 @@ impl App {
     fn draw_preview_with_zoom(&mut self, ui: &mut egui::Ui, tex: &egui::TextureHandle) {
         let avail = ui.available_size();
         let img_size = tex.size_vec2();
-        let fit_scale = (avail.x / img_size.x).min(avail.y / img_size.y).min(1.0);
-        let scale = fit_scale * self.zoom;
-        let drawn_size = img_size * scale;
+        let border = (img_size.x.max(img_size.y) * self.white_border).floor();
+        let framed_size = img_size + egui::Vec2::splat(2.0 * border);
+        let fit_scale = (avail.x / framed_size.x)
+            .min(avail.y / framed_size.y)
+            .min(1.0);
 
         let response = ui.allocate_response(avail, egui::Sense::click_and_drag());
         let rect = response.rect;
@@ -596,10 +647,18 @@ impl App {
         }
 
         let centre = rect.center() + self.pan;
-        let draw_rect = egui::Rect::from_center_size(centre, drawn_size);
+        let scale = fit_scale * self.zoom;
+        let draw_rect = egui::Rect::from_center_size(centre, img_size * scale);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         // Clip to the central panel so panned-off pixels don't leak.
         let painter = ui.painter_at(rect);
+        if self.gray_canvas {
+            // 18% scene-linear gray encoded as sRGB.
+            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(118));
+        }
+        if border > 0.0 {
+            painter.rect_filled(draw_rect.expand(border * scale), 0.0, egui::Color32::WHITE);
+        }
         painter.image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
 
         // Zoom indicator + reset chip in the corner.
@@ -719,9 +778,7 @@ impl App {
     }
 
     fn bit_depth_for(&self, path: &Path) -> Option<u8> {
-        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-        (self.output_bit_depth != 16 && matches!(extension.as_str(), "tif" | "tiff" | "exr"))
-            .then_some(self.output_bit_depth)
+        self.output_depths.for_path(path)
     }
 
     /// Export the current frame by subprocessing the f64-built
@@ -752,13 +809,16 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("spektrafilm");
         let default_name = format!("{stem}_{}_spektra_f64.png", self.film_name);
-        let Some(out_path) = rfd::FileDialog::new()
+        let Some(mut out_path) = rfd::FileDialog::new()
             .add_filter("Image", &["png", "tif", "tiff", "exr", "jpg", "jpeg"])
             .set_file_name(&default_name)
             .save_file()
         else {
             return;
         };
+        if out_path.extension().is_none() {
+            out_path.set_extension("png");
+        }
         self.start_f64_export(ctx, source, cli_path, out_path);
     }
 
@@ -971,6 +1031,7 @@ impl App {
                     profile_combo(ui, "film", "Film stock", &self.films, &mut self.film_name);
                 if film_changed {
                     self.film_dev_times = Vec::new();
+                    self.hanatos_surface_available = false;
                     self.params.film_render.development_time = None;
                     if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name)
                     {
@@ -981,6 +1042,7 @@ impl App {
                         // a paperless slide, a failed) render.
                         self.params.io.scan_film = film.is_positive();
                         self.film_dev_times = film.data.development_time.clone();
+                        self.hanatos_surface_available = has_hanatos_surface(&film);
                         if let Some(target) = film.info.target_print.as_deref()
                             && self.papers.iter().any(|p| p.stock == target)
                             && self.print_name != target
@@ -991,6 +1053,8 @@ impl App {
                             self.params.print_render.development_time = None;
                         }
                     }
+                    self.params.settings.apply_hanatos2025_adaptation_surface &=
+                        self.hanatos_surface_available;
                     self.request_render();
                 }
                 // B&W stocks are profiled at several development times —
@@ -1412,6 +1476,36 @@ impl App {
                             changed |= ui.selectable_value(method, opt.to_string(), opt).changed();
                         }
                     });
+                if method == "hanatos2025" {
+                    let settings = &mut self.params.settings;
+                    changed |= ui
+                        .checkbox(
+                            &mut settings.apply_hanatos2025_adaptation_window,
+                            "Hanatos adaptation window",
+                        )
+                        .changed();
+                    changed |= ui
+                        .add_enabled(
+                            self.hanatos_surface_available,
+                            egui::Checkbox::new(
+                                &mut settings.apply_hanatos2025_adaptation_surface,
+                                "Hanatos adaptation surface",
+                            ),
+                        )
+                        .on_disabled_hover_text("This film profile has no adaptation surface.")
+                        .changed();
+                    ui.horizontal(|ui| {
+                        ui.label("Spectral blur");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut settings.spectral_gaussian_blur)
+                                    .speed(0.1)
+                                    .range(0.0..=spektrafilm_math::spectral::N_WAVELENGTHS as f64),
+                            )
+                            .on_hover_text("Gaussian sigma in wavelength sample intervals.")
+                            .changed();
+                    });
+                }
                 if changed {
                     self.request_render();
                 }
@@ -1423,6 +1517,15 @@ impl App {
             .show(ui, |ui| {
                 let e = &mut self.params.enlarger;
                 let mut changed = false;
+                egui::ComboBox::from_label("Print illuminant")
+                    .selected_text(&e.illuminant)
+                    .show_ui(ui, |ui| {
+                        for name in ["TH-KG3", "TH-KG3-L", "D50", "D55", "D65"] {
+                            changed |= ui
+                                .selectable_value(&mut e.illuminant, name.into(), name)
+                                .changed();
+                        }
+                    });
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut e.print_exposure, 0.1..=5.0)
@@ -1475,24 +1578,14 @@ impl App {
         egui::CollapsingHeader::new("Output")
             .default_open(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("TIFF / EXR bit depth");
-                    egui::ComboBox::from_id_salt("output_bit_depth")
-                        .selected_text(format!("{} bit", self.output_bit_depth))
-                        .show_ui(ui, |ui| {
-                            for depth in [8, 16, 32] {
-                                ui.selectable_value(
-                                    &mut self.output_bit_depth,
-                                    depth,
-                                    format!("{depth} bit"),
-                                );
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "TIFF supports 8, 16 and 32 bits. EXR supports 16 and 32 bits.",
-                        );
-                });
+                depth_control(
+                    ui,
+                    "TIFF bit depth",
+                    &mut self.output_depths.tiff,
+                    &[8, 16, 32],
+                );
+                depth_control(ui, "EXR bit depth", &mut self.output_depths.exr, &[16, 32]);
+                depth_control(ui, "PNG bit depth", &mut self.output_depths.png, &[8, 16]);
                 let io = &mut self.params.io;
                 let mut changed = false;
                 let mut scan_film = io.scan_film;
@@ -1547,6 +1640,12 @@ impl App {
                     self.request_render();
                 }
             });
+
+        egui::CollapsingHeader::new("Preview display").show(ui, |ui| {
+            ui.checkbox(&mut self.gray_canvas, "18% gray canvas");
+            ui.add(egui::Slider::new(&mut self.white_border, 0.0..=1.0).text("White border"))
+                .on_hover_text("Displayed border width as a fraction of the image long edge.");
+        });
 
         // ── Metrics ─────────────────────────────────────────────────────
         ui.add_space(10.0);
@@ -2446,6 +2545,35 @@ fn tag_metal_layer_srgb<H: raw_window_handle::HasWindowHandle>(h: &H) -> Result<
 mod preview_tests {
     use super::*;
     use spektrafilm_gpu::cpu_backend::CpuBackend;
+
+    #[test]
+    fn output_depths_are_independent_for_each_format() {
+        let depths = OutputDepths {
+            tiff: 8,
+            exr: 32,
+            png: 16,
+        };
+        for (filename, expected) in [
+            ("scan.TIFF", Some(8)),
+            ("scan.exr", Some(32)),
+            ("scan.png", Some(16)),
+            ("scan.jpg", None),
+        ] {
+            assert_eq!(depths.for_path(Path::new(filename)), expected);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("preview.png");
+        write_preview_output(
+            &png,
+            &ImageBuf::new(1, 1),
+            &RasterWriteOptions {
+                bit_depth: depths.for_path(&png),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(png).unwrap()[24], 16);
+    }
 
     fn fixture_path(name: &str) -> TempPath {
         let stamp = std::time::SystemTime::now()

@@ -222,8 +222,8 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 ### P1 先让 2-LUT 可构建、可复跑
 
 1. **建立可注入和收集的确定性阶段接口（已完成）。** Python 可通过 `SimulationPipeline.process(inject=…, collect=…)` 运行子链。Rust 复用曝光／显影、印相、扫描和完整光谱标定，公开 `rgb_in → cmy_film` 与 `cmy_film → rgb_out`。实现与验证见本节下方。
-2. **把传递函数与曝光作为包契约。** 现有 Rust `export-lut` 为一张相纸生成一个 SDR sRGB CUBE，输入支持线性 ProPhoto、sRGB 和 V-Log。实测 `--topology 2lut` 返回参数错误。新包显式保存 `native` 和 Python `auto` 的有效曝光、输入／输出原色和传递函数。输入增益在解码之后，且中间值范围的探针和实际烘焙用相同增益。Python 的 sRGB `auto` 为中灰以上 4 档、增益 2.88，V-Log 原生约 8 档、增益约 1。Ektar 100／Ultra Endura 的 17³ sRGB 单 CUBE 对照 Python `auto`，最大代码值差为 `0.44246`，两边改用原生曝光后为 `6.73e-5`。旧单 CUBE 的原生默认应保持可用。出处见 [现有单 CUBE](../crates/spektrafilm-cli/src/main.rs#L414) 及 Python `spektrafilm_lut_creator/color_spaces.py:560,611`、`builders.py:879`。
-3. **交付一卷胶片、两张相纸的 CUBE 目录。** 2-LUT 是一个共享胶片 CUBE 加每张相纸各一个 CUBE。按 Python 以 9³ 编码采样探测胶片 CMY 上界，解码后施加增益并转 float32，三通道 `d_min=-0.2`，`d_max` 取观测峰值×1.05 后向上取四位小数。记录 schema v1 `bundle.json` 的版本、片纸、有效配置、传递函数、中间值范围和每个 LUT 的角色／路径／范围，附 README 和许可证。验收三个 CUBE 的计数、红轴最快的网格、两张相纸输出有区分、同一胶片段实际共享、文件读回复合与 Python 同设定链的对照。首个画质用例可用 Ektar 100／Ultra Endura、33³ sRGB→sRGB、`auto`，上游实际链的三线性 ΔE00 P99／最大值为 `0.267／0.863`，四面体为 `0.264／0.837`。出处见 Python `spektrafilm_lut_creator/builders.py:443,797`、`wires.py` 和 `metadata.py:102,137,176`。
+2. **把传递函数与曝光作为包契约（已完成）。** 新的 `export-lut-bundle` 默认采用 Python `auto`，也接受 `native` 或数值档位。输入增益施加于解码之后，范围探头和烘焙共用同一配置。sRGB 的 `auto` 放置 4 档中灰以上空间、增益 2.88，V-Log 原生正好约 8 档、增益约 1。旧 `export-lut` 仍采用原生曝光域。出处见 [包传递函数](../crates/spektrafilm-cli/src/lut_bundle/transport.rs) 及 Python `spektrafilm_lut_creator/color_spaces.py:560,611`、`builders.py:879`。
+3. **交付一卷胶片、两张相纸的 CUBE 目录（已完成）。** 2-LUT 是一个共享胶片 CUBE 加每张相纸各一个 CUBE。按 Python 以 9³ 编码采样探测胶片 CMY 上界，解码后施加增益并转 float32，三通道 `d_min=-0.2`，`d_max` 取观测峰值×1.05 后向上取四位小数。schema v1 `bundle.json` 记录版本、片纸、有效参数、传递函数、中间范围和 LUT 阶段。出处见 [包导出](../crates/spektrafilm-cli/src/lut_bundle.rs) 及 Python `spektrafilm_lut_creator/builders.py:443,797`、`wires.py` 和 `metadata.py:102,137,176`。
 
 #### 2-LUT 阶段接口验收
 
@@ -265,6 +265,32 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 - canonical 包稳定后加 ZIP、组合 LUT、可读 QA 报告和 OCIO。Python 两张相纸开启组合后实测 2／3／4-LUT 共 5／9／17 个 CUBE。OCIO 配置应按 canonical 顺序组合 FileTransform，核验多相纸视图选择和处理器输出。此次只确认上游能生成配置，临时环境缺少 OCIO 绑定。
 - 按真实宿主需求补更多色彩空间、HDR 输出增益和格式。Python 当前 CLI 有 Lumix V-Log 目标，格式模块另有 3DL 和 Hald PNG。当前快照没有 CLF writer，外部输入 log shaper 仍在开发。内部 CMY／log E 的仿射编码已经可用。
 - GUI 次级项包括显示布局、边框、格式相关的位深提示，以及已移植但尚未暴露的 Hanatos 校正／模糊和放大机光源。其余核心工作包括 GPU 常驻的非 sRGB／JzAzBz、散射／分层颗粒对齐、CUDA 硬件、RAW 去马赛克和高光质量，以及自定义 profile 校验。打包回归应覆盖任意工作目录的 GUI 和 f64 子进程。出处见 [发布流程](../.github/workflows/release.yml)。
+
+#### 多段 LUT 与交付验收
+
+分支 `codex/multi-lut-delivery` 基于 `db27caf`，对照下载的 Python 0.3.4（`3bb2c2d`）。`export-lut-bundle` 提供 1／2／3／4-LUT、双相纸共享阶段和可选组合重烘焙。两个新的类型化阶段分别提供胶片／印相 log E，直接扫胶片时可使用胶片段，印相段返回明确错误。f64 对照 Python 的胶片 log E 最大误差为 `4.44e-13`，Portra Endura／2393 的印相 log E 最大误差为 `5.31e-8`／`8.20e-8`。同尺寸下从 log E 分段合成与一次调用逐位一致。出处见 [阶段 API](../crates/spektrafilm-core/src/pipeline/lut.rs) 和 [CLI 使用方式](../README.md#cli)。
+
+| CPU f64 9³ 双相纸用例 | CUBE 个数（含组合） | 对照 Python 最大节点误差 |
+|---|---:|---:|
+| 2-LUT，Ektar 100，sRGB→sRGB | 5 | `1.22e-7` |
+| 3-LUT，Ektar 100，V-Log→Rec.2020 | 9 | `1.35e-7` |
+| 4-LUT，Portra 400，sRGB→sRGB | 17 | `1.12e-7` |
+| 4-LUT，Portra 400，相纸顺序反转（canonical） | 6 | `5.97e-8` |
+
+四组的端点、阶段角色、片纸、有效曝光和范围均与 Python 对照通过。4-LUT 的 `log_e_print` 遵循 Python 首纸范围，Portra Endura 先为 `[-1.0669, 0.9647]`，2393 先为 `[-1.1943, 1.0248]`。前者的可达输入中 2393 有 11 个通道值越过下限，换序后两张纸均在界内。两种顺序另各测了 9³ L3 CMY 全网格。与 Python 对照时，两张纸的越界值均贴在相应边界，每个 CUBE 有 128–322 个通道值贴边。PQ 另测了 3-LUT 的 PQ→PQ 与 4-LUT 的 V-Log→PQ，两者最大节点误差均小于 `1.15e-7`。Rec.709 复用 Rust 的 sRGB 原色矩阵，9³ Rec.709→Rec.709 样本与 Python 的最大编码差为 `2.64e-4`。原有 `export-lut` 用线性 ProPhoto、sRGB 和 V-Log 各生成 17³ 样本，均与改动前逐字节一致。
+
+- **ZIP／OCIO。** ZIP 实测内容与目录原件一致，其中双相纸 2-LUT 含组合、3DL 和 OCIO 时归档为 14 个文件。用 PyOpenColorIO 2.5.0 实测 1／2／3／4-LUT 配置，可调用各片纸及 CMY／log E 中间空间。128 组相同 ACES2065-1 输入经配置转换，与显式转换到源编码后按顺序应用四面体 FileTransform 的结果逐位一致。从独立目录加载解压的 4-LUT 包也能解析相对路径。多段配置沿用 Raw 视图，供宿主在上游选择纸张链。
+- **格式。** 3DL 为 Autodesk 10-bit，Hald PNG 为 8-bit，能由 Python 读回，值与 CUBE 对应量化一致。Lumix 目标为 V-Log 输入的单 LUT，验证了标头顺序和 V-Log→Rec.2020 文件。相机装载待硬件实测。证据见 [交付模块](../crates/spektrafilm-cli/src/lut_bundle/delivery.rs)。
+- **QA。** `--qa` 用原版 PCG64 种子 `20260515` 的 50,000 个样本，报告实际文件逐段插值与同分辨率重采样成单张 LUT 两种误差，均测量三线性和四面体插值。用 Python 写出的两个包和实时模拟结果复算，两种口径的 ΔE00 统计与 Python 的最大差低于 `3e-14`。Rust 实测均为 Ektar／Ultra Endura 33³。SDR 2-LUT 两种口径通过样本目标，V-Log 4-LUT 两种口径均超出 SDR 阈值，包保留以便检查。出处见 [QA](../crates/spektrafilm-cli/src/lut_bundle/qa.rs)。
+
+| Rust QA 样本 | 逐段三线性 P99／最大 | 逐段四面体 P99／最大 | 重采样三线性 P99／最大 | 重采样四面体 P99／最大 |
+|---|---:|---:|---:|---:|
+| sRGB→sRGB 2-LUT | `0.267／0.863` | `0.264／0.837` | `0.450／1.093` | `0.392／0.878` |
+| V-Log→sRGB 4-LUT | `1.189／13.601` | `1.025／15.936` | `1.779／8.496` | `1.377／10.926` |
+
+- **GUI 与 profile。** 分文件格式选择 TIFF 8/16/32、EXR 16/32、PNG 8/16，PNG16 实际写入通过。可选 18% 灰画布和白边只作用于预览。Hanatos 窗口、校正面、波长模糊与放大机光源可直接选用。31 份内置 profile 全部通过波段及通道形状验证，黑白片的多显影时间及可选数据仍受支持。另用临时 macOS `.app` 目录布局从无关工作目录启动无窗口 GUI 测试程序，自动定位资源和相邻 f64 子进程并读回 4×2 TIFF。
+
+默认精度工作区通过 135 项测试，启用 CLI／GUI f64 后通过 138 项。CUDA feature 通过编译检查。非 sRGB／JzAzBz GPU 常驻、散射和分层颗粒、CUDA 硬件以及 RAW 去马赛克与高光质量仍是剩余对齐项。额外相机编码、HLG 和外部 shaper 按目标宿主扩展，QA 的 HTML 图表也仍待移植。
 
 ### 审阅验证范围
 
