@@ -14,7 +14,9 @@ use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::spectral::TcLut;
 
 mod lut;
+mod runtime_taps;
 pub use lut::{FilmCmy, FilmLogExposure, LutPipeline, LutSampleError, PrintLogExposure};
+pub use runtime_taps::{RenderTap, TapError, TappedImage};
 
 fn stage_timings_enabled() -> bool {
     std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some()
@@ -55,7 +57,7 @@ use crate::enlarger;
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
 use crate::spectral_service;
-use crate::stages::{self, dump_if_env, filming::select_illuminant};
+use crate::stages::{self, filming::select_illuminant};
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
     // Monochrome grain is derived from the film, never user-set — clear it
@@ -457,16 +459,7 @@ impl Pipeline {
     pub fn process(&self, image: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
         let stage_timings = stage_timings_enabled();
         let t = Instant::now();
-        // Meter the original frame and keep its physical scale when cropping.
-        let exposure_scale = stages::filming::autoexposure_scale(&image, &self.params);
-        let scale = self.working_scale();
-        let pix_um = self.pixel_size_um(&image) / scale;
-        let image = if self.params.io.crop {
-            crop_working(image, self.params.io.crop_center, self.params.io.crop_size)
-        } else {
-            image
-        };
-        let image = Self::rescale_working(image, scale);
+        let (image, pix_um, exposure_scale) = self.prepare_image(image);
         print_stage_timing(stage_timings, "preprocess", t);
         tracing::info!(backend = backend.name(), "pipeline: start");
 
@@ -474,14 +467,7 @@ impl Pipeline {
         // white/black correction is on for a slide or print scan). Computed
         // up front so both the GPU-resident and per-stage paths share it.
         let t = Instant::now();
-        let color_ref = crate::color_reference::ColorReference::compute_with_preflash(
-            &self.film,
-            &self.print,
-            &self.params,
-            &self.print_illuminant,
-            self.print_exposure_factor,
-            self.preflash_raw,
-        );
+        let color_ref = self.color_reference();
         print_stage_timing(stage_timings, "color_reference", t);
 
         // GPU fast path: dispatch the whole filming→printing→scanning chain
@@ -498,76 +484,14 @@ impl Pipeline {
             return self.finish_resident_scan(out, backend);
         }
 
-        let t = Instant::now();
-        let log_raw = stages::filming::expose_working(
-            &image,
-            &self.film,
-            &self.params,
+        self.process_staged(
+            image,
+            &self.render_taps()[2..],
             backend,
-            self.tc_lut.as_ref(),
-            self.mallett_core.as_ref(),
-            select_illuminant(&self.front_illuminant),
-            color_ref.filming_exposure_correction,
+            &color_ref,
             pix_um,
             exposure_scale,
-        );
-        print_stage_timing(stage_timings, "filming_expose", t);
-        dump_if_env("SPEKTRAFILM_DUMP_FILM_LOG_RAW", &log_raw);
-        let t = Instant::now();
-        let filmed = stages::filming::develop_with_pixel_size(
-            &log_raw,
-            &self.film,
-            &self.params,
-            backend,
-            pix_um,
-        );
-        print_stage_timing(stage_timings, "filming_develop", t);
-        tracing::info!("pipeline: filming complete");
-        dump_if_env("SPEKTRAFILM_DUMP_FILM_DENSITY", &filmed);
-
-        if self.params.io.scan_film {
-            let t = Instant::now();
-            let result = stages::scanning::process(
-                &filmed,
-                &self.film,
-                &self.params,
-                backend,
-                &color_ref,
-                &self.output_gamut,
-            );
-            print_stage_timing(stage_timings, "scanning", t);
-            tracing::info!("pipeline: scanning complete (film scan)");
-            result
-        } else {
-            let t = Instant::now();
-            let printed = stages::printing::process_with_pixel_size(
-                &filmed,
-                &self.film,
-                &self.print,
-                &self.params,
-                backend,
-                &self.print_illuminant,
-                self.print_exposure_factor,
-                self.preflash_raw,
-                color_ref.printing_exposure_correction,
-                pix_um,
-            );
-            print_stage_timing(stage_timings, "printing", t);
-            tracing::info!("pipeline: printing complete");
-            dump_if_env("SPEKTRAFILM_DUMP_PRINT_DENSITY", &printed);
-            let t = Instant::now();
-            let result = stages::scanning::process(
-                &printed,
-                &self.print,
-                &self.params,
-                backend,
-                &color_ref,
-                &self.output_gamut,
-            );
-            print_stage_timing(stage_timings, "scanning", t);
-            tracing::info!("pipeline: scanning complete");
-            result
-        }
+        )
     }
 
     /// Run the GPU-resident path directly on the original image when no crop

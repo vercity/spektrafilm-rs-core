@@ -180,7 +180,7 @@ pub fn expose_calibrated(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn expose_with_pixel_size(
+pub(crate) fn expose_with_pixel_size(
     cmy_film: &ImageBuf,
     film: &Profile,
     print: &Profile,

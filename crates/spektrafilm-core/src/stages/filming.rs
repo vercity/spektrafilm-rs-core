@@ -314,6 +314,13 @@ pub(crate) fn autoexposure_scale(image: &ImageBuf, params: &RuntimeParams) -> f6
     ae_ev.exp2()
 }
 
+pub(crate) fn apply_autoexposure_scale(image: &mut ImageBuf, scale: f64) {
+    if scale != 1.0 {
+        let scale = from_f64(scale);
+        image.data.par_iter_mut().for_each(|value| *value *= scale);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expose_working(
     image: &ImageBuf,
@@ -328,11 +335,7 @@ pub(crate) fn expose_working(
     autoexposure_scale: f64,
 ) -> ImageBuf {
     let mut rgb = image.clone();
-    let ae_scale = from_f64(autoexposure_scale);
-    if autoexposure_scale != 1.0 {
-        rgb.data.par_iter_mut().for_each(|v| *v *= ae_scale);
-    }
-    // Python meters decoded luminance and applies its scale before decoding
+    apply_autoexposure_scale(&mut rgb, autoexposure_scale); // Python meters decoded luminance and applies its scale before decoding
     // the resulting working pixels for exposure.
     decode_input_in_place(&mut rgb, &params.io);
     // Exposure compensation
