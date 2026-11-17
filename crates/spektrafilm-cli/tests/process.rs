@@ -137,6 +137,31 @@ fn manual_input_interpretation_and_saving_transform_are_independent() {
 }
 
 #[test]
+fn rotates_raster_samples_before_rendering() {
+    let fixture = ProcessFixture::new();
+    let path = fixture.0.join("input.png");
+    let image = image::RgbImage::from_fn(3, 2, |x, y| {
+        image::Rgb([(20 + 30 * x + 20 * y) as u8, 111, 70])
+    });
+    image.save(&path).unwrap();
+    let result = fixture.process(true, "mallett2019", &["--rotate-quarter-turns", "1"]);
+    assert!(result.status.success(), "{result:?}");
+    let rotated_output = fs::read(fixture.0.join("pixels.bin")).unwrap();
+    assert_eq!(
+        image::image_dimensions(fixture.0.join("output.png")).unwrap(),
+        (2, 3)
+    );
+
+    image::imageops::rotate90(&image).save(&path).unwrap();
+    let already_rotated = fixture.process(true, "mallett2019", &[]);
+    assert!(already_rotated.status.success(), "{already_rotated:?}");
+    assert_eq!(
+        rotated_output,
+        fs::read(fixture.0.join("pixels.bin")).unwrap()
+    );
+}
+
+#[test]
 fn spectral_initialization_failure_returns_an_error_without_outputs() {
     let fixture = ProcessFixture::new();
     for (method, cause) in [

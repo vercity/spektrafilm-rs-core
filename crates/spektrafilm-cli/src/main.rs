@@ -9,8 +9,11 @@ use spektrafilm_core::pipeline::{LutPipeline, Pipeline};
 use spektrafilm_core::profile;
 use spektrafilm_io::raw;
 use spektrafilm_io::{
-    raster::{ColorTransform, RasterColor, RasterWriteOptions, write_raster},
-    read_image,
+    raster::{
+        ColorTransform, RasterColor, RasterImage, RasterWriteOptions, read_source_metadata,
+        write_raster,
+    },
+    read_developed_raw, read_image,
 };
 use spektrafilm_math::image::ImageBuf;
 
@@ -57,7 +60,7 @@ enum Commands {
         #[command(flatten)]
         raw: RawOptions,
         #[command(flatten)]
-        color: ImageColorOptions,
+        image_options: ProcessImageOptions,
         /// Dump the final pipeline buffer as native-endian f64 (HxWx3, row-major,
         /// channel-interleaved) after pipeline color processing and before file quantization.
         #[arg(long)]
@@ -107,8 +110,13 @@ enum Commands {
 }
 
 #[derive(Args)]
-struct ImageColorOptions {
-    /// Interpret input samples using the color space and transfer supplied in --params.
+struct ProcessImageOptions {
+    /// Clockwise 90° rotations, applied after the file's orientation.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
+    rotate_quarter_turns: u8,
+    #[arg(long, hide = true, conflicts_with_all = ["raw_white_balance", "raw_lens_correction"])]
+    developed_raw: Option<PathBuf>,
+    /// Use the input space and transfer from --params. Develop RAW into that space.
     #[arg(long)]
     use_params_input_color: bool,
     /// Save in a different color space from the simulation output.
@@ -218,7 +226,7 @@ fn main() -> Result<()> {
             timings,
             params: params_file,
             raw,
-            color,
+            image_options,
             raw_out,
             iters,
             data_dir,
@@ -233,7 +241,7 @@ fn main() -> Result<()> {
                 timings,
                 params_file.as_deref(),
                 &raw,
-                &color,
+                &image_options,
                 raw_out.as_deref(),
                 iters,
                 &data_dir,
@@ -276,7 +284,7 @@ fn cmd_process(
     show_timings: bool,
     params_file: Option<&Path>,
     raw_options: &RawOptions,
-    color_options: &ImageColorOptions,
+    image_options: &ProcessImageOptions,
     raw_out: Option<&Path>,
     iters: usize,
     data_dir: &Path,
@@ -315,15 +323,39 @@ fn cmd_process(
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
 
     let t = Instant::now();
-    let loaded = read_image(input, raw_options.decode_options(raw::is_raw(input))?)?;
-    if let Some(color) = loaded
-        .color
-        .filter(|_| !color_options.use_params_input_color)
-    {
-        params.io.input_color_space = color.color_space.into();
-        params.io.input_cctf_decoding = color.cctf_encoding;
+    let is_raw = raw::is_raw(input);
+    let develop_options = raw_options.decode_options(is_raw)?;
+    let mut loaded = if let Some(developed) = image_options.developed_raw.as_deref() {
+        ensure!(
+            is_raw,
+            "--developed-raw requires the original camera RAW input"
+        );
+        RasterImage {
+            image: read_developed_raw(developed)?,
+            metadata: read_source_metadata(input),
+            color: RasterColor::new(raw::INPUT_COLOR_SPACE, false),
+        }
+    } else {
+        read_image(input, develop_options)?
+    };
+    if let Some(color) = loaded.color {
+        if !image_options.use_params_input_color {
+            params.io.input_color_space = color.color_space.into();
+            params.io.input_cctf_decoding = color.cctf_encoding;
+        } else if is_raw {
+            let destination =
+                RasterColor::new(&params.io.input_color_space, params.io.input_cctf_decoding)
+                    .context("unknown RAW input color space")?;
+            if color != destination {
+                ColorTransform::new(color, destination).apply_image(&mut loaded.image);
+            }
+        }
     }
-    let image = loaded.image;
+    let image = if image_options.rotate_quarter_turns == 0 {
+        loaded.image
+    } else {
+        loaded.image.rotated(image_options.rotate_quarter_turns)
+    };
     eprintln!(
         "Image loaded: {}x{} ({} MP), {} ms",
         image.width,
@@ -374,13 +406,13 @@ fn cmd_process(
         cctf_encoding: pipeline.params.io.output_cctf_encoding,
         source_metadata: Some(&loaded.metadata),
     };
-    let converted = if let Some(name) = &color_options.save_color_space {
+    let converted = if let Some(name) = &image_options.save_color_space {
         let source = RasterColor::new(
             &pipeline.params.io.output_color_space,
             pipeline.params.io.output_cctf_encoding,
         )
         .context("unknown simulation output color space")?;
-        let destination = RasterColor::new(name, color_options.save_cctf_encoding.unwrap_or(true))
+        let destination = RasterColor::new(name, image_options.save_cctf_encoding.unwrap_or(true))
             .with_context(|| format!("unknown saving color space: {name}"))?;
         write_options.color_space = Some(destination.color_space);
         write_options.cctf_encoding = destination.cctf_encoding;

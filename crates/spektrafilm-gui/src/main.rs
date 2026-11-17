@@ -21,8 +21,7 @@ use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_io::{
     raster::{ColorTransform, RasterColor, RasterMetadata, RasterWriteOptions},
-    raw::DevelopOptions,
-    read_image,
+    raw, read_image, write_developed_raw,
 };
 use spektrafilm_math::precision::{from_f32, to_f32};
 use spektrafilm_math::{
@@ -31,9 +30,11 @@ use spektrafilm_math::{
 };
 
 mod export_output;
+mod raw_workflow;
 mod source_snapshot;
 
 use export_output::{StagedOutput, temporary_export_directory, write_preview_output};
+use raw_workflow::RawDevelopSettings;
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 const IN_FLIGHT_REPAINT: Duration = Duration::from_millis(16);
@@ -300,6 +301,8 @@ struct App {
     hanatos_surface_available: bool,
     params: RuntimeParams,
     source: Option<Arc<source_snapshot::SourceSnapshot>>,
+    source_rotation: u8,
+    raw_develop: RawDevelopSettings,
     image: Option<Arc<ImageBuf>>,
     source_metadata: RasterMetadata,
     detected_input_color: Option<RasterColor>,
@@ -458,6 +461,8 @@ impl App {
             hanatos_surface_available: film_profile.as_ref().is_some_and(has_hanatos_surface),
             params,
             source: None,
+            source_rotation: 0,
+            raw_develop: RawDevelopSettings::default(),
             image: None,
             source_metadata: RasterMetadata::default(),
             detected_input_color: None,
@@ -498,7 +503,7 @@ impl App {
         let captured = source_snapshot::SourceSnapshot::capture(path)
             .and_then(|source| {
                 Ok((
-                    read_image(source.path(), DevelopOptions::default())?,
+                    read_image(source.path(), self.raw_develop.options())?,
                     source,
                 ))
             })
@@ -518,6 +523,7 @@ impl App {
                 );
                 self.image = Some(Arc::new(img));
                 self.source = Some(Arc::new(source));
+                self.source_rotation = 0;
                 self.output_tex = None;
                 self.request_render();
             }
@@ -525,6 +531,47 @@ impl App {
                 self.status = format!("Load error: {e:#}");
             }
         }
+    }
+
+    fn source_is_raw(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| raw::is_raw(source.path()))
+    }
+
+    fn redevelop_raw(&mut self) {
+        let Some(source) = self
+            .source
+            .as_ref()
+            .filter(|source| raw::is_raw(source.path()))
+        else {
+            return;
+        };
+        match read_image(source.path(), self.raw_develop.options()) {
+            Ok(loaded) => {
+                let image = if self.source_rotation == 0 {
+                    loaded.image
+                } else {
+                    loaded.image.rotated(self.source_rotation)
+                };
+                self.image = Some(Arc::new(image));
+                self.source_metadata = loaded.metadata;
+                self.output_tex = None;
+                self.request_render();
+                self.status = "RAW developed.".into();
+            }
+            Err(error) => self.status = format!("RAW development error: {error:#}"),
+        }
+    }
+
+    fn rotate_input(&mut self, clockwise_quarter_turns: u8) {
+        let Some(image) = self.image.as_ref() else {
+            return;
+        };
+        self.image = Some(Arc::new(image.rotated(clockwise_quarter_turns)));
+        self.source_rotation = (self.source_rotation + clockwise_quarter_turns) % 4;
+        self.output_tex = None;
+        self.request_render();
     }
 
     fn sync_input_color(&mut self) {
@@ -589,6 +636,8 @@ impl App {
         let data_dir = self.data_dir.clone();
         let params = self.params.clone();
         let display_transform = self.display_transform;
+        let raw_input_destination =
+            (self.override_input_color && self.source_is_raw()).then_some(self.manual_input_color);
         let mut pipeline_cache = self.pipeline_cache.take();
         let backend = self.backend.clone();
         let (tx, rx) = mpsc::channel();
@@ -602,6 +651,17 @@ impl App {
                 // and the user gets a uselessly vague status line.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t_total = Instant::now();
+                    let raw_input_source = RasterColor::new(raw::INPUT_COLOR_SPACE, false).unwrap();
+                    let image = if let Some(destination) =
+                        raw_input_destination.filter(|&color| color != raw_input_source)
+                    {
+                        let mut converted = (*image).clone();
+                        ColorTransform::new(raw_input_source, destination)
+                            .apply_image(&mut converted);
+                        Arc::new(converted)
+                    } else {
+                        image
+                    };
                     let params = render_params(params, mode, &image);
                     let pipeline = render_pipeline(
                         &mut pipeline_cache,
@@ -931,10 +991,14 @@ impl App {
         params.settings.use_enlarger_lut = true;
         params.settings.use_scanner_lut = true;
         let bit_depth = self.bit_depth_for(&out_path);
-        let color_options = ExportColorOptions {
-            use_params_input_color: self.override_input_color,
-            saving_color: Some(self.saving_color),
+        let developed_raw = if raw::is_raw(source.path()) {
+            self.image.clone()
+        } else {
+            None
         };
+        let rotation = self.source_rotation;
+        let use_params_input_color = self.override_input_color;
+        let saving_color = self.saving_color;
         let data_dir = self.data_dir.clone();
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
@@ -953,7 +1017,12 @@ impl App {
                     &paper,
                     &params,
                     &data_dir,
-                    color_options,
+                    ExportImageOptions {
+                        use_params_input_color,
+                        saving_color: Some(saving_color),
+                        rotation: if developed_raw.is_some() { 0 } else { rotation },
+                        developed_raw: developed_raw.as_deref(),
+                    },
                     &cancel_for_worker,
                 );
                 let name = out_path
@@ -1114,6 +1183,30 @@ impl App {
                 )
                 .small(),
             );
+        }
+        ui.horizontal(|ui| {
+            let loaded = self.image.is_some();
+            if ui
+                .add_enabled(loaded, egui::Button::new("Rotate left"))
+                .clicked()
+            {
+                self.rotate_input(3);
+            }
+            if ui
+                .add_enabled(loaded, egui::Button::new("Rotate right"))
+                .clicked()
+            {
+                self.rotate_input(1);
+            }
+        });
+        let loaded_raw = self.source_is_raw();
+        let redevelop = egui::CollapsingHeader::new("RAW development")
+            .default_open(loaded_raw)
+            .show(ui, |ui| self.raw_develop.controls(ui, loaded_raw))
+            .body_returned
+            .unwrap_or(false);
+        if redevelop {
+            self.redevelop_raw();
         }
         ui.add_space(4.0);
 
@@ -1540,10 +1633,8 @@ impl App {
                     None => "Untagged input: assume linear ProPhoto RGB".to_string(),
                 });
                 let changed_input_mode = ui
-                    .checkbox(
-                        &mut self.override_input_color,
-                        "Override input interpretation",
-                    )
+                    .checkbox(&mut self.override_input_color, "Override input color space")
+                    .on_hover_text("Interpret raster samples in this space, or convert developed RAW to this space.")
                     .changed();
                 let changed_input_color = self.override_input_color
                     && color_control(ui, "Input color space", &mut self.manual_input_color);
@@ -2333,9 +2424,11 @@ impl Drop for TempPath {
 }
 
 #[derive(Default)]
-struct ExportColorOptions {
+struct ExportImageOptions<'a> {
     use_params_input_color: bool,
     saving_color: Option<RasterColor>,
+    rotation: u8,
+    developed_raw: Option<&'a ImageBuf>,
 }
 
 /// Run the f64 CLI against a staged output and publish after it exits
@@ -2349,7 +2442,7 @@ fn run_f64_export(
     paper: &str,
     params: &spektrafilm_core::params::RuntimeParams,
     data_dir: &Path,
-    color: ExportColorOptions,
+    image: ExportImageOptions<'_>,
     cancel: &AtomicBool,
 ) -> Result<()> {
     anyhow::ensure!(!cancel.load(Ordering::SeqCst), "cancelled");
@@ -2395,10 +2488,19 @@ fn run_f64_export(
     if let Some(bit_depth) = bit_depth {
         cmd.arg("--bit-depth").arg(bit_depth.to_string());
     }
-    if color.use_params_input_color {
+    if let Some(developed) = image.developed_raw {
+        let developed_path = job_files.path().join("developed-aces.bin");
+        write_developed_raw(&developed_path, developed).context("staging developed RAW pixels")?;
+        cmd.arg("--developed-raw").arg(developed_path);
+    }
+    if image.rotation != 0 {
+        cmd.arg("--rotate-quarter-turns")
+            .arg(image.rotation.to_string());
+    }
+    if image.use_params_input_color {
         cmd.arg("--use-params-input-color");
     }
-    if let Some(saving_color) = color.saving_color {
+    if let Some(saving_color) = image.saving_color {
         cmd.arg("--save-color-space")
             .arg(saving_color.color_space)
             .arg("--save-cctf-encoding")
@@ -2484,7 +2586,7 @@ mod f64_export_tests {
             "paper",
             &RuntimeParams::default(),
             Path::new("."),
-            ExportColorOptions::default(),
+            ExportImageOptions::default(),
             cancel,
         )
     }
@@ -2793,7 +2895,7 @@ mod preview_tests {
         app.display_transform = false;
         app.save_to_path(&exr).unwrap();
         for path in [&tiff, &exr] {
-            let read = read_image(path, DevelopOptions::default()).unwrap();
+            let read = read_image(path, raw::DevelopOptions::default()).unwrap();
             assert_eq!(read.color, Some(SRGB_DISPLAY));
             for (actual, expected) in read.image.data.iter().map(|&value| to_f32(value)).zip([
                 1.146545,
@@ -3007,7 +3109,7 @@ mod preview_tests {
             },
         )
         .unwrap();
-        let saved = read_image(&saved, DevelopOptions::default()).unwrap();
+        let saved = read_image(&saved, raw::DevelopOptions::default()).unwrap();
         assert_eq!((saved.image.width, saved.image.height), (256, 128));
     }
 
@@ -3052,7 +3154,7 @@ exit 23
                 "paper",
                 &RuntimeParams::default(),
                 Path::new("."),
-                ExportColorOptions::default(),
+                ExportImageOptions::default(),
                 cancel,
             );
             done.send(()).ok();

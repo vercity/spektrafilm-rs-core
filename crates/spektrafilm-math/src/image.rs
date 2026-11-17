@@ -81,6 +81,33 @@ impl ImageBuf {
         self.data.par_chunks_exact_mut(w)
     }
 
+    /// Return the same samples rotated clockwise in 90° increments.
+    pub fn rotated(&self, clockwise_quarter_turns: u8) -> Self {
+        let turns = clockwise_quarter_turns % 4;
+        if turns == 0 {
+            return self.clone();
+        }
+        let (width, height) = if turns == 2 {
+            (self.width, self.height)
+        } else {
+            (self.height, self.width)
+        };
+        let mut image = Self::new(width, height);
+        image.par_rows_mut().enumerate().for_each(|(y, row)| {
+            let y = y as u32;
+            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+                let x = x as u32;
+                let (source_x, source_y) = match turns {
+                    1 => (y, self.height - 1 - x),
+                    2 => (self.width - 1 - x, self.height - 1 - y),
+                    _ => (self.width - 1 - y, x),
+                };
+                pixel.copy_from_slice(&self.get(source_x, source_y));
+            }
+        });
+        image
+    }
+
     pub fn extract_channel(&self, c: usize) -> Vec<Scalar> {
         assert!(c < 3);
         self.data.iter().skip(c).step_by(3).copied().collect()
