@@ -17,6 +17,7 @@ mod diagnostics;
 mod gamut_edge;
 mod model_usage;
 mod report;
+mod spectral_envelope;
 
 const SAMPLE_COUNT: usize = 50_000;
 const RNG_SEED: u64 = 20_260_515;
@@ -216,6 +217,7 @@ pub(super) struct Metrics {
     dynamic_range_usage: model_usage::DynamicRange,
     hue_twist_oklab: model_usage::HueTwist,
     rg_plane_slices: model_usage::RgPlanes,
+    spectral_locus_envelope: spectral_envelope::Envelope,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_gamut_edge_stress: Option<gamut_edge::Outcome>,
 }
@@ -298,6 +300,7 @@ pub(super) fn evaluate(
         dynamic_range_usage: model_usage::dynamic_range(&effective, frame),
         hue_twist_oklab: model_usage::hue_twist(&effective, frame),
         rg_plane_slices: model_usage::rg_planes(&effective, frame)?,
+        spectral_locus_envelope: spectral_envelope::evaluate(&effective, frame)?,
         output_gamut_edge_stress: None,
     })
 }

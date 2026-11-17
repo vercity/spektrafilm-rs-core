@@ -115,6 +115,7 @@ figcaption{{font-size:.92em}}section+section{{margin-top:2.5rem}}
         html.push_str("</section>\n");
     }
     model_usage(&mut html, metrics)?;
+    spectral_envelope(&mut html, metrics)?;
     html.push_str("</main></html>\n");
     fs::write(directory.join("report.html"), html)
         .with_context(|| format!("writing QA report in {}", directory.display()))
@@ -265,6 +266,35 @@ fn figure_density_lines(
         }
         html.push_str("</title></polyline>");
     }
+    Ok(())
+}
+
+fn spectral_envelope(html: &mut String, metrics: &Metrics) -> Result<()> {
+    use super::spectral_envelope::{SIDE, project};
+
+    let envelope = &metrics.spectral_locus_envelope;
+    html.push_str("<section><h2>Spectral locus envelope</h2><p>All valid LUT grid samples in CIE xy. The output gamut triangle and the visible spectral locus are drawn over the distribution.</p>");
+    metric_table(html, &serde_json::to_value(envelope)?)?;
+    write!(
+        html,
+        r##"<figure><svg viewBox="0 0 {SIDE} {SIDE}" role="img" aria-label="Output chromaticity map with reference gamut and spectral locus" style="max-width:32rem"><image width="{SIDE}" height="{SIDE}" href="data:image/png;base64,{}"/><polygon fill="none" stroke="#aaa" opacity=".6" points=""##,
+        STANDARD.encode(&envelope.png)
+    )?;
+    for xy in envelope.locus {
+        let [x, y] = project(xy);
+        write!(html, "{x:.2} {y:.2} ")?;
+    }
+    html.push_str(r##""/><polygon fill="none" stroke="#eee" points=""##);
+    for xy in envelope.primaries {
+        let [x, y] = project(xy);
+        write!(html, "{x:.2} {y:.2} ")?;
+    }
+    html.push_str(r#""/>"#);
+    let [x, y] = project(envelope.white);
+    write!(
+        html,
+        r##"<circle cx="{x:.2}" cy="{y:.2}" r="2.5" fill="#eee"><title>Output white point</title></circle></svg><figcaption>The white triangle marks the output gamut. The marked point is its reference white.</figcaption></figure></section>"##
+    )?;
     Ok(())
 }
 
