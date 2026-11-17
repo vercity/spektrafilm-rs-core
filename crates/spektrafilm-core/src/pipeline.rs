@@ -530,30 +530,14 @@ impl Pipeline {
     fn can_render_resident(&self, backend: &dyn ComputeBackend) -> bool {
         // The resident path runs direct spectral integration. Staged
         // rendering handles the internal print and scan LUTs.
-        if !backend.is_gpu()
-            || (self.tc_lut.is_none() && self.mallett_core.is_none())
-            || self
+        backend.is_gpu()
+            && (self.tc_lut.is_some() || self.mallett_core.is_some())
+            && self
                 .output_gamut
                 .gpu_params()
-                .is_some_and(|gamut| !backend.supports_resident_gamut(&gamut))
-            || self.params.settings.use_scanner_lut
-            || (!self.params.io.scan_film && self.params.settings.use_enlarger_lut)
-        {
-            return false;
-        }
-        let halation = &self.params.film_render.halation;
-        if halation.active && halation.halation_n_bounces > 0 {
-            let (strength, sigma) = halation.strength_and_sigma(&self.film);
-            let has_positive_strength =
-                strength.iter().any(|&s| s * halation.halation_amount > 0.0);
-            let has_radius = sigma.map(|s| s * halation.halation_spatial_scale > 0.0);
-            // The resident kernel uses one radius for every channel. Mixed
-            // zero/positive radii need the staged per-channel implementation.
-            if has_positive_strength && !has_radius.iter().all(|&r| r == has_radius[0]) {
-                return false;
-            }
-        }
-        true
+                .is_none_or(|gamut| backend.supports_resident_gamut(&gamut))
+            && !self.params.settings.use_scanner_lut
+            && (self.params.io.scan_film || !self.params.settings.use_enlarger_lut)
     }
 
     fn resident_halation_params(&self, pix_um: f32) -> Option<spektrafilm_gpu::HalationGpuParams> {
@@ -561,19 +545,23 @@ impl Pipeline {
         if !h.active {
             return None;
         }
-        // The resident kernels use averaged radii and per-channel strengths.
-        let avg = |radii: [f64; 3]| radii.iter().sum::<f64>() / 3.0;
         let (strength, sigma_um) = h.strength_and_sigma(&self.film);
         let a_tot = strength.map(|s| s * h.halation_amount);
-        let halation_sigma_px = avg(sigma_um) * h.halation_spatial_scale / pix_um as f64;
-        let halation_n_bounces = if halation_sigma_px > 0.0 && a_tot.iter().any(|&a| a > 0.0) {
-            h.halation_n_bounces
-        } else {
-            0
-        };
-        let scatter_core_px = avg(h.scatter_core_um) * h.scatter_spatial_scale / pix_um as f64;
-        let scatter_tail_px = avg(h.scatter_tail_um) * h.scatter_spatial_scale / pix_um as f64;
-        let scatter_amount = if scatter_core_px > 0.0 || scatter_tail_px > 0.0 {
+        let px = |radius: [f64; 3], scale: f64| radius.map(|r| r * scale / f64::from(pix_um));
+        let halation_sigma = px(sigma_um, h.halation_spatial_scale);
+        let halation_n_bounces =
+            if halation_sigma.iter().any(|&s| s > 0.0) && a_tot.iter().any(|&a| a > 0.0) {
+                h.halation_n_bounces
+            } else {
+                0
+            };
+        let scatter_core_px = px(h.scatter_core_um, h.scatter_spatial_scale);
+        let scatter_tail_px = px(h.scatter_tail_um, h.scatter_spatial_scale);
+        let scatter_amount = if scatter_core_px
+            .iter()
+            .chain(&scatter_tail_px)
+            .any(|&s| s > 0.0)
+        {
             h.scatter_amount.max(0.0)
         } else {
             0.0
@@ -583,15 +571,13 @@ impl Pipeline {
         }
         Some(spektrafilm_gpu::HalationGpuParams {
             scatter_amount: scatter_amount as f32,
-            scatter_core_px: scatter_core_px as f32,
-            scatter_tail_px: scatter_tail_px as f32,
+            scatter_core_px,
+            scatter_tail_px,
             scatter_tail_weight: h.scatter_tail_weight.map(|w| w as f32),
-            halation_amount: h.halation_amount as f32,
-            halation_strength_avg: avg(a_tot) as f32,
             halation_a_tot: a_tot.map(|a| a as f32),
-            halation_first_sigma_px: halation_sigma_px as f32,
+            halation_first_sigma_px: halation_sigma,
             halation_n_bounces,
-            halation_bounce_decay: h.halation_bounce_decay as f32,
+            halation_bounce_decay: h.halation_bounce_decay,
             halation_renormalize: h.halation_renormalize,
         })
     }
@@ -1190,6 +1176,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a native wgpu adapter"]
+    fn resident_optics_matches_cpu_for_mixed_radii_and_preflash() {
+        let backend =
+            spektrafilm_gpu::wgpu_backend::WgpuBackend::new().expect("native wgpu adapter");
+        let dir = data_dir();
+        let film = crate::profile::load_profile_by_name(&dir, "kodak_ektar_100").unwrap();
+        let paper = crate::profile::load_profile_by_name(&dir, "kodak_ultra_endura").unwrap();
+        let mut params = RuntimeParams::default();
+        params.camera.film_format_mm = 0.021;
+        params.camera.auto_exposure = false;
+        params.io.input_cctf_decoding = false;
+        params.io.output_cctf_encoding = false;
+        params.io.output_gamut_compress.algorithm = "off".into();
+        params.enlarger.preflash_exposure = 0.03125;
+        params.film_render.dir_couplers.active = false;
+        params.film_render.grain.active = false;
+        params.print_render.glare.active = false;
+        params.scanner.unsharp_mask = [0.0; 2];
+
+        let optics = &mut params.film_render.halation;
+        optics.scatter_amount = 0.63;
+        optics.scatter_core_um = [1.1, 3.5, 0.0];
+        optics.scatter_tail_um = [6.5, 2.1, 0.0];
+        optics.scatter_tail_weight = [0.2, 0.61, 0.86];
+        optics.halation_strength = Some([0.15, 0.09, 0.13]);
+        optics.halation_first_sigma_um = Some([2.0, 0.0, 79.0]);
+        optics.halation_n_bounces = 3;
+        optics.halation_bounce_decay = 0.38;
+        let mut image =
+            ImageBuf::from_data(21, 12, [0.15, 0.11, 0.06].map(from_f64).repeat(21 * 12));
+        image.set(0, 0, [3.1, 1.0, 0.4].map(from_f64));
+        image.set(20, 0, [0.1, 0.3, 2.8].map(from_f64));
+        image.set(10, 6, [2.8, 1.3, 0.9].map(from_f64));
+        for renormalize in [false, true] {
+            params.film_render.halation.halation_renormalize = renormalize;
+            let pipeline =
+                Pipeline::new_with_spectral(film.clone(), paper.clone(), params.clone(), &dir)
+                    .unwrap();
+            let gpu = pipeline
+                .process_resident_borrowed(&image, &backend)
+                .expect("optical passes should stay resident");
+            let cpu = pipeline.process(image.clone(), &CpuBackend);
+            for (px, (gpu, cpu)) in gpu.data.into_iter().zip(cpu.data).enumerate() {
+                let delta = (gpu as f64 - cpu as f64).abs();
+                assert!(delta < 2e-5, "channel sample {px}: {gpu}, {cpu}, {delta}");
+            }
+        }
+    }
+
+    #[test]
     fn cached_pipeline_uses_stock_halation_and_explicit_overrides() {
         let data = data_dir();
         let print = crate::profile::load_profile_by_name(&data, "kodak_portra_endura").unwrap();
@@ -1210,7 +1246,7 @@ mod tests {
             let pipeline = cached.clone().with_params(params);
             let gpu = pipeline.resident_halation_params(50.0).unwrap();
             assert_eq!(gpu.halation_a_tot, strength.map(|s| s as f32));
-            assert_eq!(gpu.halation_first_sigma_px, (sigma / 50.0) as f32);
+            assert_eq!(gpu.halation_first_sigma_px, [sigma / 50.0; 3]);
 
             let expose = |pipeline: &Pipeline| {
                 stages::filming::expose(
@@ -1241,7 +1277,7 @@ mod tests {
             let overridden = cached.clone().with_params(overridden);
             let gpu = overridden.resident_halation_params(50.0).unwrap();
             assert_eq!(gpu.halation_a_tot, [0.05, 0.015, 0.0]);
-            assert_eq!(gpu.halation_first_sigma_px, (sigma / 50.0) as f32);
+            assert_eq!(gpu.halation_first_sigma_px, [sigma / 50.0; 3]);
             assert_ne!(expose(&pipeline).data, expose(&overridden).data);
 
             let mut disabled = pipeline.params.clone();

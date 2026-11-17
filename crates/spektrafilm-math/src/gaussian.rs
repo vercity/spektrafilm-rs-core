@@ -34,6 +34,11 @@ fn blur_channel<const REFLECT: bool>(data: &mut [Scalar], w: u32, h: u32, sigma:
     blur_1d_parallel::<REFLECT>(&tmp, data, wu, hu, sigma, !horizontal_first);
 }
 
+/// Python scatter-tail fit. Pairs are amplitude and ratio of Gaussian σ to
+/// exponential decay length.
+pub const EXPONENTIAL_GAUSSIAN_FIT: [(f64, f64); 3] =
+    [(0.1633, 0.5360), (0.6496, 1.5236), (0.1870, 2.7684)];
+
 /// Sum-of-3-Gaussians approximation of an isotropic 2D exponential PSF
 /// `exp(-r / decay) / (2π · decay²)` with replicated edges.
 pub fn exponential_filter_channel(
@@ -61,12 +66,10 @@ fn exponential_filter<const REFLECT: bool>(
     h: u32,
     decay_constant: f64,
 ) -> Vec<Scalar> {
-    // Python `_EXPONENTIAL_GAUSSIAN_FITS[3]` — amplitude, σ / decay.
-    const FIT: [(f64, f64); 3] = [(0.1633, 0.5360), (0.6496, 1.5236), (0.1870, 2.7684)];
     let n = data.len();
     let mut result = vec![ZERO; n];
     let mut component = vec![ZERO; n];
-    for &(amp, ratio) in &FIT {
+    for (amp, ratio) in EXPONENTIAL_GAUSSIAN_FIT {
         let sigma = ratio * decay_constant;
         let sigma = if REFLECT {
             from_f64(sigma)

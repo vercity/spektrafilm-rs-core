@@ -665,23 +665,99 @@ extern "C" __global__ void upsample_bilinear_kernel(
     }
 }
 
+// Scattering uses the same reflected FIR and sample-replicated recursive
+// filter as the CPU and WGSL paths, with a different width in each channel.
+__device__ unsigned int optical_reflect(int index, int length) {
+    if (index >= 0 && index < length) return (unsigned int)index;
+    int period = 2 * length;
+    int wrap = (index % period + period) % period;
+    return (unsigned int)min(wrap, period - 1 - wrap);
+}
+
+__device__ float3 optical_iir_step(float value, float3 state, const float* coeff) {
+    float second = fmaf(coeff[0], value - state.x, fmaf(coeff[1], state.y, coeff[2] * state.z));
+    float first = state.y + second;
+    return make_float3(state.x + first, first, second);
+}
+
+__device__ void optical_iir_line(
+    const float* source,
+    float* result,
+    unsigned int head,
+    unsigned int stride,
+    unsigned int length,
+    const float* coeff
+) {
+    float3 state = make_float3(source[head], 0.0f, 0.0f);
+    for (unsigned int i = 0; i < length; ++i) {
+        unsigned int index = head + i * stride;
+        state = optical_iir_step(source[index], state, coeff);
+        result[index] = state.x;
+    }
+    state = make_float3(state.x, 0.0f, 0.0f);
+    for (unsigned int i = length; i > 0; --i) {
+        unsigned int index = head + (i - 1u) * stride;
+        state = optical_iir_step(result[index], state, coeff);
+        result[index] = state.x;
+    }
+}
+
+extern "C" __global__ void optical_gaussian_kernel(
+    const float* __restrict__ source,
+    float* __restrict__ result,
+    unsigned int width,
+    unsigned int height,
+    unsigned int first,
+    int radius_r,
+    int radius_g,
+    int radius_b,
+    const float* __restrict__ weights
+) {
+    unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    unsigned int base = (y * width + x) * 3u;
+    const int radii[3] = {radius_r, radius_g, radius_b};
+    for (unsigned int c = 0; c < 3; ++c) {
+        int radius = radii[c];
+        const float* coeff = weights + c * 19u;
+        if (radius < 0) {
+            if (first != 0u && x == 0u) {
+                optical_iir_line(source, result, base + c, 3u, width, coeff);
+            } else if (first == 0u && y == 0u) {
+                optical_iir_line(source, result, base + c, width * 3u, height, coeff);
+            }
+        } else if (radius == 0) {
+            result[base + c] = source[base + c];
+        } else {
+            float value = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                unsigned int sx = first == 0u ? optical_reflect((int)x + k, (int)width) : x;
+                unsigned int sy = first != 0u ? optical_reflect((int)y + k, (int)height) : y;
+                value = fmaf(source[(sy * width + sx) * 3u + c], coeff[k + radius], value);
+            }
+            result[base + c] = value;
+        }
+    }
+}
+
 extern "C" __global__ void scatter_mix_kernel(
+    const float* __restrict__ source,
     const float* __restrict__ core,
-    const float* __restrict__ tail,
     unsigned int n_pixels,
-    float scatter_amount,
+    float amount,
     float tail_r,
     float tail_g,
     float tail_b,
-    float* __restrict__ result
+    float* __restrict__ mixed
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_pixels) return;
     unsigned int base = idx * 3u;
-    float tw[3] = {tail_r, tail_g, tail_b};
-    for (int c = 0; c < 3; c++) {
-        float scattered = (1.0f - tw[c]) * core[base + c] + tw[c] * tail[base + c];
-        result[base + c] = (1.0f - scatter_amount) * result[base + c] + scatter_amount * scattered;
+    float weights[3] = {tail_r, tail_g, tail_b};
+    for (unsigned int c = 0; c < 3; ++c) {
+        mixed[base + c] = (1.0f - amount) * source[base + c]
+            + amount * (1.0f - weights[c]) * core[base + c];
     }
 }
 
@@ -1239,6 +1315,7 @@ pub struct CudaBackend {
     blur_v_kernel: CudaFunction,
     downsample_kernel: CudaFunction,
     upsample_kernel: CudaFunction,
+    optical_gaussian_kernel: CudaFunction,
     scatter_mix_kernel: CudaFunction,
     add_scaled_kernel: CudaFunction,
     add_scaled_pc_kernel: CudaFunction,
@@ -1280,6 +1357,7 @@ impl CudaBackend {
         let blur_v_kernel = module.load_function("gaussian_blur_v_kernel").ok()?;
         let downsample_kernel = module.load_function("downsample_area_kernel").ok()?;
         let upsample_kernel = module.load_function("upsample_bilinear_kernel").ok()?;
+        let optical_gaussian_kernel = module.load_function("optical_gaussian_kernel").ok()?;
         let scatter_mix_kernel = module.load_function("scatter_mix_kernel").ok()?;
         let add_scaled_kernel = module.load_function("add_scaled_kernel").ok()?;
         let add_scaled_pc_kernel = module.load_function("add_scaled_per_channel_kernel").ok()?;
@@ -1313,6 +1391,7 @@ impl CudaBackend {
             blur_v_kernel,
             downsample_kernel,
             upsample_kernel,
+            optical_gaussian_kernel,
             scatter_mix_kernel,
             add_scaled_kernel,
             add_scaled_pc_kernel,
@@ -1553,6 +1632,67 @@ impl CudaBackend {
         Ok(())
     }
 
+    fn blur_optical_device(
+        &self,
+        image: &CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        blurred: &mut CudaSlice<f32>,
+        width: u32,
+        height: u32,
+        plan: &crate::optical_blur::GaussianRgb,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let weights = self.stream.clone_htod(plan.weights.as_flattened())?;
+        let full_lines = plan.radii.iter().all(|&r| r < 0);
+        let [r, g, b] = plan.radii;
+        for first in [1u32, 0u32] {
+            let (src, dst) = if first != 0 {
+                (image, &mut *scratch)
+            } else {
+                (&*scratch, &mut *blurred)
+            };
+            let mut config = launch_2d(width, height);
+            if full_lines {
+                if first != 0 {
+                    config.grid_dim.0 = 1;
+                } else {
+                    config.grid_dim.1 = 1;
+                }
+            }
+            let mut launch = self.stream.launch_builder(&self.optical_gaussian_kernel);
+            launch
+                .arg(src)
+                .arg(dst)
+                .arg(&width)
+                .arg(&height)
+                .arg(&first)
+                .arg(&r)
+                .arg(&g)
+                .arg(&b)
+                .arg(&weights);
+            unsafe { launch.launch(config) }?;
+        }
+        Ok(())
+    }
+
+    fn add_scaled_channels(
+        &self,
+        source: &CudaSlice<f32>,
+        n_pixels: u32,
+        [r, g, b]: [f32; 3],
+        output: &mut CudaSlice<f32>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut launch = self.stream.launch_builder(&self.add_scaled_pc_kernel);
+        launch
+            .arg(source)
+            .arg(&n_pixels)
+            .arg(&r)
+            .arg(&g)
+            .arg(&b)
+            .arg(output);
+        unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
+        Ok(())
+    }
+
     fn run_halation_device(
         &self,
         img: &mut CudaSlice<f32>,
@@ -1561,67 +1701,44 @@ impl CudaBackend {
         height: u32,
         hp: &crate::HalationGpuParams,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let n_pixels = width * height;
-        let mut core = self.alloc_f32(n_pixels as usize * 3)?;
-        let mut tail = self.alloc_f32(n_pixels as usize * 3)?;
-        let mut acc = self.alloc_f32(n_pixels as usize * 3)?;
+        use crate::optical_blur::{GaussianRgb, halation_bounces, scatter_tail};
 
-        self.blur_device(img, scratch, &mut core, width, height, hp.scatter_core_px)?;
-        self.blur_device(img, scratch, &mut tail, width, height, hp.scatter_tail_px)?;
-        {
-            let [tr, tg, tb] = hp.scatter_tail_weight;
+        let n_pixels = width * height;
+        let mut blurred = self.alloc_f32(n_pixels as usize * 3)?;
+        let mut mixed = self.alloc_f32(n_pixels as usize * 3)?;
+        if hp.scatter_amount > 0.0 {
+            self.blur_optical_device(
+                img, scratch, &mut blurred, width, height, &GaussianRgb::new(hp.scatter_core_px),
+            )?;
+            let [r, g, b] = hp.scatter_tail_weight;
             let mut launch = self.stream.launch_builder(&self.scatter_mix_kernel);
             launch
-                .arg(&core)
-                .arg(&tail)
+                .arg(&*img)
+                .arg(&blurred)
                 .arg(&n_pixels)
                 .arg(&hp.scatter_amount)
-                .arg(&tr)
-                .arg(&tg)
-                .arg(&tb)
-                .arg(&mut *img);
+                .arg(&r)
+                .arg(&g)
+                .arg(&b)
+                .arg(&mut mixed);
             unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
+            for (component, scale) in scatter_tail(hp) {
+                self.blur_optical_device(img, scratch, &mut blurred, width, height, &component)?;
+                self.add_scaled_channels(&blurred, n_pixels, scale, &mut mixed)?;
+            }
+            std::mem::swap(img, &mut mixed);
         }
 
-        let n = hp.halation_n_bounces as usize;
-        if n > 0 {
-            let mut decay: Vec<f32> = (0..n)
-                .map(|k| hp.halation_bounce_decay.powi(k as i32))
-                .collect();
-            let sum: f32 = decay.iter().sum();
-            if sum > 0.0 {
-                for d in &mut decay {
-                    *d /= sum;
-                }
+        if hp.halation_n_bounces > 0 {
+            for (index, (bounce, scale)) in halation_bounces(hp).enumerate() {
+                self.blur_optical_device(img, scratch, &mut blurred, width, height, &bounce)?;
+                self.add_scaled(&blurred, n_pixels, scale, index == 0, &mut mixed)?;
             }
-            for (k, wk) in decay.into_iter().enumerate() {
-                let sigma = hp.halation_first_sigma_px * ((k as f32) + 1.0).sqrt();
-                self.blur_device(img, scratch, &mut core, width, height, sigma)?;
-                self.add_scaled(&core, n_pixels, wk, k == 0, &mut acc)?;
-            }
-            {
-                let [sr, sg, sb] = hp.halation_a_tot;
-                let mut launch = self.stream.launch_builder(&self.add_scaled_pc_kernel);
-                launch
-                    .arg(&acc)
-                    .arg(&n_pixels)
-                    .arg(&sr)
-                    .arg(&sg)
-                    .arg(&sb)
-                    .arg(&mut *img);
-                unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
-            }
+            self.add_scaled_channels(&mixed, n_pixels, hp.halation_a_tot, img)?;
             if hp.halation_renormalize {
-                let inv_r = 1.0f32 / (1.0 + hp.halation_a_tot[0]);
-                let inv_g = 1.0f32 / (1.0 + hp.halation_a_tot[1]);
-                let inv_b = 1.0f32 / (1.0 + hp.halation_a_tot[2]);
+                let [r, g, b] = hp.halation_a_tot.map(|strength| 1.0 / (1.0 + strength));
                 let mut launch = self.stream.launch_builder(&self.halation_renorm_kernel);
-                launch
-                    .arg(&n_pixels)
-                    .arg(&inv_r)
-                    .arg(&inv_g)
-                    .arg(&inv_b)
-                    .arg(&mut *img);
+                launch.arg(&n_pixels).arg(&r).arg(&g).arg(&b).arg(img);
                 unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
             }
         }

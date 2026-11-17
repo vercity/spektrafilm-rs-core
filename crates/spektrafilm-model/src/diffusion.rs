@@ -108,13 +108,17 @@ pub fn apply_halation_um(
     // f64 sigmas/lambdas — Python casts these via
     // `np.asarray(..., dtype=np.float64) * s_scale / pixel_size_um`.
     let pix_um_f64 = pixel_size_um as f64;
-    if scatter_amount > 0.0 {
+    let scatter_core_px = scatter_core_um.map(|s| s * scatter_spatial_scale / pix_um_f64);
+    let scatter_tail_px = scatter_tail_um.map(|s| s * scatter_spatial_scale / pix_um_f64);
+    if scatter_amount > 0.0
+        && scatter_core_px
+            .iter()
+            .chain(&scatter_tail_px)
+            .any(|&s| s > 0.0)
+    {
         for c in 0..3 {
-            let sigma_c_px_f64 = scatter_core_um[c] * scatter_spatial_scale / pix_um_f64;
-            let lambda_t_px_f64 = scatter_tail_um[c] * scatter_spatial_scale / pix_um_f64;
-            if sigma_c_px_f64 <= 0.0 && lambda_t_px_f64 <= 0.0 {
-                continue;
-            }
+            let sigma_c_px_f64 = scatter_core_px[c];
+            let lambda_t_px_f64 = scatter_tail_px[c];
             let mut core = channels[c].clone();
             gaussian_blur_channel_reflect_in_place(
                 &mut core,

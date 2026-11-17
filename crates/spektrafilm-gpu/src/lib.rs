@@ -1,4 +1,5 @@
 pub mod cpu_backend;
+mod optical_blur;
 #[cfg(feature = "cuda-backend")]
 pub mod cuda_backend;
 #[cfg(feature = "wgpu-backend")]
@@ -382,29 +383,19 @@ pub struct GlareGpuParams {
     pub rgb_offset: [f32; 3],
 }
 
-/// Halation parameters for the GPU-resident scatter + multi-bounce pass.
-/// Mirrors the field layout of the CPU `apply_halation_um`, but pre-converts
-/// the per-channel µm sigmas to a single pixel-space sigma (the GPU path
-/// uses the average across channels, matching the existing CPU impl).
+/// Halation parameters for the resident scatter and multi-bounce passes.
+/// Spatial values are the three channels' Gaussian σ or exponential decay in pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct HalationGpuParams {
     pub scatter_amount: f32,
-    pub scatter_core_px: f32,
-    pub scatter_tail_px: f32,
-    /// Per-channel tail weight. Python applies these per channel
-    /// (Portra 0.78 / 0.65 / 0.67); averaging is a noticeable
-    /// chromatic drift.
+    pub scatter_core_px: [f64; 3],
+    pub scatter_tail_px: [f64; 3],
     pub scatter_tail_weight: [f32; 3],
-    pub halation_amount: f32,
-    pub halation_strength_avg: f32,
-    /// Per-channel `halation_strength[c] * halation_amount`. Used only
-    /// for the renormalize pass (which is per-channel even though the
-    /// blur/add use the averaged scalar). When `halation_renormalize`
-    /// is false this is ignored.
+    /// Per-channel total strength, before the optional energy renormalization.
     pub halation_a_tot: [f32; 3],
-    pub halation_first_sigma_px: f32,
+    pub halation_first_sigma_px: [f64; 3],
     pub halation_n_bounces: u32,
-    pub halation_bounce_decay: f32,
+    pub halation_bounce_decay: f64,
     pub halation_renormalize: bool,
 }
 
