@@ -98,3 +98,69 @@ impl Pcg64 {
         result
     }
 }
+const NORMAL_R: f64 = 3.654_152_885_361_009;
+const NORMAL_AREA: f64 = 0.004_928_673_233_974_655;
+const MAGNITUDE_COUNT: f64 = (1_u64 << 52) as f64;
+
+pub(super) struct Normal {
+    widths: [f64; 256],
+    densities: [f64; 256],
+    thresholds: [u64; 256],
+}
+
+impl Normal {
+    pub(super) fn new() -> Self {
+        // Marsaglia–Tsang's 256 equal-area rectangles. Reconstruct the
+        // tables from the area and tail cutoff used by NumPy rather than
+        // keeping three large constant tables in the diagnostic.
+        let density = |x: f64| (-0.5 * x * x).exp();
+        let mut widths = [0.0; 256];
+        let mut densities = [0.0; 256];
+        let mut thresholds = [0; 256];
+        let mut x = NORMAL_R;
+        widths[255] = x;
+        densities[255] = density(x);
+        widths[0] = NORMAL_AREA / densities[255];
+        densities[0] = 1.0;
+        thresholds[0] = (MAGNITUDE_COUNT * (x / widths[0])) as u64;
+        for i in (1..255).rev() {
+            let inner = (-2.0 * (NORMAL_AREA / x + density(x)).ln()).sqrt();
+            widths[i] = inner;
+            densities[i] = density(inner);
+            thresholds[i + 1] = (MAGNITUDE_COUNT * (inner / x)) as u64;
+            x = inner;
+        }
+        Self {
+            widths: widths.map(|x| x / MAGNITUDE_COUNT),
+            densities,
+            thresholds,
+        }
+    }
+
+    pub(super) fn sample(&self, rng: &mut Pcg64) -> f64 {
+        loop {
+            let word = rng.next_u64();
+            let i = (word & 255) as usize;
+            let mag = (word >> 9) & ((1_u64 << 52) - 1);
+            let sign = if word & 256 == 0 { 1.0 } else { -1.0 };
+            let x = sign * mag as f64 * self.widths[i];
+            if mag < self.thresholds[i] {
+                return x;
+            }
+            if i == 0 {
+                loop {
+                    let tail = -(-rng.uniform()).ln_1p() / NORMAL_R;
+                    let height = -(-rng.uniform()).ln_1p();
+                    if 2.0 * height > tail * tail {
+                        let sign = if (mag >> 8) & 1 == 0 { 1.0 } else { -1.0 };
+                        return sign * (NORMAL_R + tail);
+                    }
+                }
+            }
+            let y = self.densities[i] + (self.densities[i - 1] - self.densities[i]) * rng.uniform();
+            if y < (-0.5 * x * x).exp() {
+                return x;
+            }
+        }
+    }
+}

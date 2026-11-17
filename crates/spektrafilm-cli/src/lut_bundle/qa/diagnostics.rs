@@ -289,7 +289,7 @@ pub(super) fn to_oklab(xyz: [f64; 3]) -> [f64; 3] {
     )
 }
 
-fn from_oklab(lab: [f64; 3]) -> [f64; 3] {
+pub(super) fn from_oklab(lab: [f64; 3]) -> [f64; 3] {
     let lms = mat_vec(
         [
             [
@@ -334,7 +334,7 @@ fn from_oklab(lab: [f64; 3]) -> [f64; 3] {
 }
 
 fn noise(cube: &Cube, frame: Frame) -> Option<Noise> {
-    const L: f64 = 0.564_622_597_143_569_8;
+    const L: f64 = super::noise_gradient::MIDGRAY_OKLAB_L;
     const SIGMA: f64 = 0.005;
     const EPS: f64 = 0.005;
     let mut sigma1 = Vec::new();

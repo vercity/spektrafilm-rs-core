@@ -118,6 +118,7 @@ figcaption{{font-size:.92em}}section+section{{margin-top:2.5rem}}
     spectral_envelope(&mut html, metrics)?;
     input_gamut(&mut html, metrics)?;
     output_gamut(&mut html, metrics)?;
+    noise_gradient(&mut html, metrics)?;
     html.push_str("</main></html>\n");
     fs::write(directory.join("report.html"), html)
         .with_context(|| format!("writing QA report in {}", directory.display()))
@@ -511,6 +512,30 @@ fn output_gamut(html: &mut String, metrics: &Metrics) -> Result<()> {
         html.push_str("</svg><figcaption>CIE xy with output primaries and the spectral locus</figcaption></figure></div><p>Solid lines show the unbounded rim. Dashes show the compressed rim.</p>");
     }
     html.push_str("</section>");
+    Ok(())
+}
+
+fn noise_gradient(html: &mut String, metrics: &Metrics) -> Result<()> {
+    use super::noise_gradient::SIDE;
+
+    let noise = &metrics.noise_gradient;
+    html.push_str("<section><h2>Noise gradient</h2><p>The OkLab hue cycle runs left to right. Lightness rises from black at the bottom to white at the top, with peak chroma near 18% gray.</p>");
+    metric_table(html, &serde_json::to_value(noise)?)?;
+    html.push_str(r#"<div class="panels">"#);
+    for (image, title) in [
+        (&noise.clean, "Clean LUT output"),
+        (
+            &noise.noisy,
+            "Same gradient with seeded encoded-input noise",
+        ),
+    ] {
+        write!(
+            html,
+            r#"<figure><img width="{SIDE}" height="{SIDE}" alt="{title}" src="data:image/png;base64,{}"><figcaption>{title}</figcaption></figure>"#,
+            STANDARD.encode(image)
+        )?;
+    }
+    html.push_str("</div></section>");
     Ok(())
 }
 

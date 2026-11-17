@@ -18,6 +18,7 @@ mod gamut_edge;
 mod hull;
 mod input_gamut;
 mod model_usage;
+mod noise_gradient;
 mod output_gamut;
 mod report;
 mod rng;
@@ -217,6 +218,7 @@ pub(super) struct Metrics {
     rg_plane_slices: model_usage::RgPlanes,
     spectral_locus_envelope: spectral_envelope::Envelope,
     output_gamut_compression: output_gamut::Compression,
+    noise_gradient: noise_gradient::Gradient,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_gamut_edge_stress: Option<gamut_edge::Outcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,6 +306,7 @@ pub(super) fn evaluate(
         resampled,
         diagnostics,
         output_gamut_compression,
+        noise_gradient: noise_gradient::evaluate(&effective, frame)?,
         characteristic_curve: curves::characteristic(&effective),
         planckian_sweep: curves::planckian(&effective, frame),
         dynamic_range_usage: model_usage::dynamic_range(&effective, frame),

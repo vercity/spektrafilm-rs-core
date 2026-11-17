@@ -234,7 +234,14 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
         compression["input_gamut_compression_smoothness"]["probe_samples"],
         720
     );
-    assert_eq!(html.matches("data:image/png;base64,").count(), 9);
+    assert_eq!(qa_report["noise_gradient"]["image_side"], 512);
+    assert!(
+        qa_report["noise_gradient"]["p99_abs_output_delta"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert_eq!(html.matches("data:image/png;base64,").count(), 11);
     assert!(html.contains("Noise sensitivity"));
     assert!(html.contains("Dynamic range usage"));
     assert!(html.contains("Red–green plane slices"));

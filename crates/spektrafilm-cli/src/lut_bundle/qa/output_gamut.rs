@@ -133,7 +133,7 @@ impl Rim {
                         colors.push(rgb);
                         // Match Python's rim. This native-code stress probe
                         // bypasses exposure scaling and the delivered LUT.
-                        data.extend(rgb.map(|c| from_f32(frame.input.decode(c) as f32)));
+                        data.extend(frame.input.decode(rgb).map(|value| from_f32(value as f32)));
                     }
                 }
             }
