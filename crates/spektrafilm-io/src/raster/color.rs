@@ -120,7 +120,18 @@ pub(super) fn identify_icc(bytes: &[u8]) -> Option<RasterColor> {
     let [Some(red), Some(green), Some(blue)] = curves else {
         return None;
     };
-    for space in RgbSpace::ALL {
+    let description = embedded.description.as_ref().and_then(|text| match text {
+        ProfileText::PlainString(text) => Some(text.as_str()),
+        ProfileText::Localizable(text) => text.first().map(|entry| entry.value.as_str()),
+        ProfileText::Description(text) => Some(text.ascii_string.as_str()),
+    });
+    // Linear Rec.709 and linear sRGB share primaries and curves. Prefer the
+    // named color space when its colorants and curves also match.
+    let named_space = description
+        .map(|text| text.strip_suffix(" (linear)").unwrap_or(text))
+        .and_then(RgbSpace::from_name)
+        .filter(|space| RgbSpace::ALL.contains(space));
+    for space in named_space.into_iter().chain(RgbSpace::ALL) {
         let known = profile(space).rgb_to_xyz_matrix().v;
         if matrix
             .iter()
@@ -222,4 +233,34 @@ pub(super) fn identify_exr(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn added_rgb_spaces_roundtrip_icc_metadata() -> Result<()> {
+        for space in [
+            RgbSpace::Rec709,
+            RgbSpace::DisplayP3,
+            RgbSpace::DciP3,
+            RgbSpace::AdobeRgb,
+        ] {
+            for encoded in [true, false] {
+                let color = RasterColor::new(space.name(), encoded).unwrap();
+                let bytes = make_icc(color)?.unwrap();
+                assert_eq!(identify_icc(&bytes), Some(color));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exr_tags_disambiguate_srgb_and_rec709() {
+        let mut attrs = ImageAttributes::with_size((1, 1));
+        let color = RasterColor::new(RgbSpace::Rec709.name(), false);
+        set_exr_color(&mut attrs, color);
+        assert_eq!(identify_exr(&attrs, &LayerAttributes::default()), color);
+    }
 }

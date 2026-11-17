@@ -299,13 +299,13 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 | 项目 | 验收条件和当前进度 |
 |---|---|
 | GUI 色彩和 RAW 开发 | 输入解释、模拟空间、显示和保存转换已通过 macOS 验收。无标签 V-Log TIFF 显式按 V-Gamut 读取，f64 以 ProPhoto 模拟并导出线性 Rec.2020 TIFF32，ICC 正确，对照原版 colour-science 最大误差 `1.29e-8`。独立切换保存空间时模拟缓冲逐位一致。RAW 增加白平衡、Lensfun 开关、旋转及重新开发。合成 Bayer DNG 打开后替换原路径，修改白平衡再旋转为 104×72，Scan 与真实 f64 Export 使用已开发帧。导出 TIFF32 像素与直接 f64 同参数渲染逐位一致。自定义 5000 K／tint 1.15 的线性 ACES AP0 与 Python 的 P99 差为 `0.00222`，as-shot 为 `0.11382`，解码画质、真实 X-Trans GUI 回归及 Windows 显示 ICC 另外验收。 |
-| GUI 预设、默认片纸和交互 | 对照原版 JSON、启动默认值、恢复出厂设置、记忆目录、负片与正片切换、预览采样、颗粒控件和图层／相纸动画。待验收。 |
+| GUI 预设、默认片纸和交互 | 预设与会话已验收。Rust GUI 导入 Python 0.3.4 写出的出厂和非默认 JSON，重新保存后由 Python 解析，摄影机、印相、扫描、色彩、片纸与设置参数在 f32 舍入范围内一致。覆盖启动默认 Gold 200／Supra Endura、换胶片保留纸型、正片直接扫描、重启记忆目录、恢复出厂及损坏文件保护。通道置换与插值模式可以往返，实际应用、预览采样、颗粒控件及图层／相纸动画继续对齐。 |
 | LUT 编码和命令 | 已验收。覆盖 Python 注册表的 26 个公开输入和 10 个公开输出，含 HLG 的 RGB 耦合 CCTF、相机 Log、P3、Adobe RGB 和独立 Rec.709 矩阵。Ektar 100／Ultra Endura 5³ 各角色的 CUBE 最大节点误差小于 `2e-7`，PyOpenColorIO 2.5 加载并调用已映射端点的处理器。新增兼容入口 `spektrafilm-lut build/list`，支持 TOML 配方、参数覆盖和原版 1-LUT 默认。含自定义色域压缩参数的双相纸 4-LUT 与原版的 17 个 CUBE 路径相同，最大节点差为 `1.01e-7`，ZIP 内 23 个条目名称一致。Rust 原有 `export-lut-bundle` 保留自己的默认值。 |
 | LUT QA | D65 ΔE00、ΔITP、P95 和 `--qa-print-index` 已验收。同一 17³ V-Log→ProPhoto 4-LUT 文件和 50,000 个固定采样点，两端各统计值最大差分别为 `3.40e-6`／`2.37e-6`。Index 1 只生成第二张相纸的报告，包保留两张相纸。后续单调性、色域与噪声等诊断以及 HTML 输出仍在进行。 |
 | 4-LUT 画质 | 对照两端逐段与重采样结果。65³ Ektar 100／Ultra Endura V-Log→sRGB 三线性／四面体逐段最大 ΔE00 为 6.65／6.28，两端一致，样本仍超出最大值 2.0 的门槛。 |
 | 运行时阶段接口 | 已验收。普通渲染公开 `process_with_taps`，包含 `rgb_pre`、`cmy_print` 等边界，返回工作像素尺寸供从中途继续。Portra 400／Portra Endura 与 Provia 直扫启用全图测光、裁切、1.5× 缩放、空间效果与黑白校正，从每个可达阶段续跑与 Rust 一次渲染逐位一致。Python f64 对照同为 14×9，六个阶段从 `rgb_pre` 到 `rgb_out` 的最大差依次为 `2.22e-15`、`4.34e-9`、`1.66e-7`、`1.05e-7`、`1.70e-7`、`1.59e-7`。 |
 | 自定义 profile 保存 | 已验收。公共 `save_profile` 写回片纸 JSON，保留许可信息、波段空值和黑白片多显影时间，替换前先完整写入同目录暂存文件。Portra 400、Portra Endura 由 Python 原版读取并通过验证，光谱及密度数组形状、空值位置一致，有限数值的最大差为 `1.78e-15`。Rust 额外覆盖 Double-X 与保存失败后保留原件。 |
-| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。MakerNote 与 RAW 去马赛克、高光和非直线镜头校正待验收。源码复核确认 Python 对 EXR 跳过 Exiv2 元数据写入，因此 EXR 通用元数据透传属于扩展。 |
+| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。另验证 Rec.709、Display P3、DCI-P3 和 Adobe RGB 的线性／编码 ICC 往返与 EXR 标签。MakerNote 与 RAW 去马赛克、高光和非直线镜头校正待验收。源码复核确认 Python 对 EXR 跳过 Exiv2 元数据写入，因此 EXR 通用元数据透传属于扩展。 |
 | GPU 和发布验证 | 对照 Metal／wgpu 的色域压缩、散射和颗粒。另需 CUDA、Lumix 和 Windows 文件取消／替换实测。待验收。 |
 
 ### 审阅验证范围
