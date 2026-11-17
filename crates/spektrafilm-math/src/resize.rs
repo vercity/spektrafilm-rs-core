@@ -9,6 +9,7 @@ use crate::precision::{from_f64, to_f64};
 #[derive(Clone, Copy)]
 pub enum Interpolation {
     Nearest,
+    Bilinear,
     CubicSpline,
 }
 
@@ -26,7 +27,7 @@ pub fn resize(image: &ImageBuf, size: [u32; 2], interpolation: Interpolation) ->
     let [width, height] = size.map(|length| length.max(1));
     match interpolation {
         Interpolation::Nearest => gaussian_sample(image, width, height, width, height),
-        Interpolation::CubicSpline => {
+        Interpolation::Bilinear | Interpolation::CubicSpline => {
             let filtered = if width < image.width || height < image.height {
                 Cow::Owned(gaussian_sample(
                     image,
@@ -38,6 +39,9 @@ pub fn resize(image: &ImageBuf, size: [u32; 2], interpolation: Interpolation) ->
             } else {
                 Cow::Borrowed(image)
             };
+            if matches!(interpolation, Interpolation::Bilinear) {
+                return linear_resize(&filtered, width, height);
+            }
             // skimage clips interpolation overshoot to the input range across
             // all three channels. The range may include negatives and >1.
             let (min, max) = image.data.iter().copied().fold(
@@ -74,6 +78,41 @@ fn mirror(index: isize, len: usize) -> usize {
 
 fn source_center(index: usize, input: usize, output: usize) -> f64 {
     (index as f64 + 0.5) * (input as f64 / output as f64) - 0.5
+}
+
+fn linear_resize(image: &ImageBuf, width: u32, height: u32) -> ImageBuf {
+    let axis = |index, source, destination| {
+        let coordinate = source_center(index, source, destination);
+        let lower = coordinate.floor() as isize;
+        (
+            [
+                mirror(lower, source) as u32,
+                mirror(lower + 1, source) as u32,
+            ],
+            coordinate - lower as f64,
+        )
+    };
+    let horizontal: Vec<_> = (0..width as usize)
+        .map(|x| axis(x, image.width as usize, width as usize))
+        .collect();
+    let mut output = ImageBuf::new(width, height);
+    output.par_rows_mut().enumerate().for_each(|(y, row)| {
+        let ([top, bottom], ty) = axis(y, image.height as usize, height as usize);
+        for (pixel, &([left, right], tx)) in row.chunks_exact_mut(3).zip(&horizontal) {
+            let upper_left = image.get(left, top);
+            let upper_right = image.get(right, top);
+            let lower_left = image.get(left, bottom);
+            let lower_right = image.get(right, bottom);
+            for channel in 0..3 {
+                let above =
+                    to_f64(upper_left[channel]) * (1.0 - tx) + to_f64(upper_right[channel]) * tx;
+                let below =
+                    to_f64(lower_left[channel]) * (1.0 - tx) + to_f64(lower_right[channel]) * tx;
+                pixel[channel] = from_f64(above * (1.0 - ty) + below * ty);
+            }
+        }
+    });
+    output
 }
 
 fn nearest_index(index: usize, input: usize, output: usize) -> usize {

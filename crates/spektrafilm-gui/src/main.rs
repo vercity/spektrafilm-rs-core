@@ -31,11 +31,13 @@ use spektrafilm_math::{
 
 mod export_output;
 mod presets;
+mod preview_source;
 mod raw_workflow;
 mod source_snapshot;
 
 use export_output::{StagedOutput, temporary_export_directory, write_preview_output};
 use presets::{FACTORY_FILM, FACTORY_PAPER, GuiPreset, Preferences};
+use preview_source::{PreviewSource, interpret_input};
 use raw_workflow::RawDevelopSettings;
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -358,6 +360,7 @@ struct App {
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
     pipeline_cache: Option<PipelineCache>,
+    preview_source: Option<PreviewSource>,
     last_render_ms: f32,
     last_pipeline_build_ms: f32,
     last_input_clone_ms: f32,
@@ -436,6 +439,7 @@ struct RenderJob {
 
 struct RenderReply {
     pipeline_cache: Option<PipelineCache>,
+    preview_source: Option<PreviewSource>,
     result: Result<RenderResult, String>,
 }
 
@@ -520,6 +524,7 @@ impl App {
             output_image: None,
             output_tex: None,
             pipeline_cache: None,
+            preview_source: None,
             last_render_ms: 0.0,
             last_pipeline_build_ms: 0.0,
             last_input_clone_ms: 0.0,
@@ -753,6 +758,7 @@ impl App {
                     t.elapsed().as_secs_f32() * 1000.0
                 );
                 self.image = Some(Arc::new(img));
+                self.preview_source = None;
                 self.source = Some(Arc::new(source));
                 self.source_rotation = 0;
                 self.output_tex = None;
@@ -786,6 +792,7 @@ impl App {
                     loaded.image.rotated(self.source_rotation)
                 };
                 self.image = Some(Arc::new(image));
+                self.preview_source = None;
                 self.source_metadata = loaded.metadata;
                 self.output_tex = None;
                 self.request_render();
@@ -800,6 +807,7 @@ impl App {
             return;
         };
         self.image = Some(Arc::new(image.rotated(clockwise_quarter_turns)));
+        self.preview_source = None;
         self.source_rotation = (self.source_rotation + clockwise_quarter_turns) % 4;
         self.output_tex = None;
         self.request_render();
@@ -871,6 +879,11 @@ impl App {
         let raw_input_destination =
             (self.override_input_color && self.source_is_raw()).then_some(self.manual_input_color);
         let mut pipeline_cache = self.pipeline_cache.take();
+        let mut preview_source = if mode == RenderMode::Preview {
+            self.preview_source.take()
+        } else {
+            None
+        };
         let backend = self.backend.clone();
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
@@ -883,18 +896,16 @@ impl App {
                 // and the user gets a uselessly vague status line.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t_total = Instant::now();
-                    let raw_input_source = RasterColor::new(raw::INPUT_COLOR_SPACE, false).unwrap();
-                    let image = if let Some(destination) =
-                        raw_input_destination.filter(|&color| color != raw_input_source)
-                    {
-                        let mut converted = (*image).clone();
-                        ColorTransform::new(raw_input_source, destination)
-                            .apply_image(&mut converted);
-                        Arc::new(converted)
-                    } else {
-                        image
+                    let image = match mode {
+                        RenderMode::Preview => PreviewSource::prepare(
+                            &mut preview_source,
+                            image,
+                            params.settings.preview_max_size,
+                            raw_input_destination,
+                        ),
+                        RenderMode::Scan => interpret_input(image, raw_input_destination),
                     };
-                    let params = render_params(params, mode, &image);
+                    let params = render_params(params, mode);
                     let pipeline = render_pipeline(
                         &mut pipeline_cache,
                         &data_dir,
@@ -933,6 +944,7 @@ impl App {
                 .unwrap_or_else(|panic| Err(panic_message(&panic)));
                 let _ = tx.send(RenderReply {
                     pipeline_cache,
+                    preview_source,
                     result,
                 });
                 ctx_for_worker.request_repaint();
@@ -1047,6 +1059,7 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => RenderReply {
                 pipeline_cache: None,
+                preview_source: None,
                 result: Err("worker thread vanished".into()),
             },
         };
@@ -1057,6 +1070,13 @@ impl App {
         }
         self.render_job = None;
         self.pipeline_cache = reply.pipeline_cache;
+        if let Some(preview_source) = reply.preview_source.filter(|cache| {
+            self.image
+                .as_ref()
+                .is_some_and(|original| cache.belongs_to(original))
+        }) {
+            self.preview_source = Some(preview_source);
+        }
         if generation != self.render_generation {
             return;
         }
@@ -2421,14 +2441,12 @@ fn fps_label(ms: f32) -> &'static str {
     }
 }
 
-fn render_params(mut params: RuntimeParams, mode: RenderMode, image: &ImageBuf) -> RuntimeParams {
+fn render_params(mut params: RuntimeParams, mode: RenderMode) -> RuntimeParams {
     params.settings.preview_mode = mode == RenderMode::Preview;
     if mode == RenderMode::Preview {
-        let long_edge = image.width.max(image.height).max(1);
-        let cap = params.settings.preview_max_size.clamp(1, long_edge);
-        // Use the regular pipeline so it meters and crops the original frame
-        // before resampling and scales the physical pixel size for the render.
-        params.io.upscale_factor = (f64::from(cap) / f64::from(long_edge)) as f32;
+        // Preview source has already been resized before metering and cropping.
+        // A scan scale change must only affect Scan and Export.
+        params.io.upscale_factor = 1.0;
 
         // Match the Python GUI's preview-mode effect policy.
         params.camera.lens_blur_um = 0.0;
@@ -3295,6 +3313,7 @@ mod preview_tests {
             tx.send(RenderReply {
                 result,
                 pipeline_cache: None,
+                preview_source: None,
             })
             .ok()
             .unwrap();
@@ -3453,9 +3472,19 @@ mod preview_tests {
         assert_eq!(app.params.io.upscale_factor, 1.0);
         let scan = finish(&mut app, RenderMode::Scan);
         assert_eq!((scan.width, scan.height), (512, 256));
-        for (preview_value, scan_value) in preview.data.iter().zip(&scan.data).take(3) {
-            assert!((preview_value - scan_value).abs() < from_f32(1e-5));
-        }
+        // Gaussian prefiltering before cropping mixes some of the bright
+        // surround into the preview. Scan still meters and crops the original.
+        assert!(
+            preview
+                .data
+                .iter()
+                .zip(&scan.data)
+                .take(3)
+                .any(
+                    |(preview_value, scan_value)| (preview_value - scan_value).abs()
+                        > from_f32(1e-5)
+                )
+        );
 
         app.params.io.upscale_factor = 0.5;
         let preview_at_half_scan_scale = finish(&mut app, RenderMode::Preview);
