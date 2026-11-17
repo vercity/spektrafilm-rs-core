@@ -319,31 +319,27 @@ impl OutputGamutCompress {
         }
     }
 
-    /// The perceptual shaders cover OkLab and CAM16-UCS for sRGB only.
-    pub(crate) fn requires_staged_rendering(&self) -> bool {
-        match self.kind {
-            Kind::Perceptual(Space::Jzazbz) => true,
-            Kind::Perceptual(_) => self.target != RgbSpace::Srgb,
-            _ => false,
-        }
-    }
-
-    /// GPU-pass inputs for the active compressor (mode id matching
-    /// `gamut_compress.wgsl`, knee/lightness coefficients, table geometry
-    /// and the baked `C_max` table). `None` for inactive and CPU-only compressors.
+    /// GPU-pass inputs for the active compressor.
     pub fn gpu_params(&self) -> Option<spektrafilm_gpu::GamutGpuParams<'_>> {
-        if self.requires_staged_rendering() {
-            return None;
-        }
+        use spektrafilm_gpu::GamutMode;
         let mode = match self.kind {
-            Kind::Off | Kind::Perceptual(Space::Jzazbz) => return None,
-            Kind::AcesRgc => 0,
-            Kind::Perceptual(Space::Oklch) => 1,
-            Kind::Perceptual(Space::Oklrab) => 2,
-            Kind::Perceptual(Space::Cam16ucs) => 3,
+            Kind::Off => return None,
+            Kind::AcesRgc => GamutMode::AcesRgc,
+            Kind::Perceptual(Space::Oklch) => GamutMode::Oklch,
+            Kind::Perceptual(Space::Oklrab) => GamutMode::Oklrab,
+            Kind::Perceptual(Space::Cam16ucs) => GamutMode::Cam16ucs,
+            Kind::Perceptual(Space::Jzazbz) => GamutMode::Jzazbz,
         };
+        let [r, g, b] = self.cam16_white.adaptation;
         Some(spektrafilm_gpu::GamutGpuParams {
             mode,
+            target: self.target,
+            cam16_white: [
+                r as f32,
+                g as f32,
+                b as f32,
+                self.cam16_white.response as f32,
+            ],
             knee: [self.knee.0 as f32, self.knee.1 as f32, self.knee.2 as f32],
             lightness: self
                 .lightness
@@ -854,7 +850,9 @@ mod tests {
             for (actual, expected) in rgb.into_iter().zip(expected) {
                 assert!((actual - expected).abs() < 1e-6, "{target}: {rgb:?}");
             }
-            assert!(comp.requires_staged_rendering());
+            let gpu = comp.gpu_params().unwrap();
+            assert_eq!(gpu.mode, spektrafilm_gpu::GamutMode::Cam16ucs);
+            assert_eq!(gpu.target.name(), target);
         }
     }
 
@@ -868,8 +866,10 @@ mod tests {
         };
         let srgb = OutputGamutCompress::build(&params, "sRGB");
         assert!(srgb.is_active());
-        assert!(srgb.requires_staged_rendering());
-        assert!(srgb.gpu_params().is_none());
+        assert_eq!(
+            srgb.gpu_params().unwrap().mode,
+            spektrafilm_gpu::GamutMode::Jzazbz
+        );
         assert_eq!(srgb.compress([0.0; 3]), [0.0; 3]);
         let cases = [
             (

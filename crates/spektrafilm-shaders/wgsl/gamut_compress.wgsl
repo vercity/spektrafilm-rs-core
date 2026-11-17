@@ -9,8 +9,9 @@
 //   1 = oklch      (OkLab chroma reduction)
 //   2 = oklrab     (OkLab coords, table indexed by Ottosson Lr lightness)
 //   3 = cam16ucs   (full CIECAM16 + Luo 2006 UCS)
+//   4 = jzazbz     (Safdar 2017, with signed ST 2084)
 //
-// f32 throughout — preview-only path; exports run the CPU f64 compressor.
+// Perceptual transforms use the destination RGB primaries and white point.
 
 struct Params {
     n_pixels: u32,
@@ -24,6 +25,10 @@ struct Params {
     lightness: vec4<f32>,
     // x=l_white (perceptual white), y=l_min, z=l_max (table L-axis bounds).
     lspace: vec4<f32>,
+    rgb_to_xyz: array<vec4<f32>, 3>,
+    xyz_to_rgb: array<vec4<f32>, 3>,
+    // xyz: CAT16 channel adaptation; w: achromatic response of the white.
+    cam16_white: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -31,14 +36,6 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> img: array<f32>;  // [H*W*3]
 
 const PI: f32 = 3.141592653589793;
-
-// sRGB linear RGB ↔ XYZ (colour-science's rounded sRGB matrices, D65).
-const RGB2XYZ_R0 = vec3<f32>(0.4124, 0.3576, 0.1805);
-const RGB2XYZ_R1 = vec3<f32>(0.2126, 0.7152, 0.0722);
-const RGB2XYZ_R2 = vec3<f32>(0.0193, 0.1192, 0.9505);
-const XYZ2RGB_R0 = vec3<f32>(3.2406, -1.5372, -0.4986);
-const XYZ2RGB_R1 = vec3<f32>(-0.9689, 1.8758, 0.0415);
-const XYZ2RGB_R2 = vec3<f32>(0.0557, -0.204, 1.057);
 
 // OkLab (Ottosson) matrices.
 const M1_R0 = vec3<f32>(0.8189330101, 0.3618667424, -0.1288597137);
@@ -61,11 +58,9 @@ const CAM16_M16_R2 = vec3<f32>(-0.002079, 0.048952, 0.953127);
 const CAM16_M16I_R0 = vec3<f32>(1.8620678551, -1.0112546305, 0.1491867754);
 const CAM16_M16I_R1 = vec3<f32>(0.3875265432, 0.6214474419, -0.0089739852);
 const CAM16_M16I_R2 = vec3<f32>(-0.0158414988, -0.0341229380, 1.0499644369);
-const CAM16_D_RGB = vec3<f32>(1.0228770275, 0.9852074783, 0.9285450587);
 const CAM16_F_L: f32 = 0.6839903846;
 const CAM16_N_BB: f32 = 1.0003040046;
 const CAM16_CZ: f32 = 0.69 * 1.9272135955; // c * z
-const CAM16_A_W: f32 = 37.1690753022;
 // (50000/13) * N_c * N_cb with N_c = 1, N_cb = N_BB.
 const CAM16_ECC: f32 = 3846.1538461538 * 1.0003040046;
 // (1.64 - 0.29^n)^0.73 and F_L^0.25 — const-folded at shader compile.
@@ -94,8 +89,11 @@ fn reinhard_knee(d: f32, threshold: f32, limit: f32, power: f32) -> f32 {
     }
     let scale = limit - threshold;
     let x = (d - threshold) / scale;
-    let y = x / pow(1.0 + pow(x, power), 1.0 / power);
-    return threshold + scale * y;
+    // The reciprocal form avoids overflowing pow(x, power) near zero C_max.
+    if x >= 1.0 {
+        return threshold + scale * pow(1.0 + pow(1.0 / x, power), -1.0 / power);
+    }
+    return threshold + scale * x / pow(1.0 + pow(x, power), 1.0 / power);
 }
 
 fn xyz_to_oklab(xyz: vec3<f32>) -> vec3<f32> {
@@ -142,13 +140,13 @@ fn cam16_padc_inverse(rgb: vec3<f32>) -> vec3<f32> {
 // XYZ (Y=1) → CAM16-UCS (Jp, ap, bp).
 fn xyz_to_cam16ucs(xyz: vec3<f32>) -> vec3<f32> {
     let rgb = mv(CAM16_M16_R0, CAM16_M16_R1, CAM16_M16_R2, xyz * 100.0);
-    let p = cam16_padc_forward(rgb * CAM16_D_RGB);
+    let p = cam16_padc_forward(rgb * params.cam16_white.xyz);
     let a = p.x - 12.0 * p.y / 11.0 + p.z / 11.0;
     let b = (p.x + p.y - 2.0 * p.z) / 9.0;
     let h = atan2_deg(b, a);
     let e_t = 0.25 * (cos(2.0 + radians(h)) + 3.8);
     let a_resp = (2.0 * p.x + p.y + p.z / 20.0 - 0.305) * CAM16_N_BB;
-    let jj = 100.0 * pow(a_resp / CAM16_A_W, CAM16_CZ);
+    let jj = 100.0 * pow(max(a_resp, 0.0) / params.cam16_white.w, CAM16_CZ);
     let denom = p.x + p.y + 21.0 * p.z / 20.0;
     var t = 0.0;
     if denom != 0.0 {
@@ -170,10 +168,10 @@ fn cam16ucs_to_xyz(jab: vec3<f32>) -> vec3<f32> {
     let jj = jp / ((1.0 + 100.0 * UCS_C1) - UCS_C1 * jp);
     let m = (exp(UCS_C2 * mp) - 1.0) / UCS_C2;
     let cc = m / CAM16_F_L_4;
-    let j_prime = max(jj, 1.1920929e-7);
+    let j_prime = max(jj, 2.22044605e-16);
     let t = pow(cc / (sqrt(j_prime / 100.0) * CAM16_CC_F), 1.0 / 0.9);
     let e_t = 0.25 * (cos(2.0 + radians(h)) + 3.8);
-    let a_resp = CAM16_A_W * pow(jj / 100.0, 1.0 / CAM16_CZ);
+    let a_resp = params.cam16_white.w * pow(jj / 100.0, 1.0 / CAM16_CZ);
     var p1 = 0.0;
     if t != 0.0 {
         p1 = CAM16_ECC * e_t / t;
@@ -213,8 +211,83 @@ fn cam16ucs_to_xyz(jab: vec3<f32>) -> vec3<f32> {
     let ra = (460.0 * p2 + 451.0 * a + 288.0 * b) / 1403.0;
     let ga = (460.0 * p2 - 891.0 * a - 261.0 * b) / 1403.0;
     let ba = (460.0 * p2 - 220.0 * a - 6300.0 * b) / 1403.0;
-    let rgb = cam16_padc_inverse(vec3<f32>(ra, ga, ba)) / CAM16_D_RGB;
+    let rgb = cam16_padc_inverse(vec3<f32>(ra, ga, ba)) / params.cam16_white.xyz;
     return mv(CAM16_M16I_R0, CAM16_M16I_R1, CAM16_M16I_R2, rgb) / 100.0;
+}
+
+const JZ_D: f32 = -0.56;
+const JZ_D0: f32 = 1.6295499532821566e-11;
+const JZ_B: f32 = 1.15;
+const JZ_G: f32 = 0.66;
+const JZ_PQ_C1: f32 = 3424.0 / 4096.0;
+const JZ_PQ_C2: f32 = 2413.0 / 128.0;
+const JZ_PQ_C3: f32 = 2392.0 / 128.0;
+const JZ_PQ_M1: f32 = 2610.0 / 16384.0;
+const JZ_PQ_M2: f32 = 1.7 * 2523.0 / 32.0;
+
+// Evaluate PQ's power near one without rounding away the small offset
+// before raising the ratio to a large exponent.
+fn pq_forward(powered: f32) -> f32 {
+    let offset = fma(JZ_PQ_C2 - JZ_PQ_C3, powered, JZ_PQ_C1 - 1.0)
+        / fma(JZ_PQ_C3, powered, 1.0);
+    let ratio = 1.0 + offset;
+    if ratio == 1.0 {
+        return exp(JZ_PQ_M2 * offset);
+    }
+    if abs(offset) < 0.25 {
+        let log_ratio = log(ratio) * (offset / (ratio - 1.0));
+        return exp(JZ_PQ_M2 * log_ratio);
+    }
+    return sign(ratio) * pow(abs(ratio), JZ_PQ_M2);
+}
+
+// Safdar 2017 with the relative XYZ white at 100 cd/m².
+fn xyz_to_jzazbz(xyz: vec3<f32>) -> vec3<f32> {
+    let prime = vec3<f32>(
+        JZ_B * xyz.x - (JZ_B - 1.0) * xyz.z,
+        JZ_G * xyz.y - (JZ_G - 1.0) * xyz.x,
+        xyz.z,
+    );
+    let lms = mv(
+        vec3<f32>(0.41478972, 0.579999, 0.0146480),
+        vec3<f32>(-0.2015100, 1.120649, 0.0531008),
+        vec3<f32>(-0.0166008, 0.264800, 0.6684799),
+        prime,
+    );
+    let powered = sign(lms) * pow(abs(lms) / 100.0, vec3<f32>(JZ_PQ_M1));
+    let lms_p = vec3<f32>(pq_forward(powered.x), pq_forward(powered.y), pq_forward(powered.z));
+    let izab = mv(
+        vec3<f32>(0.5, 0.5, 0.0),
+        vec3<f32>(3.524, -4.066708, 0.542708),
+        vec3<f32>(0.199076, 1.096799, -1.295875),
+        lms_p,
+    );
+    let jz = (1.0 + JZ_D) * izab.x / (1.0 + JZ_D * izab.x) - JZ_D0;
+    return vec3<f32>(jz, izab.yz);
+}
+
+fn jzazbz_to_xyz(lab: vec3<f32>) -> vec3<f32> {
+    let jz = lab.x + JZ_D0;
+    let iz = jz / (1.0 + JZ_D - JZ_D * jz);
+    let lms_p = mv(
+        vec3<f32>(1.0, 0.1386050433, 0.0580473162),
+        vec3<f32>(1.0, -0.1386050433, -0.0580473162),
+        vec3<f32>(1.0, -0.0960192420, -0.8118918961),
+        vec3<f32>(iz, lab.yz),
+    );
+    let powered = sign(lms_p) * pow(abs(lms_p), vec3<f32>(1.0 / JZ_PQ_M2));
+    let ratio = max(powered - JZ_PQ_C1, vec3<f32>(0.0))
+        / fma(vec3<f32>(-JZ_PQ_C3), powered, vec3<f32>(JZ_PQ_C2));
+    let lms = 100.0 * sign(ratio) * pow(abs(ratio), vec3<f32>(1.0 / JZ_PQ_M1));
+    let prime = mv(
+        vec3<f32>(1.924226436, -1.004792313, 0.037651404),
+        vec3<f32>(0.350316762, 0.726481194, -0.065384423),
+        vec3<f32>(-0.090982811, -0.312728291, 1.522766561),
+        lms,
+    );
+    let x = (prime.x + (JZ_B - 1.0) * prime.z) / JZ_B;
+    let y = (prime.y + (JZ_G - 1.0) * x) / JZ_G;
+    return vec3<f32>(x, y, prime.z);
 }
 
 // Bilinear C_max(L, h) lookup — L clamped to the table bounds, h wraps.
@@ -263,12 +336,16 @@ fn compress_aces_rgc(rgb: vec3<f32>) -> vec3<f32> {
 }
 
 fn compress_perceptual(rgb: vec3<f32>) -> vec3<f32> {
-    let xyz = mv(RGB2XYZ_R0, RGB2XYZ_R1, RGB2XYZ_R2, rgb);
+    if all(rgb == vec3<f32>(0.0)) {
+        return rgb;
+    }
+    let to_xyz = params.rgb_to_xyz;
+    let xyz = mv(to_xyz[0].xyz, to_xyz[1].xyz, to_xyz[2].xyz, rgb);
     var lab: vec3<f32>;
-    if params.mode == 3u {
-        lab = xyz_to_cam16ucs(xyz);
-    } else {
-        lab = xyz_to_oklab(xyz);
+    switch params.mode {
+        case 3u: { lab = xyz_to_cam16ucs(xyz); }
+        case 4u: { lab = xyz_to_jzazbz(xyz); }
+        default: { lab = xyz_to_oklab(xyz); }
     }
     // One-sided lightness compression first (so C_max is looked up at the
     // corrected L), normalized by the perceptual white.
@@ -295,12 +372,13 @@ fn compress_perceptual(rgb: vec3<f32>) -> vec3<f32> {
     let c_new = d_comp * safe;
     let lab_new = vec3<f32>(l, c_new * cos(h), c_new * sin(h));
     var xyz_new: vec3<f32>;
-    if params.mode == 3u {
-        xyz_new = cam16ucs_to_xyz(lab_new);
-    } else {
-        xyz_new = oklab_to_xyz(lab_new);
+    switch params.mode {
+        case 3u: { xyz_new = cam16ucs_to_xyz(lab_new); }
+        case 4u: { xyz_new = jzazbz_to_xyz(lab_new); }
+        default: { xyz_new = oklab_to_xyz(lab_new); }
     }
-    return mv(XYZ2RGB_R0, XYZ2RGB_R1, XYZ2RGB_R2, xyz_new);
+    let to_rgb = params.xyz_to_rgb;
+    return mv(to_rgb[0].xyz, to_rgb[1].xyz, to_rgb[2].xyz, xyz_new);
 }
 
 @compute @workgroup_size(1024)

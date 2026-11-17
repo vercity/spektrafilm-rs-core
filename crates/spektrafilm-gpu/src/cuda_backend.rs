@@ -1665,11 +1665,12 @@ impl CudaBackend {
         let cmax_dev = self.stream.clone_htod(&cmax_f32)?;
         let light = gp.lightness.unwrap_or([0.0, 1.0, 1.0]);
         let light_enable = if gp.lightness.is_some() { 1u32 } else { 0u32 };
+        let mode = gp.mode as u32;
         let mut launch = self.stream.launch_builder(&self.gamut_kernel);
         launch
             .arg(img)
             .arg(&n_pixels)
-            .arg(&gp.mode)
+            .arg(&mode)
             .arg(&gp.n_l)
             .arg(&gp.n_h)
             .arg(&gp.knee[0])
@@ -1691,10 +1692,9 @@ impl CudaBackend {
         &self,
         img: &mut CudaSlice<f32>,
         n_pixels: u32,
+        rgb_matrix: &[[f64; 3]; 3],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use spektrafilm_math::colorspace::{SRGB_TO_XYZ_F64, XYZ_TO_SRGB_F64, mat3_mul3_f64};
-
-        let matrix = matrix_f32(&mat3_mul3_f64(&XYZ_TO_SRGB_F64, &SRGB_TO_XYZ_F64));
+        let matrix = matrix_f32(rgb_matrix);
         let matrix_dev = self.stream.clone_htod(&matrix)?;
         let mut launch = self.stream.launch_builder(&self.post_scan_kernel);
         launch.arg(img).arg(&n_pixels).arg(&matrix_dev);
@@ -2172,8 +2172,8 @@ impl CudaBackend {
             self.run_unsharp_device(&mut buf_b, &mut buf_a, image.width, image.height, up)?;
         }
 
-        if p.output_cctf_encoding {
-            self.run_post_scan_device(&mut buf_b, n_pixels)?;
+        if let Some(rgb_matrix) = p.device_srgb_matrix.as_ref() {
+            self.run_post_scan_device(&mut buf_b, n_pixels, rgb_matrix)?;
         }
 
         let out = self.stream.clone_dtoh(&buf_b)?;
@@ -2292,6 +2292,12 @@ impl ComputeBackend for CudaBackend {
                 None
             }
         }
+    }
+
+    fn supports_resident_gamut(&self, gamut: &crate::GamutGpuParams<'_>) -> bool {
+        gamut.mode == crate::GamutMode::AcesRgc
+            || (gamut.mode != crate::GamutMode::Jzazbz
+                && gamut.target == spektrafilm_math::colorspace::RgbSpace::Srgb)
     }
 
     fn resident_chain_applies_post_scan(&self) -> bool {

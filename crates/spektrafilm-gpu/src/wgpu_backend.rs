@@ -1513,9 +1513,9 @@ impl WgpuBackend {
             .enlarger_diffusion
             .as_ref()
             .map(|_| build_linear_to_log_state(&self.device, n_pixels, &buf_b, self));
-        let post_scan_state = p
-            .output_cctf_encoding
-            .then(|| build_post_scan_state(&self.device, n_pixels, &buf_b, self));
+        let post_scan_state = p.device_srgb_matrix.map(|rgb_matrix| {
+            build_post_scan_state(&self.device, n_pixels, &buf_b, rgb_matrix, self)
+        });
 
         // ── Single command buffer chaining everything ────────────────────
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -2121,6 +2121,10 @@ impl ComputeBackend for WgpuBackend {
 
     fn try_run_film_chain(&self, params: &crate::FilmChainParams<'_>) -> Option<ImageBuf> {
         Some(self.run_film_chain(params))
+    }
+
+    fn supports_resident_gamut(&self, _gamut: &crate::GamutGpuParams<'_>) -> bool {
+        true
     }
 
     fn resident_chain_applies_post_scan(&self) -> bool {
@@ -3622,9 +3626,9 @@ fn build_post_scan_state(
     device: &wgpu::Device,
     n_pixels: u32,
     img: &wgpu::Buffer,
+    rgb_matrix: [[f64; 3]; 3],
     backend: &WgpuBackend,
 ) -> InplaceUnaryState {
-    use spektrafilm_math::colorspace::{SRGB_TO_XYZ_F64, XYZ_TO_SRGB_F64, mat3_mul3_f64};
     use wgpu::util::DeviceExt;
     #[repr(C)]
     #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -3633,8 +3637,7 @@ fn build_post_scan_state(
         _pad: [u32; 3],
         rows: [[f32; 4]; 3],
     }
-    let rows = mat3_mul3_f64(&XYZ_TO_SRGB_F64, &SRGB_TO_XYZ_F64)
-        .map(|[r, g, b]| [r as f32, g as f32, b as f32, 0.0]);
+    let rows = rgb_matrix.map(|[r, g, b]| [r as f32, g as f32, b as f32, 0.0]);
     let pipe = backend.cached_pipeline(
         include_str!("../../spektrafilm-shaders/wgsl/post_scan.wgsl"),
         &[
@@ -4847,7 +4850,12 @@ fn build_gamut_state(
         knee: [f32; 4],
         lightness: [f32; 4],
         lspace: [f32; 4],
+        rgb_to_xyz: [[f32; 4]; 3],
+        xyz_to_rgb: [[f32; 4]; 3],
+        cam16_white: [f32; 4],
     }
+    let padded_rgb_matrix =
+        |matrix: [[f64; 3]; 3]| matrix.map(|[a, b, c]| [a as f32, b as f32, c as f32, 0.0]);
     let lightness = match gp.lightness {
         Some([t, l, p]) => [t, l, p, 1.0],
         None => [0.0, 1.0, 1.0, 0.0],
@@ -4856,12 +4864,15 @@ fn build_gamut_state(
         label: Some("gamut_params"),
         contents: bytemuck::bytes_of(&GamutParams {
             n_pixels,
-            mode: gp.mode,
+            mode: gp.mode as u32,
             n_l: gp.n_l,
             n_h: gp.n_h,
             knee: [gp.knee[0], gp.knee[1], gp.knee[2], 0.0],
             lightness,
             lspace: [gp.l_white, gp.l_min, gp.l_max, 0.0],
+            rgb_to_xyz: padded_rgb_matrix(gp.target.to_xyz()),
+            xyz_to_rgb: padded_rgb_matrix(gp.target.from_xyz()),
+            cam16_white: gp.cam16_white,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });

@@ -532,7 +532,10 @@ impl Pipeline {
         // rendering handles the internal print and scan LUTs.
         if !backend.is_gpu()
             || (self.tc_lut.is_none() && self.mallett_core.is_none())
-            || self.output_gamut.requires_staged_rendering()
+            || self
+                .output_gamut
+                .gpu_params()
+                .is_some_and(|gamut| !backend.supports_resident_gamut(&gamut))
             || self.params.settings.use_scanner_lut
             || (!self.params.io.scan_film && self.params.settings.use_enlarger_lut)
         {
@@ -1090,7 +1093,9 @@ impl Pipeline {
             diffusion,
             enlarger_diffusion,
             print_exposure_scale,
-            output_cctf_encoding: self.device_encodes_srgb(backend),
+            device_srgb_matrix: self.device_encodes_srgb(backend).then(|| {
+                stages::scanning::rgb_to_rgb_identity_matrix(&self.params.io.output_color_space)
+            }),
         };
         backend.try_run_film_chain(&params)
     }
@@ -1122,6 +1127,66 @@ mod tests {
 
     fn data_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")
+    }
+
+    #[test]
+    #[ignore = "requires a native wgpu adapter"]
+    fn resident_gamut_matches_cpu_for_wide_spaces_and_jzazbz() {
+        use spektrafilm_gpu::wgpu_backend::WgpuBackend;
+
+        let backend = WgpuBackend::new().expect("native wgpu adapter");
+        let dir = data_dir();
+        let film = crate::profile::load_profile_by_name(&dir, "kodak_ektar_100").unwrap();
+        let paper = crate::profile::load_profile_by_name(&dir, "kodak_ultra_endura").unwrap();
+        let samples = [
+            [0.0, 0.0, 0.0],
+            [0.0001, 0.0004, 0.0002],
+            [0.18, 0.18, 0.18],
+            [1.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [2.5, 1.0, 0.2],
+            [0.06, 0.6, 2.3],
+        ];
+        let data = samples.into_iter().flatten().map(from_f64).collect();
+        let image = ImageBuf::from_data(samples.len() as u32, 1, data);
+        let mut params = RuntimeParams::default();
+        params.io.input_cctf_decoding = false;
+        params.camera.auto_exposure = false;
+        params.film_render.halation.active = false;
+        params.film_render.halation.boost_ev = 0.0;
+        params.film_render.dir_couplers.active = false;
+        params.film_render.grain.active = false;
+        params.print_render.glare.active = false;
+        params.scanner.unsharp_mask = [0.0; 2];
+
+        for (space, mode, encoded, tolerance) in [
+            ("Display P3", "cam16ucs", true, 5e-5),
+            ("DCI-P3", "cam16ucs", false, 5e-5),
+            ("Adobe RGB (1998)", "oklrab", true, 5e-5),
+            ("ProPhoto RGB", "oklch", false, 5e-5),
+            ("sRGB", "jzazbz", true, 4e-4),
+            ("ITU-R BT.2020", "jzazbz", false, 4e-4),
+        ] {
+            params.io.output_color_space = space.into();
+            params.io.output_cctf_encoding = encoded;
+            params.io.output_gamut_compress.algorithm = mode.into();
+            let pipeline =
+                Pipeline::new_with_spectral(film.clone(), paper.clone(), params.clone(), &dir)
+                    .unwrap();
+            let gpu = pipeline
+                .process_resident_borrowed(&image, &backend)
+                .unwrap_or_else(|| panic!("{space} / {mode} missed the resident path"));
+            let cpu = pipeline.process(image.clone(), &CpuBackend);
+            for (channel, (&gpu, &cpu)) in gpu.data.iter().zip(&cpu.data).enumerate() {
+                let delta = (gpu as f64 - cpu as f64).abs();
+                assert!(
+                    delta < tolerance,
+                    "{space} / {mode}, channel {channel}: GPU {gpu}, CPU {cpu}, delta {delta}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -380,7 +380,7 @@ pub(crate) fn apply_output_cctf(rgb: &mut ImageBuf, io: &crate::params::IoParams
 /// (CAT02 collapses to identity when src/dst whites match), but the
 /// product of 4-decimal-rounded sRGB matrices isn't exactly the
 /// identity in f64.
-fn rgb_to_rgb_identity_matrix(name: &str) -> [[f64; 3]; 3] {
+pub(crate) fn rgb_to_rgb_identity_matrix(name: &str) -> [[f64; 3]; 3] {
     let space = colorspace::RgbSpace::from_name(name).unwrap_or(colorspace::RgbSpace::Srgb);
     colorspace::mat3_mul3_f64(&space.from_xyz(), &space.to_xyz())
 }

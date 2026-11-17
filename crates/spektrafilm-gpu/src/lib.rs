@@ -134,6 +134,11 @@ pub trait ComputeBackend: Send + Sync {
         None
     }
 
+    /// Whether the resident chain implements this output gamut compressor.
+    fn supports_resident_gamut(&self, _gamut: &GamutGpuParams<'_>) -> bool {
+        false
+    }
+
     /// Whether the resident chain can apply the optional device sRGB
     /// encoding. Backends default to returning linear RGB.
     fn resident_chain_applies_post_scan(&self) -> bool {
@@ -234,9 +239,9 @@ pub struct FilmChainParams<'a> {
     /// when `enlarger_diffusion` is active so it can preserve the CPU
     /// print-stage ordering around preflash.
     pub print_exposure_scale: f64,
-    /// Whether to apply sRGB encoding before the resident output is read back.
-    /// Leave false for linear results and for other transfer functions.
-    pub output_cctf_encoding: bool,
+    /// Apply the sRGB transfer on device after this same-space RGB transform.
+    /// If omitted, leave the resident buffer linear for host readback.
+    pub device_srgb_matrix: Option<[[f64; 3]; 3]>,
 }
 
 /// RGB → film-raw front pass of the GPU-resident chain. Both variants are
@@ -317,6 +322,17 @@ pub struct GrainGpuParams {
     pub monochrome: bool,
 }
 
+/// Selector shared by the Rust, WGSL, and CUDA gamut passes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum GamutMode {
+    AcesRgc = 0,
+    Oklch = 1,
+    Oklrab = 2,
+    Cam16ucs = 3,
+    Jzazbz = 4,
+}
+
 /// Output gamut compression parameters for the GPU-resident per-pixel pass.
 /// CPU equivalent: `OutputGamutCompress::compress`. The `C_max(L, h)` table
 /// is baked once on the CPU (bisection against the output cube) and uploaded
@@ -324,9 +340,11 @@ pub struct GrainGpuParams {
 /// perceptual transform + Reinhard knee.
 #[derive(Debug, Clone, Copy)]
 pub struct GamutGpuParams<'a> {
-    /// 0 = aces_rgc, 1 = oklch, 2 = oklrab, 3 = cam16ucs — must match the
-    /// mode dispatch in `gamut_compress.wgsl`.
-    pub mode: u32,
+    pub mode: GamutMode,
+    /// Supplies the linear RGB ↔ XYZ transforms for the display primaries.
+    pub target: spektrafilm_math::colorspace::RgbSpace,
+    /// Per-channel adaptation and achromatic response for the target white.
+    pub cam16_white: [f32; 4],
     /// Reinhard knee on normalized chroma: (threshold, limit, power).
     pub knee: [f32; 3],
     /// One-sided lightness compression (threshold, limit, power); `None` off.
