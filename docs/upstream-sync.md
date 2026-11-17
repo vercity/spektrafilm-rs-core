@@ -104,7 +104,7 @@ RAW 由 CLI、GUI 和 `decode_raw_gui` 共用。方向及有效区在模拟前�
 
 DNG 直接渲染与输出后重新读取带 ACES 标记的 float32 TIFF，在 f64 胶片曝光阶段逐位一致。以 DNG 测 as-shot、daylight、tungsten、自定义 5000 K／1.15，曝光对数 P99 绝对误差为 `0.0316–0.0504`。NEF 原生高光最大到 `1.4163`，Python 的 16 位 RAW 输出最大为 `1.0`。单像素最大差异为 `1.1444`，后续需单独验证去马赛克与高光。
 
-CLI 使用 `--raw-lens-correction` 开启 Lensfun。匹配到直线投影镜头时应用暗角、自动缩放、径向畸变与逐通道 TCA，顺序在分析白平衡和 tint 前。未匹配到镜头时保持原图。CLI 端到端实测 Fuji 裁切图的线性 RGB 最大变化为 `0.00571`，缺镜头信息的 DNG 重跑逐位一致。以同一份 Python 解出的 Fuji 6032×4028 线性 ACES 输入隔离验证，XF35mmF1.4 R @35 mm、f/2.8 的校正结果与 Python lensfunpy 的 P99 绝对误差为 `0.001779`，平均 `0.0002291`，最大 `0.009976`。同一输入关闭校正时，对 Python 校正结果的 P99 为 `0.103072`。非直线投影到直线投影的转换仍待对齐。原生依赖是 [Lensfun Rust 0.7](https://github.com/vdavid/lensfun-rs)，算法许可为 LGPL-3.0-or-later，捆绑数据库许可为 CC BY-SA 3.0。
+CLI 使用 `--raw-lens-correction` 开启 Lensfun。匹配到镜头时应用暗角、自动缩放、投影、径向畸变和逐通道 TCA，再做白平衡分析和 tint 调整。未匹配到镜头时保持原图。七种非直线投影和真实 Fuji RAF 的对照结果见[高阶插值、镜头投影与 GPU 光学验收](#高阶插值镜头投影与-gpu-光学验收)。实现依赖 [Lensfun Rust 0.7](https://github.com/vdavid/lensfun-rs)，算法许可为 LGPL-3.0-or-later，捆绑数据库许可为 CC BY-SA 3.0。
 
 PNG、JPEG、TIFF、EXR 共用读写。文件中可识别的色域和传递函数优先用于读取，未标记 TIFF 沿用配置，未标记 PNG/JPEG 按 sRGB 编码读取，未标记 EXR 按线性 sRGB 读取。CLI 用 `process --bit-depth 32` 生成 float32 TIFF／EXR，GUI 在 **Output** 选择 **TIFF / EXR bit depth**。设置 `io.output_cctf_encoding=false` 可生成线性输出。
 
@@ -184,7 +184,7 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 
 ## 当前优先级与剩余差距
 
-本次以 Rust `main` 的 `8be7ec5` 和下载的 Python 0.3.4（`3bb2c2d`）为审阅基准。下文优先级适用于下一轮开发。GUI 审阅涵盖打开、预览、参数编辑、全尺寸输出和持久化，LUT 审阅涵盖阶段数值、包结构和离网格验收。
+以下保留基于 Rust `main` 的 `8be7ec5` 和下载的 Python 0.3.4（`3bb2c2d`）的首轮审阅计划。当前进度见 [Python 0.3.4 剩余功能验收](#python-034-剩余功能验收)。GUI 审阅涵盖打开、预览、参数编辑、全尺寸输出和持久化，LUT 审阅涵盖阶段数值、包结构和离网格验收。
 
 ### P0 保证 GUI 导出的输入与目标文件完整（已完成）
 
@@ -299,15 +299,50 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 | 项目 | 验收条件和当前进度 |
 |---|---|
 | GUI 色彩和 RAW 开发 | 输入解释、模拟空间、显示和保存转换已通过 macOS 验收。无标签 V-Log TIFF 显式按 V-Gamut 读取，f64 以 ProPhoto 模拟并导出线性 Rec.2020 TIFF32，ICC 正确，对照原版 colour-science 最大误差 `1.29e-8`。独立切换保存空间时模拟缓冲逐位一致。RAW 白平衡、Lensfun 开关、旋转及重新开发通过合成 Bayer DNG 和真实 Fuji X-Trans 的无窗口操作及 f64 导出测试。Windows 显示通过当前监视器 ICC 转换纹理。1000 个 sRGB→Display P3 样本相对 Python Pillow/LittleCMS 的最大差为一字节，见 [Windows 原生运行 #44122537635](https://github.com/vercity/spektrafilm-rs-core/actions/runs/44122537635)。 |
-| GUI 预设、默认片纸和交互 | 预设与会话已验收。Rust GUI 导入 Python 0.3.4 写出的出厂和非默认 JSON，重新保存后由 Python 解析，摄影机、印相、扫描、色彩、片纸与设置参数在 f32 舍入范围内一致。覆盖启动默认 Gold 200／Supra Endura、换胶片保留纸型、正片直接扫描、重启记忆目录、恢复出厂及损坏文件保护。颗粒分层、染料云、单层粒径及色域 knee 等控件已加入。Ektar／Ultra Endura 交换胶片和相纸的染料通道后，f64 导出与对应 Python 光谱列重排的片纸样本逐位一致。GUI Preview 已先双线性抗锯齿缩小再测光、裁切，1024×768 测试的缩小图和最终 RGB 对照 Python 最大误差为 `5.55e-16` 和 `8.76e-17`。Scan／Export 保持独立比例。原图、相纸背面与模拟结果可独立切换，三个尺寸的水印最大差为 `1/255`。首次显影动画和同尺寸更新渐变沿用 Python 时序，四帧六色参考逐字节一致，预览纹理动画与保存图像独立。高阶显示插值仍待对齐。 |
+| GUI 预设、默认片纸和交互 | 预设与会话已验收。Rust GUI 导入 Python 0.3.4 写出的出厂和非默认 JSON，重新保存后由 Python 解析，摄影机、印相、扫描、色彩、片纸与设置参数在 f32 舍入范围内一致。覆盖启动默认 Gold 200／Supra Endura、换胶片保留纸型、正片直接扫描、重启记忆目录、恢复出厂及损坏文件保护。颗粒分层、染料云、单层粒径及色域 knee 等控件已加入。Ektar／Ultra Endura 交换胶片和相纸的染料通道后，f64 导出与对应 Python 光谱列重排的片纸样本逐位一致。GUI Preview 已先双线性抗锯齿缩小再测光、裁切，1024×768 测试的缩小图和最终 RGB 对照 Python 最大误差为 `5.55e-16` 和 `8.76e-17`。Scan／Export 保持独立比例。原图、相纸背面与模拟结果可独立切换，三个尺寸的水印最大差为 `1/255`。首次显影动画和同尺寸更新渐变沿用 Python 时序，四帧六色参考逐字节一致，预览纹理动画与保存图像独立。高阶显示插值已验收，详见本表下方。 |
 | LUT 编码和命令 | 已验收。覆盖 Python 注册表的 26 个公开输入和 10 个公开输出，含 HLG 的 RGB 耦合 CCTF、相机 Log、P3、Adobe RGB 和独立 Rec.709 矩阵。Ektar 100／Ultra Endura 5³ 各角色的 CUBE 最大节点误差小于 `2e-7`，PyOpenColorIO 2.5 加载并调用已映射端点的处理器。新增兼容入口 `spektrafilm-lut build/list`，支持 TOML 配方、参数覆盖和原版 1-LUT 默认。含自定义色域压缩参数的双相纸 4-LUT 与原版的 17 个 CUBE 路径相同，最大节点差为 `1.01e-7`，ZIP 内 23 个条目名称一致。Rust 原有 `export-lut-bundle` 保留自己的默认值。 |
 | LUT QA | 原版 16 项诊断均可运行，支持 `--qa-print-index`、逐相纸 JSON/HTML 与 ZIP 读回。相同 17³ 4-LUT 文件和 50,000 个固定样本的 D65 ΔE00、ΔITP 统计最大差 `3.40e-6`／`2.37e-6`，Jacobian P99 差约 `1e-11`。单调、六面折回、有效光谱格点、动态范围与趾肩、特性曲线 gamma、Planckian 最大弯角吻合；九张 RG 切片与两张 512² 噪声渐变 PNG 逐像素一致。输入色域三种算法的位移和平滑度差最大 `6.02e-14`；33³ 输出色域凸包比率差 `9.44e-16`、亮部位移差不超过 `1.63e-9`。噪声协方差椭圆、增益热图和色相花瓣的样本数相同，最大增益差 `7.99e-15`。部分图使用 SVG 投影，绘制形式与 Matplotlib 有差异。 |
 | 4-LUT 画质 | 对照两端逐段与重采样结果。65³ Ektar 100／Ultra Endura V-Log→sRGB 三线性／四面体逐段最大 ΔE00 为 6.65／6.28，两端一致，样本仍超出最大值 2.0 的门槛。 |
 | 运行时阶段接口 | 已验收。普通渲染公开 `process_with_taps`，包含 `rgb_pre`、`cmy_print` 等边界，返回工作像素尺寸供从中途继续。Portra 400／Portra Endura 与 Provia 直扫启用全图测光、裁切、1.5× 缩放、空间效果与黑白校正，从每个可达阶段续跑与 Rust 一次渲染逐位一致。Python f64 对照同为 14×9，六个阶段从 `rgb_pre` 到 `rgb_out` 的最大差依次为 `2.22e-15`、`4.34e-9`、`1.66e-7`、`1.05e-7`、`1.70e-7`、`1.59e-7`。 |
 | GUI 渲染默认 | 出厂和 Python 预设的 GUI 渲染采用 17³ 印相和扫描内部 LUT 与原版的快速颗粒统计，Preview、Scan 和 f64 Export 共享这组渲染设置。Ektar／Ultra Endura 的 64×32 f64 GUI Preview 对照 Python 最终 RGB 最大差 `9.72e-17`。Rust 独立库和 CLI 的默认参数保留。 |
 | 自定义 profile 保存 | 已验收。公共 `save_profile` 写回片纸 JSON，保留许可信息、波段空值和黑白片多显影时间，替换前先完整写入同目录暂存文件。Portra 400、Portra Endura 由 Python 原版读取并通过验证，光谱及密度数组形状、空值位置一致，有限数值的最大差为 `1.78e-15`。Rust 额外覆盖 Double-X 与保存失败后保留原件。 |
-| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。另验证 Rec.709、Display P3、DCI-P3 和 Adobe RGB 的线性／编码 ICC 往返与 EXR 标签，Adobe 图像传递指数按 colour-science 采用 563／256。新增可选原生 `libraw` 构建，使用 Python 的 16 位线性 ACES 解码参数。LibRaw 0.22.0 的实测样本为 Bayer DNG、4284×2844 Nikon NEF 和 6032×4028 Fuji X-Trans RAF。NEF／RAF 的机内、日光和钨丝灯白平衡逐位一致，自定义 5000 K／tint 1.15 最大差 `1.19e-7`／`5.96e-8`。无窗口 GUI 打开真实 RAF 后替换源路径，自定义白平衡重新开发和旋转继续使用源图快照，真实 f64 子进程按 0.02 比例导出 81×121 线性 ACES TIFF。默认发布包启用、MakerNote 和非直线镜头校正待验收。Python 对 EXR 跳过 Exiv2 元数据写入。 |
-| GPU 和发布验证 | Windows 原生跑器通过覆盖现有文件、编码失败、取消、目录目标及目标锁定的实测，运行 [Windows export verification #44118951320](https://github.com/vercity/spektrafilm-rs-core/actions/runs/44118951320)。Apple M4 上 12 个色域及传递组合均命中 Metal／wgpu 常驻路径，非 JzAzBz 的 GPU／Python 最大差 `5.67e-6`，JzAzBz 线性 sRGB／BT.2020／V-Gamut 最大差 `8.58e-5`／`6.32e-5`／`1.67e-5`，编码 sRGB 最大差 `1.39e-4`。CUDA 对应 kernel 已通过设备 LLVM IR 编译与 host C++ 对照，含负亮度的 11 个模式／空间中 CAM16 最大差 `1.28e-6`，JzAzBz 最大差 `5.46e-5`。散射、分层颗粒仍在实现，CUDA 真机执行与 Lumix 实机仍待测。 |
+| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。另验证 Rec.709、Display P3、DCI-P3 和 Adobe RGB 的线性／编码 ICC 往返与 EXR 标签，Adobe 图像传递指数按 colour-science 采用 563／256。新增可选原生 `libraw` 构建，使用 Python 的 16 位线性 ACES 解码参数。LibRaw 0.22.0 的实测样本为 Bayer DNG、4284×2844 Nikon NEF 和 6032×4028 Fuji X-Trans RAF。NEF／RAF 的机内、日光和钨丝灯白平衡逐位一致，自定义 5000 K／tint 1.15 最大差 `1.19e-7`／`5.96e-8`。无窗口 GUI 打开真实 RAF 后替换源路径，自定义白平衡重新开发和旋转继续使用源图快照，真实 f64 子进程按 0.02 比例导出 81×121 线性 ACES TIFF。macOS 发布包和非直线镜头校正已验收，Windows 打包暂缓，MakerNote 待处理。Python 对 EXR 跳过 Exiv2 元数据写入。 |
+| GPU 和发布验证 | Windows 原生跑器通过覆盖现有文件、编码失败、取消、目录目标及目标锁定的实测，运行 [Windows export verification #44118951320](https://github.com/vercity/spektrafilm-rs-core/actions/runs/44118951320)。Apple M4 上 12 个色域及传递组合均命中 Metal／wgpu 常驻路径，非 JzAzBz 的 GPU／Python 最大差 `5.67e-6`，JzAzBz 线性 sRGB／BT.2020／V-Gamut 最大差 `8.58e-5`／`6.32e-5`／`1.67e-5`，编码 sRGB 最大差 `1.39e-4`。CUDA 对应 kernel 已通过设备 LLVM IR 编译与 host C++ 对照，含负亮度的 11 个模式／空间中 CAM16 最大差 `1.28e-6`，JzAzBz 最大差 `5.46e-5`。GPU 散射和光晕已验收。GPU 分层颗粒已在 Apple M4 上对照，CUDA 真机执行和 Lumix 相机加载待验收。 |
+
+### 高阶插值、镜头投影与 GPU 光学验收
+
+三项均已进入远端 `main` 的 `5d9f855`。工作区测试通过，另跑了 31 项 f64 GUI 测试、Apple GPU 光学回归和 CUDA feature 编译检查。
+
+| 改动 | 与 Python 0.3.4 的对照 |
+|---|---|
+| GUI 高阶显示插值（`fddb2d8`） | cubic、spline16、默认 spline36、Lanczos、Blackman 在 17×13 平移窗口的样本与 VisPy 参考逐像素一致。最近邻和双线性仍可选。高阶插值只生成当前视口纹理，Save／Export 使用原模拟缓冲。见 [视口滤波及测试](../crates/spektrafilm-gui/src/spatial_filter.rs)。 |
+| RAW 非直线镜头投影（`b3d26d1`） | 七种非直线投影各测横向与竖向，同一校准数据与 lensfunpy 1.18.0／Lensfun 0.3.4 原生坐标最大差 `0.000214 px`，线性 RGB 最大差 `1.31e-6`。真实 Fuji RAF 6032×4028 以 32×32 网格均匀抽样，校正开启时 RGB P99 差 `2.55e-6`，最大差 `9.75e-6`，关闭时 3072 个通道样本逐位一致。见 [镜头校正及测试](../crates/spektrafilm-io/src/lens.rs)。 |
+| GPU 散射和光晕（`5d9f855`） | Apple M4 的八组线性 RGB 对照涵盖分通道零半径与混合半径、单行和单列、宽核递归模糊、预闪光及高光增强。Metal 对 Python 和 Rust CPU 的最大绝对差均为 `5.59e-6`，CPU 对 Python 最大差 `6.77e-9`。CUDA 已通过 feature 检查和设备代码编译，NVIDIA 上的实际执行待验收。见 [光学参数和原生 Metal 回归](../crates/spektrafilm-core/src/pipeline.rs)。 |
+
+可复跑 `cargo test --workspace --locked --offline`、`cargo test --locked --offline -p spektrafilm-gui --features precision-f64`、`cargo test --locked --offline -p spektrafilm-core resident_optics_matches_cpu_for_mixed_radii_and_preflash -- --ignored` 和 `cargo check --locked --offline -p spektrafilm-cli --features spektrafilm-gpu/cuda-backend`。光学回归需要本机 wgpu 设备。
+
+### macOS 原生 RAW 发布包验收
+
+macOS 发布流程构建 arm64 应用、f32 CLI、f64 导出程序和 Python 同名的 `spektrafilm-lut`。包内自带 LibRaw 及其动态库依赖。打包时改写运行库加载路径，附上库的许可和来源信息，再签名和生成 ZIP。CLI 用可执行文件相邻的资源目录查找片纸及光谱数据，显式 `--data-dir` 可覆盖。Windows 打包本轮暂缓。
+
+- 用经过校验的 Homebrew Tahoe arm64 二进制包构建并解压，包含 LibRaw 0.22.3、libomp、jpeg-turbo 和 Little CMS。移开构建时的库目录后，签名校验通过，四个动态库从解压后应用的 `Contents/Frameworks` 加载。
+- 在与应用无关的工作目录用 f32 和 f64 CLI 处理同一个 96×72 合成 Bayer DNG，日志明确记录 LibRaw 成功开发，两端均写出 96×72 TIFF32。兼容命令 `spektrafilm-lut build` 用随包数据生成 2³ CUBE 和包描述。以相同合成 DNG 独立对照 Rust LibRaw 0.22.0 和 Python 0.3.4 的开发像素，96×72×3 个线性 ACES 样本逐位一致。
+- 从解压后的应用启动 GUI，实测合成 DNG 与真实 Fuji X-Trans RAF 均通过包内 LibRaw 开发，Metal 显示层已初始化。f64 导出程序通过包内 CLI 入口验证。集成包的 f32 CLI 另在 Apple M4 上读取 DNG，以 wgpu 渲染 Portra 400，日志确认使用了常驻分层颗粒，生成 96×72 TIFF32。
+- 测试宿主使用 Tahoe 二进制包，验证包标注最低 macOS `26.0`。GitHub 发布作业选用 `macos-15` 并按实际 Mach-O 依赖填写最低版本，托管作业尚未执行。
+
+可用 [macOS 打包脚本](../scripts/package_macos_app.sh) 生成 ZIP，再用 [解包验收脚本](../scripts/smoke_macos_package.sh) 复跑签名、RAW 开发、TIFF32 和 LUT 构建验证。
+
+### GPU 分层颗粒验收
+
+GPU 常驻管线使用胶片配置中的乳剂分层密度曲线和三层粒子参数，逐层采样并模糊染料云，再应用微结构团簇和最后的颗粒模糊。缺少可用分层曲线的胶片沿用合计颗粒路径。黑白片共用一个通道的颗粒，正片沿反向密度轴插值。
+
+Apple M4 对照 Python 0.3.4 的九组密度阶段样本共 536,601 像素，涵盖 Portra、Velvia 和 Double-X，并隔离染料云、最终模糊和微结构团簇。逐通道平均光学密度的最大绝对差为 `0.00260`，方差最大相对差为 `7.05%`，出现在混合 FIR／IIR 的强染料云模糊样本中。1×4097 的 Double-X 样本三通道完全一致。完整渲染回归覆盖启用 DIR 的 Portra 负片和 Velvia 正片，以及分层表缺失或损坏时的回退。GPU 与 Python 使用各自的随机序列，颗粒按统计量验收。
+
+Python 快速统计在一组近饱和 Velvia 绿色分层上因二项分布起始概率下溢，产生约 `0.0174` 的平均光学密度偏差。该组用 Python 精确采样复核，另用独立样本覆盖 Python 快速统计。Rust CPU 继续用现有的精确条件二项采样处理该情况，GPU 使用同分布的泊松稀疏化采样。
+
+CUDA 已通过 Rust feature 检查、NVPTX 设备代码编译及同一 kernel 的宿主 C++ 数值对照。宿主 C++ 结果的最大平均密度差为 `0.00260`，最大方差相对差为 `7.04%`。NVIDIA 实机仍待验收。
+
+集成分支通过 182 项工作区测试、31 项 f64 GUI 测试，另在 Apple M4 上执行了三项常驻回归。分层颗粒可用 `cargo test --locked --offline -p spektrafilm-core resident_profiled_grain_preserves_moments_and_aggregate_fallback -- --ignored` 复跑，CUDA 编译使用 `cargo check --locked --offline -p spektrafilm-cli --features precision-f64,spektrafilm-gpu/cuda-backend`。
 
 ### 审阅验证范围
 

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub use spektrafilm_math::colorspace::{
     ACES_TO_XYZ, D50_XYZ, D55_XYZ, D65_XYZ, PROPHOTO_TO_XYZ, REC2020_TO_XYZ, SRGB_TO_XYZ,
     XYZ_TO_ACES, XYZ_TO_PROPHOTO, XYZ_TO_REC2020, XYZ_TO_SRGB,
@@ -13,8 +15,6 @@ pub use spektrafilm_math::spectral::{
 pub const LOG_EXPOSURE_MIN: f32 = -3.0;
 pub const LOG_EXPOSURE_MAX: f32 = 4.0;
 pub const LOG_EXPOSURE_LEN: usize = 256;
-use std::path::PathBuf;
-
 
 /// Locate the profiles and spectral data installed with this executable.
 pub fn bundled_data_dir() -> Option<PathBuf> {
