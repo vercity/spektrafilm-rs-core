@@ -243,6 +243,13 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
     );
     assert_eq!(html.matches("data:image/png;base64,").count(), 11);
     assert!(html.contains("Noise sensitivity"));
+    assert_eq!(
+        diagnostics["noise_sensitivity"]["field"]["heatmap_side"],
+        96
+    );
+    assert!(html.contains("OkLab covariance ellipses"));
+    assert!(html.contains("Worst-case noise gain heatmap"));
+    assert!(html.contains("Hue rosette of luminance and chroma noise"));
     assert!(html.contains("Dynamic range usage"));
     assert!(html.contains("Red–green plane slices"));
 

@@ -18,6 +18,7 @@ mod gamut_edge;
 mod hull;
 mod input_gamut;
 mod model_usage;
+mod noise_field;
 mod noise_gradient;
 mod output_gamut;
 mod report;

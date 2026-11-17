@@ -82,6 +82,11 @@ figcaption{{font-size:.92em}}section+section{{margin-top:2.5rem}}
             "jacobian_condition" => {
                 condition_planes(&mut html, &metrics.diagnostics.condition_planes)?
             }
+            "noise_sensitivity" => {
+                if let Some(noise) = &metrics.diagnostics.noise_sensitivity {
+                    noise_field(&mut html, &noise.field)?;
+                }
+            }
             _ => {}
         }
     }
@@ -536,6 +541,142 @@ fn noise_gradient(html: &mut String, metrics: &Metrics) -> Result<()> {
         )?;
     }
     html.push_str("</div></section>");
+    Ok(())
+}
+
+fn noise_field(html: &mut String, field: &super::noise_field::Field) -> Result<()> {
+    use super::noise_field::HEATMAP_SIDE;
+
+    const SIDE: f64 = 240.0;
+    let half = SIDE * 0.5;
+    let scale = half / field.panel_extent;
+    let project = |[a, b]: [f64; 2]| [half + scale * a, half - scale * b];
+    let has_rosette = field.samples.iter().any(|p| p.hue.is_some());
+    let open = |html: &mut String, label: &str| -> Result<()> {
+        write!(
+            html,
+            r##"<figure><svg viewBox="0 0 {SIDE} {SIDE}" role="img" aria-label="{label}" style="background:#111317">"##
+        )?;
+        Ok(())
+    };
+    let axes = |html: &mut String| -> Result<()> {
+        write!(
+            html,
+            r##"<path d="M0 {half} H{SIDE} M{half} 0 V{SIDE}" stroke="#9b9fa8" opacity=".3"/>"##
+        )?;
+        Ok(())
+    };
+    let outline = |html: &mut String| -> Result<()> {
+        for (line, style) in [
+            (&field.input_outline, r##"stroke="#61a0f9""##),
+            (
+                &field.output_outline,
+                r##"stroke="#f2cb58" stroke-dasharray="4 2""##,
+            ),
+        ] {
+            write!(html, r#"<polygon {style} fill="none" points=""#)?;
+            for &p in line {
+                let [x, y] = project(p);
+                write!(html, "{x:.2} {y:.2} ")?;
+            }
+            html.push_str(r#""/>"#);
+        }
+        Ok(())
+    };
+    let color = |gain: f64| {
+        let f = (gain / field.color_limit).clamp(0.0, 1.0);
+        let r = 26.0 + 229.0 * f;
+        let g = 18.0 + 213.0 * f.powi(3);
+        let b = 66.0 + 112.0 * f;
+        format!("rgb({r:.0},{g:.0},{b:.0})")
+    };
+
+    html.push_str(r#"<div class="panels">"#);
+    open(html, "OkLab covariance ellipses")?;
+    axes(html)?;
+    outline(html)?;
+    for point in &field.samples {
+        let [x0, y0] = project(point.input_ab);
+        let [x, y] = project(point.output_ab);
+        let [rx, ry] = point.ellipse_radii.map(|r| (scale * r).max(0.2));
+        let angle = -point.ellipse_angle_deg;
+        let edge = color(point.sigma1);
+        let [r, g, b] = point.output_rgb.map(|c| c.clamp(0.0, 1.0) * 255.0);
+        write!(
+            html,
+            r##"<path d="M{x0:.2} {y0:.2} L{x:.2} {y:.2}" stroke="#aaa" opacity=".45"/><ellipse cx="{x:.2}" cy="{y:.2}" rx="{rx:.2}" ry="{ry:.2}" transform="rotate({angle:.2} {x:.2} {y:.2})" fill="rgb({r:.0},{g:.0},{b:.0})" stroke="{edge}" opacity=".9"/>"##
+        )?;
+    }
+    html.push_str("</svg><figcaption>OkLab a*/b* noise ellipses at 2σ (1.5× for display)</figcaption></figure>");
+
+    open(
+        html,
+        "Worst-case noise gain heatmap across input OkLab chromaticity",
+    )?;
+    let width = 2.0 * scale * field.domain_extent / (HEATMAP_SIDE - 1) as f64;
+    let edge = field.domain_extent;
+    for (i, value) in field.gain.iter().enumerate() {
+        if let Some(gain) = value {
+            let [x, y] = project([
+                -edge + (i % HEATMAP_SIDE) as f64 * width / scale,
+                -edge + (i / HEATMAP_SIDE) as f64 * width / scale,
+            ])
+            .map(|v| v - width * 0.5);
+            let fill = color(*gain);
+            write!(
+                html,
+                r#"<rect x="{x:.2}" y="{y:.2}" width="{width:.2}" height="{width:.2}" fill="{fill}" shape-rendering="crispEdges"/>"#
+            )?;
+        }
+    }
+    axes(html)?;
+    outline(html)?;
+    write!(
+        html,
+        "</svg><figcaption>Worst-case gain σ₁(J). The color scale runs from 0 to {:.2}.</figcaption></figure>",
+        field.color_limit
+    )?;
+
+    if has_rosette {
+        open(
+            html,
+            "Hue rosette of luminance and chroma noise at mid chroma",
+        )?;
+        let peak = field
+            .samples
+            .iter()
+            .filter(|p| p.hue.is_some())
+            .map(|p| p.sigma_l.max(p.sigma_ab))
+            .fold(1e-6_f64, f64::max);
+        axes(html)?;
+        for grid in [0.25, 0.5, 0.75, 1.0] {
+            let radius = 0.43 * SIDE * grid;
+            write!(
+                html,
+                r##"<circle cx="{half}" cy="{half}" r="{radius:.2}" stroke="#9b9fa8" fill="none" opacity=".3"/>"##
+            )?;
+        }
+        for (chroma, color) in [(false, "#86cfff"), (true, "#ff88a8")] {
+            write!(
+                html,
+                r#"<polygon stroke="{color}" stroke-width="2" fill="{color}" fill-opacity=".11" points=""#
+            )?;
+            for s in &field.samples {
+                if let Some(angle) = s.hue {
+                    let sigma = if chroma { s.sigma_ab } else { s.sigma_l };
+                    let r = (0.43 * SIDE) * sigma / peak;
+                    let [x, y] = [half + r * angle.cos(), half - r * angle.sin()];
+                    write!(html, "{x:.2} {y:.2} ")?;
+                }
+            }
+            html.push_str(r#""/>"#);
+        }
+        write!(
+            html,
+            "</svg><figcaption>Hue rosette. Blue is luminance noise and pink is chroma noise. Outer ring σ={peak:.4}.</figcaption></figure>"
+        )?;
+    }
+    html.push_str("</div><p>Solid blue is the input gamut. Dashed gold is the output gamut.</p>");
     Ok(())
 }
 

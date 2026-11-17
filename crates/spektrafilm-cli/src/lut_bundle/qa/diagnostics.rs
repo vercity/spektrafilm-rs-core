@@ -9,7 +9,7 @@ pub(super) struct Diagnostics {
     jacobian_condition: Option<Summary>,
     total_variation: TotalVariation,
     pub(super) gamut_face_folds: GamutFolds,
-    noise_sensitivity: Option<Noise>,
+    pub(super) noise_sensitivity: Option<Noise>,
     #[serde(skip)]
     pub(super) centerlines: [[f64; 65]; 3],
     #[serde(skip)]
@@ -45,7 +45,7 @@ pub(super) struct GamutFolds {
 }
 
 #[derive(Serialize)]
-struct Noise {
+pub(super) struct Noise {
     input_samples: usize,
     sigma_in_encoded: f64,
     l_slice: f64,
@@ -55,6 +55,7 @@ struct Noise {
     sigma_chroma: Summary,
     max_hue_rotation_deg: f64,
     worst_hue_deg: f64,
+    pub(super) field: super::noise_field::Field,
 }
 
 pub(super) fn evaluate(cube: &Cube, frame: Frame) -> Diagnostics {
@@ -162,7 +163,7 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 // One-sided Jacobi rotations retain relative accuracy for small singular
 // values. Forming JᵀJ explicitly would square the condition number.
-fn singular_values(mut columns: [[f64; 3]; 3]) -> [f64; 3] {
+pub(super) fn singular_values(mut columns: [[f64; 3]; 3]) -> [f64; 3] {
     for _ in 0..12 {
         let mut rotated = false;
         for (i, j) in [(0, 1), (0, 2), (1, 2)] {
@@ -334,56 +335,57 @@ pub(super) fn from_oklab(lab: [f64; 3]) -> [f64; 3] {
 }
 
 fn noise(cube: &Cube, frame: Frame) -> Option<Noise> {
-    const L: f64 = super::noise_gradient::MIDGRAY_OKLAB_L;
-    const SIGMA: f64 = 0.005;
-    const EPS: f64 = 0.005;
+    use super::{
+        noise_field::{Field, PAD, SIGMA, Sample, local_jacobian},
+        noise_gradient::{MIDGRAY_OKLAB_L, in_gamut},
+    };
+
+    let l = MIDGRAY_OKLAB_L;
     let mut sigma1 = Vec::new();
     let mut anisotropy = Vec::new();
     let mut sigma_l = Vec::new();
     let mut sigma_ab = Vec::new();
+    let mut plotted = Vec::new();
     let mut worst_rotation = 0.0;
     let mut worst_hue = 0.0;
     let hue = |v: [f64; 3]| v[2].atan2(v[1]).to_degrees();
-    let oklab_out = |code| to_oklab(to_xyz_qa(cube.trilinear(code), frame.output));
-    let sample_labs =
-        std::iter::once([L, 0.0, 0.0]).chain([0.07, 0.14, 0.21].into_iter().flat_map(|chroma| {
-            (0..16).map(move |i| {
-                let angle = f64::from(i) * std::f64::consts::TAU / 16.0;
-                [L, chroma * angle.cos(), chroma * angle.sin()]
-            })
-        }));
+    let sample_labs = std::iter::once(([l, 0.0, 0.0], None)).chain(
+        [0.07, 0.14, 0.21]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(ring, chroma)| {
+                (0..16).map(move |i| {
+                    let h = f64::from(i) * (std::f64::consts::TAU / 16.0);
+                    (
+                        [l, chroma * h.cos(), chroma * h.sin()],
+                        (ring == 1).then_some(h),
+                    )
+                })
+            }),
+    );
     let matrix = from_xyz_matrix(frame.input);
-    for lab in sample_labs {
+    for (lab, ring_hue) in sample_labs {
         let linear = mat_vec(matrix, from_oklab(lab));
-        if !linear.iter().all(|v| (0.0..=1.0).contains(v)) {
+        if !in_gamut(linear) {
             continue;
         }
-        let code = frame.input.encode(linear.map(|v| v / frame.gain));
-        if !code.iter().all(|&v| v > 0.006 && v < 0.994) {
+        let code = frame.input.encode(linear.map(|value| value / frame.gain));
+        if !code.iter().all(|&v| v > PAD && v < 1.0 - PAD) {
             continue;
         }
-        let jacobian = std::array::from_fn(|axis| {
-            let mut plus = code;
-            let mut minus = code;
-            plus[axis] += EPS;
-            minus[axis] -= EPS;
-            subtract(oklab_out(plus), oklab_out(minus)).map(|v| v / (2.0 * EPS))
-        });
+        let jacobian = local_jacobian(cube, code, frame.output);
         let [min, _, max] = singular_values(jacobian);
+        let in_lab = to_oklab(to_xyz_qa(code, frame.input));
+        let output_rgb = cube.trilinear(code);
+        let out_lab = to_oklab(to_xyz_qa(output_rgb, frame.output));
+        let sample = Sample::new(in_lab, out_lab, output_rgb, ring_hue, max, &jacobian);
         sigma1.push(max);
         anisotropy.push(max / min.max(1e-9));
-        sigma_l.push(SIGMA * jacobian.iter().map(|j| j[0].powi(2)).sum::<f64>().sqrt());
-        sigma_ab.push(
-            SIGMA
-                * jacobian
-                    .iter()
-                    .map(|j| j[1].powi(2) + j[2].powi(2))
-                    .sum::<f64>()
-                    .sqrt(),
-        );
-        let in_lab = to_oklab(to_xyz_qa(code, frame.input));
+        sigma_l.push(sample.sigma_l);
+        sigma_ab.push(sample.sigma_ab);
+        plotted.push(sample);
         let angle = hue(in_lab);
-        let rotation = ((hue(oklab_out(code)) - angle + 180.0).rem_euclid(360.0) - 180.0).abs();
+        let rotation = ((hue(out_lab) - angle + 180.0).rem_euclid(360.0) - 180.0).abs();
         if in_lab[1].hypot(in_lab[2]) > 1e-3 && rotation > worst_rotation {
             worst_rotation = rotation;
             worst_hue = angle;
@@ -392,12 +394,13 @@ fn noise(cube: &Cube, frame: Frame) -> Option<Noise> {
     (!sigma1.is_empty()).then(|| Noise {
         input_samples: sigma1.len(),
         sigma_in_encoded: SIGMA,
-        l_slice: L,
+        l_slice: l,
         sigma1: Summary::new(sigma1),
         anisotropy: Summary::new(anisotropy),
         sigma_lightness: Summary::new(sigma_l),
         sigma_chroma: Summary::new(sigma_ab),
         max_hue_rotation_deg: worst_rotation,
         worst_hue_deg: worst_hue,
+        field: Field::evaluate(cube, frame, plotted),
     })
 }
