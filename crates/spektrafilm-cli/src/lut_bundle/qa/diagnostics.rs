@@ -8,7 +8,7 @@ pub(super) struct Diagnostics {
     monotonicity: Monotonicity,
     jacobian_condition: Option<Summary>,
     total_variation: TotalVariation,
-    gamut_face_folds: GamutFolds,
+    pub(super) gamut_face_folds: GamutFolds,
     noise_sensitivity: Option<Noise>,
     #[serde(skip)]
     pub(super) centerlines: [[f64; 65]; 3],
@@ -38,9 +38,9 @@ struct TotalVariation {
 }
 
 #[derive(Serialize)]
-struct GamutFolds {
-    fold_triangles: usize,
-    fold_fraction: f64,
+pub(super) struct GamutFolds {
+    pub(super) fold_triangles: usize,
+    pub(super) fold_fraction: f64,
     triangles: usize,
 }
 

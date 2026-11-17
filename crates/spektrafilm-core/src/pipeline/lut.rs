@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use super::Pipeline;
 use crate::color_reference::ColorReference;
+use crate::gamut_compression::OutputGamutCompress;
 use crate::params::{InputGamutCompressParams, RuntimeParams};
 use crate::profile::Profile;
 use crate::stages::{filming, printing, scanning};
@@ -140,6 +141,34 @@ impl LutPipeline {
         )
     }
 
+    /// Run a LUT QA probe before output gamut compression and return the
+    /// compressor that the normal rendering path uses for the same values.
+    pub fn output_gamut_qa(
+        &self,
+        rgb: &ImageBuf,
+    ) -> Result<(ImageBuf, &OutputGamutCompress, &str), LutSampleError> {
+        let pipeline = &self.0;
+        let cmy = self.collect_film_cmy(rgb)?;
+        let (profile, density) = if pipeline.params.io.scan_film {
+            (&pipeline.film, cmy.as_image().clone())
+        } else {
+            let exposure = self.collect_print_log_exposure(&cmy)?;
+            let density = printing::develop(
+                exposure.as_image(),
+                &pipeline.print,
+                &pipeline.params,
+                &CpuBackend,
+            );
+            (&pipeline.print, density)
+        };
+        let output = self.scan_with_gamut(&density, profile, &OutputGamutCompress::identity())?;
+        Ok((
+            output,
+            &pipeline.output_gamut,
+            &pipeline.params.io.output_gamut_compress.algorithm,
+        ))
+    }
+
     /// Collect `log_e_film` from `rgb_in`.
     pub fn collect_film_log_exposure(
         &self,
@@ -229,6 +258,15 @@ impl LutPipeline {
     }
 
     fn scan(&self, density: &ImageBuf, profile: &Profile) -> Result<ImageBuf, LutSampleError> {
+        self.scan_with_gamut(density, profile, &self.0.output_gamut)
+    }
+
+    fn scan_with_gamut(
+        &self,
+        density: &ImageBuf,
+        profile: &Profile,
+        gamut: &OutputGamutCompress,
+    ) -> Result<ImageBuf, LutSampleError> {
         let pipeline = &self.0;
         let rgb = scanning::process(
             density,
@@ -236,7 +274,7 @@ impl LutPipeline {
             &pipeline.params,
             &CpuBackend,
             &ColorReference::identity(),
-            &pipeline.output_gamut,
+            gamut,
         );
         validate_samples(&rgb)?;
         Ok(rgb)

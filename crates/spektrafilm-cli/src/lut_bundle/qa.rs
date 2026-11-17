@@ -15,9 +15,12 @@ use super::transport::Encoding;
 mod curves;
 mod diagnostics;
 mod gamut_edge;
+mod hull;
 mod input_gamut;
 mod model_usage;
+mod output_gamut;
 mod report;
+mod rng;
 mod spectral_envelope;
 
 const SAMPLE_COUNT: usize = 50_000;
@@ -26,18 +29,12 @@ const RNG_SEED: u64 = 20_260_515;
 pub(super) fn reference_samples() -> Vec<[f64; 3]> {
     // NumPy PCG64 state and increment after SeedSequence(RNG_SEED), as used by
     // the Python reference sampler. Its encoded samples are rounded to f32.
-    let mut state = 0xe266_3509_8516_7732_3541_84ff_b93c_a9f7_u128;
-    let mut sample = || {
-        state = state
-            .wrapping_mul(0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645)
-            .wrapping_add(0xba06_a268_7c52_68e2_626c_4d66_6044_bdc9);
-        let word = ((state >> 64) ^ state) as u64;
-        let value = word.rotate_right((state >> 122) as u32);
-        let uniform = (value >> 11) as f64 / (1_u64 << 53) as f64;
-        f64::from(uniform as f32)
-    };
+    let mut rng = rng::Pcg64::new(
+        0xe266_3509_8516_7732_3541_84ff_b93c_a9f7,
+        0xba06_a268_7c52_68e2_626c_4d66_6044_bdc9,
+    );
     (0..SAMPLE_COUNT)
-        .map(|_| std::array::from_fn(|_| sample()))
+        .map(|_| std::array::from_fn(|_| f64::from(rng.uniform() as f32)))
         .collect()
 }
 
@@ -219,6 +216,7 @@ pub(super) struct Metrics {
     hue_twist_oklab: model_usage::HueTwist,
     rg_plane_slices: model_usage::RgPlanes,
     spectral_locus_envelope: spectral_envelope::Envelope,
+    output_gamut_compression: output_gamut::Compression,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_gamut_edge_stress: Option<gamut_edge::Outcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,10 +292,18 @@ pub(super) fn evaluate(
             (effective.trilinear(input), effective.tetrahedral(input))
         })?
     };
+    let diagnostics = diagnostics::evaluate(&effective, frame);
+    let output_gamut_compression = output_gamut::Compression::evaluate(
+        &effective,
+        frame,
+        diagnostics.gamut_face_folds.fold_triangles,
+        diagnostics.gamut_face_folds.fold_fraction,
+    );
     Ok(Metrics {
         sequential,
         resampled,
-        diagnostics: diagnostics::evaluate(&effective, frame),
+        diagnostics,
+        output_gamut_compression,
         characteristic_curve: curves::characteristic(&effective),
         planckian_sweep: curves::planckian(&effective, frame),
         dynamic_range_usage: model_usage::dynamic_range(&effective, frame),
@@ -323,6 +329,7 @@ impl Metrics {
                 },
             },
         );
+        self.output_gamut_compression.evaluate_rim(frame, pipeline);
         self.output_gamut_edge_stress = Some(match gamut_edge::evaluate(frame, pipeline) {
             Ok(panels) => gamut_edge::Outcome::Panels(panels),
             Err(error) => gamut_edge::Outcome::Error {

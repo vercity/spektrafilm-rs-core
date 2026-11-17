@@ -1,0 +1,100 @@
+//! The PCG64 sequence and distributions used by the Python QA harness.
+
+use std::collections::HashSet;
+
+pub(super) struct Pcg64 {
+    state: u128,
+    increment: u128,
+    upper: Option<u32>,
+}
+
+impl Pcg64 {
+    pub(super) fn for_seed_zero() -> Self {
+        // NumPy SeedSequence(0), exposed by PCG64(0).state.
+        Self::new(
+            0x1aa1_b534_5996_452d_0958_5eb7_a695_61e3,
+            0x418d_dadb_3af7_1a82_5881_33bc_4478_73a9,
+        )
+    }
+
+    pub(super) const fn new(state: u128, increment: u128) -> Self {
+        Self {
+            state,
+            increment,
+            upper: None,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645)
+            .wrapping_add(self.increment);
+        let word = ((self.state >> 64) ^ self.state) as u64;
+        word.rotate_right((self.state >> 122) as u32)
+    }
+
+    pub(super) fn uniform(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1_u64 << 53) as f64
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        if let Some(high) = self.upper.take() {
+            return high;
+        }
+        let word = self.next_u64();
+        self.upper = Some((word >> 32) as u32);
+        word as u32
+    }
+
+    fn bounded_index(&mut self, max: usize) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        // Cube sizes fit in 32 bits. NumPy uses 32-bit multiply/reject
+        // for small bounds and keeps the unused half of each PCG64 word.
+        let range = max as u32 + 1;
+        let reject_below = range.wrapping_neg() % range;
+        loop {
+            let product = u64::from(self.next_u32()) * u64::from(range);
+            if product as u32 >= reject_below {
+                return (product >> 32) as usize;
+            }
+        }
+    }
+
+    /// The set selected by NumPy's choice(replace=False) from a cube grid.
+    pub(super) fn choose(&mut self, population: usize, count: usize) -> Vec<usize> {
+        if count == population {
+            // A convex hull is invariant under shuffling all points.
+            return (0..population).collect();
+        }
+        if population > 10_000 && count > population / 50 {
+            // Partial Fisher–Yates shuffle. Sparse swaps capture the tail
+            // without allocating the whole permutation.
+            let mut swaps = std::collections::HashMap::with_capacity(count);
+            let mut result = Vec::with_capacity(count);
+            for i in (population - count..population).rev() {
+                let j = self.bounded_index(i);
+                let at_i = swaps.remove(&i).unwrap_or(i);
+                let at_j = swaps.insert(j, at_i).unwrap_or(j);
+                result.push(if i == j { at_i } else { at_j });
+            }
+            return result;
+        }
+        // Floyd selection. The final shuffle changes the order only.
+        let mut seen = HashSet::with_capacity(count);
+        let mut result = Vec::with_capacity(count);
+        for j in population - count..population {
+            let candidate = self.bounded_index(j);
+            let value = if seen.insert(candidate) {
+                candidate
+            } else {
+                seen.insert(j);
+                j
+            };
+            result.push(value);
+        }
+        result
+    }
+}

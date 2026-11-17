@@ -117,6 +117,7 @@ figcaption{{font-size:.92em}}section+section{{margin-top:2.5rem}}
     model_usage(&mut html, metrics)?;
     spectral_envelope(&mut html, metrics)?;
     input_gamut(&mut html, metrics)?;
+    output_gamut(&mut html, metrics)?;
     html.push_str("</main></html>\n");
     fs::write(directory.join("report.html"), html)
         .with_context(|| format!("writing QA report in {}", directory.display()))
@@ -395,6 +396,121 @@ fn xy_shape(
         write!(html, "{x:.2} {y:.2} ")?;
     }
     html.push_str(r#""/>"#);
+    Ok(())
+}
+
+fn output_gamut(html: &mut String, metrics: &Metrics) -> Result<()> {
+    use super::{
+        output_gamut::SEGMENT_SAMPLES,
+        spectral_envelope::{SIDE, project},
+    };
+    use spektrafilm_core::input_gamut::spectral_locus_xy;
+
+    let diagnostic = &metrics.output_gamut_compression;
+    html.push_str("<section><h2>Output gamut compression</h2><p>Convex-hull volume in output-space OkLab and face folds measure the effective LUT. The rim compares the live model’s linear RGB before and after output compression.</p>");
+    metric_table(html, &serde_json::to_value(diagnostic)?)?;
+    if let Some(error) = diagnostic.error() {
+        write!(html, "<p>{}</p>", escape(error))?;
+    }
+    if let Some(rim) = &diagnostic.rim {
+        let project_lab =
+            |[l, a, b]: [f64; 3]| [0.65 * a - 0.32 * b, 0.48 * l + 0.22 * a + 0.25 * b];
+        let projected: Vec<_> = rim
+            .unbounded_oklab
+            .iter()
+            .chain(&rim.compressed_oklab)
+            .chain(&diagnostic.output_oklab)
+            .map(|&point| project_lab(point))
+            .collect();
+        let side = f64::from(SIDE);
+        let bounds: [[f64; 2]; 2] = std::array::from_fn(|axis| {
+            projected
+                .iter()
+                .fold([f64::INFINITY, f64::NEG_INFINITY], |[lo, hi], p| {
+                    [lo.min(p[axis]), hi.max(p[axis])]
+                })
+        });
+        let lab_screen = |p| {
+            let [x, y] = project_lab(p);
+            let tx =
+                12.0 + (side - 24.0) * (x - bounds[0][0]) / (bounds[0][1] - bounds[0][0]).max(1e-3);
+            let ty =
+                12.0 + (side - 24.0) * (y - bounds[1][0]) / (bounds[1][1] - bounds[1][0]).max(1e-3);
+            [tx, side - ty]
+        };
+        let open = |html: &mut String, label: &str| -> Result<()> {
+            write!(
+                html,
+                r##"<figure><svg viewBox="0 0 {SIDE} {SIDE}" role="img" aria-label="{label}" style="background:#0a0a0a">"##
+            )?;
+            Ok(())
+        };
+        html.push_str(r#"<div class="panels">"#);
+        open(html, "Output rim and LUT gamut in OkLab")?;
+        let skip = (diagnostic.output_oklab.len() / 1600).max(1);
+        for &p in diagnostic.output_oklab.iter().step_by(skip) {
+            let [x, y] = lab_screen(p);
+            write!(
+                html,
+                r##"<circle cx="{x:.2}" cy="{y:.2}" r="1.4" fill="#b9d8ef" opacity=".15"/>"##
+            )?;
+        }
+        let draw = |html: &mut String, i, color: [f64; 3], points: &[[f64; 2]]| -> Result<()> {
+            let [r, g, b] = color.map(|v| (0.26 + 0.74 * v) * 255.0);
+            let dash = if i == 0 {
+                ""
+            } else {
+                r#" stroke-dasharray="3 2""#
+            };
+            for segment in points.chunks_exact(SEGMENT_SAMPLES) {
+                write!(
+                    html,
+                    r#"<polyline fill="none" stroke="rgb({r:.0},{g:.0},{b:.0})" stroke-width="2.2"{dash} points=""#
+                )?;
+                for [x, y] in segment {
+                    write!(html, "{x:.2} {y:.2} ")?;
+                }
+                html.push_str(r#""/>"#);
+            }
+            Ok(())
+        };
+        for (mode, points) in [&rim.unbounded_oklab, &rim.compressed_oklab]
+            .into_iter()
+            .enumerate()
+        {
+            for (segment, colors) in points
+                .chunks_exact(SEGMENT_SAMPLES)
+                .zip(rim.colors.chunks_exact(SEGMENT_SAMPLES))
+            {
+                let projected: Vec<_> = segment.iter().map(|&p| lab_screen(p)).collect();
+                draw(html, mode, colors[SEGMENT_SAMPLES / 2], &projected)?;
+            }
+        }
+        html.push_str("</svg><figcaption>OkLab projection with the delivered LUT sample cloud</figcaption></figure>");
+        open(html, "Output rim in CIE xy")?;
+        xy_shape(html, spectral_locus_xy(), "polygon", "#bbb", 0.65)?;
+        xy_shape(
+            html,
+            &metrics.spectral_locus_envelope.primaries,
+            "polygon",
+            "#eee",
+            0.65,
+        )?;
+        for (mode, points) in [&rim.unbounded_xy, &rim.compressed_xy]
+            .into_iter()
+            .enumerate()
+        {
+            for (segment, colors) in points
+                .chunks_exact(SEGMENT_SAMPLES)
+                .zip(rim.colors.chunks_exact(SEGMENT_SAMPLES))
+            {
+                let projected: Vec<_> = segment.iter().map(|&p| project(p)).collect();
+                draw(html, mode, colors[SEGMENT_SAMPLES / 2], &projected)?;
+            }
+        }
+        html.push_str("</svg><figcaption>CIE xy with output primaries and the spectral locus</figcaption></figure></div><p>Solid lines show the unbounded rim. Dashes show the compressed rim.</p>");
+    }
+    html.push_str("</section>");
     Ok(())
 }
 

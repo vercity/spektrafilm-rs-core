@@ -220,6 +220,11 @@ fn qa_can_select_a_single_paper_without_removing_the_other_paper_from_the_bundle
     assert_eq!(qa_report["planckian_sweep"]["cct_range_k"], "2700-10000");
     assert_eq!(qa_report["spectral_locus_envelope"]["cube_cells"], 125);
     assert!(qa_report["spectral_locus_envelope"]["near_locus_fraction"].is_number());
+    let output_compression = &qa_report["output_gamut_compression"];
+    assert!(output_compression["compression_ratio"].is_number());
+    assert!(output_compression["rim_oog_samples"].is_number());
+    assert!(output_compression["rim_max_displacement"].is_number());
+    assert_eq!(output_compression["compression_algorithm"], "cam16ucs");
     let compression = &qa_report["input_gamut_compression"];
     assert_eq!(
         compression["input_gamut_compression_preview"]["reference_illuminant"],
