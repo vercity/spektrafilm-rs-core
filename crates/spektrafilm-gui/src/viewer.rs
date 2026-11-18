@@ -50,6 +50,7 @@ struct Animation {
 pub(super) struct Viewer {
     pub layer: Layer,
     paper: Option<([usize; 2], egui::TextureHandle)>,
+    startup_input: Option<egui::TextureHandle>,
     input: Option<(InputLayerRequest, egui::TextureHandle)>,
     input_job: Option<(InputLayerRequest, mpsc::Receiver<PreviewTextureData>)>,
     output_frame: Option<Arc<PreviewTextureData>>,
@@ -180,16 +181,30 @@ impl Viewer {
             .texture(ctx, source, image_rect, viewport, mode)
     }
 
-    pub fn layers(&mut self, ui: &mut egui::Ui, input: bool, output: bool) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.layer, Layer::PaperBack, "Paper back");
-            ui.add_enabled_ui(input, |ui| {
-                ui.selectable_value(&mut self.layer, Layer::Input, "Input");
-            });
-            ui.add_enabled_ui(output, |ui| {
-                ui.selectable_value(&mut self.layer, Layer::Output, "Output");
-            });
+    pub fn layers(&mut self, ui: &mut egui::Ui, output: bool) {
+        ui.selectable_value(&mut self.layer, Layer::PaperBack, "Paper back");
+        ui.selectable_value(&mut self.layer, Layer::Input, "Input");
+        ui.add_enabled_ui(output, |ui| {
+            ui.selectable_value(&mut self.layer, Layer::Output, "Output");
         });
+    }
+
+    pub fn startup_size(cap: u32) -> egui::Vec2 {
+        let height = f64::from(cap.max(1));
+        let width = (height * 2.0 / 3.0).round_ties_even().max(1.0);
+        egui::vec2(width as f32, height as f32)
+    }
+
+    pub fn startup_input_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        self.startup_input
+            .get_or_insert_with(|| {
+                ctx.load_texture(
+                    "spektrafilm-startup-input",
+                    egui::ColorImage::new([1, 1], egui::Color32::BLACK),
+                    egui::TextureOptions::NEAREST,
+                )
+            })
+            .clone()
     }
 
     pub fn paper_texture(

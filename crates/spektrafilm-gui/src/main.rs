@@ -335,6 +335,12 @@ fn has_hanatos_surface(film: &profile::Profile) -> bool {
     params.len() == 3 && params.iter().all(|channel| channel.len() == 15)
 }
 
+struct PrintScanSettings {
+    white_correction: bool,
+    black_correction: bool,
+    glare_active: bool,
+}
+
 struct App {
     backend: Arc<dyn ComputeBackend>,
     data_dir: PathBuf,
@@ -352,6 +358,7 @@ struct App {
     print_dev_times: Vec<f64>,
     hanatos_surface_available: bool,
     params: RuntimeParams,
+    print_scan_restore: Option<PrintScanSettings>,
     source: Option<Arc<source_snapshot::SourceSnapshot>>,
     source_rotation: u8,
     raw_develop: RawDevelopSettings,
@@ -382,11 +389,9 @@ struct App {
     auto_preview: bool,
     /// Only the newest render request is queued while a render runs.
     render_request: Option<RenderRequest>,
-    /// Current preview zoom multiplier on top of the fit-to-panel
-    /// scale (1.0 = fit). Mouse wheel adjusts it around the cursor,
-    /// drag pans, double-click resets.
-    zoom: f32,
-    /// Pan offset (screen pixels) added to the preview centre.
+    /// Screen pixels per image pixel. None fits the image to the panel.
+    zoom: Option<f32>,
+    /// Pan offset in egui points relative to the panel centre.
     pan: egui::Vec2,
     gray_canvas: bool,
     white_border: f32,
@@ -520,6 +525,7 @@ impl App {
             print_dev_times,
             hanatos_surface_available: film_profile.as_ref().is_some_and(has_hanatos_surface),
             params,
+            print_scan_restore: None,
             source: None,
             source_rotation: 0,
             raw_develop: RawDevelopSettings::default(),
@@ -546,7 +552,7 @@ impl App {
             render_generation: 0,
             auto_preview: true,
             render_request: None,
-            zoom: 1.0,
+            zoom: None,
             pan: egui::Vec2::ZERO,
             gray_canvas: factory.gray_canvas,
             white_border: factory.white_padding,
@@ -623,6 +629,7 @@ impl App {
             .clone_from(&paper.data.development_time);
         self.hanatos_surface_available = has_hanatos_surface(&film);
         self.params = preset.params;
+        self.print_scan_restore = None;
         self.params.settings.apply_hanatos2025_adaptation_surface &= self.hanatos_surface_available;
         self.manual_input_color = input_color;
         self.override_input_color = preset.override_input_color;
@@ -774,6 +781,7 @@ impl App {
                 self.image = Some(Arc::new(img));
                 self.preview_source = None;
                 self.viewer.source_changed();
+                self.reset_preview_view();
                 self.source = Some(Arc::new(source));
                 self.source_rotation = 0;
                 self.output_tex = None;
@@ -809,6 +817,7 @@ impl App {
                 self.image = Some(Arc::new(image));
                 self.preview_source = None;
                 self.viewer.source_changed();
+                self.reset_preview_view();
                 self.source_metadata = loaded.metadata;
                 self.output_tex = None;
                 self.request_render();
@@ -824,9 +833,33 @@ impl App {
         };
         self.image = Some(Arc::new(image.rotated(clockwise_quarter_turns)));
         self.viewer.source_changed();
+        self.reset_preview_view();
         self.preview_source = None;
         self.source_rotation = (self.source_rotation + clockwise_quarter_turns) % 4;
         self.output_tex = None;
+        self.request_render();
+    }
+
+    fn set_scan_for_print(&mut self, active: bool) {
+        if active == self.print_scan_restore.is_some() {
+            return;
+        }
+        let scanner = &mut self.params.scanner;
+        let glare = &mut self.params.print_render.glare;
+        if active {
+            self.print_scan_restore = Some(PrintScanSettings {
+                white_correction: scanner.white_correction,
+                black_correction: scanner.black_correction,
+                glare_active: glare.active,
+            });
+            scanner.white_correction = true;
+            scanner.black_correction = true;
+            glare.active = false;
+        } else if let Some(previous) = self.print_scan_restore.take() {
+            scanner.white_correction = previous.white_correction;
+            scanner.black_correction = previous.black_correction;
+            glare.active = previous.glare_active;
+        }
         self.request_render();
     }
 
@@ -977,15 +1010,20 @@ impl App {
 
     /// Central-panel preview with mouse-wheel zoom (centred on the
     /// cursor) and click-drag pan. Double-click resets to fit.
-    /// `self.zoom = 1.0` means fit-to-panel; values >1 zoom in.
-    fn draw_preview_with_zoom(&mut self, ui: &mut egui::Ui, tex: &egui::TextureHandle) {
+    fn draw_preview_with_zoom(
+        &mut self,
+        ui: &mut egui::Ui,
+        tex: &egui::TextureHandle,
+        img_size: egui::Vec2,
+    ) {
         let avail = ui.available_size();
-        let img_size = tex.size_vec2();
         let border = (img_size.x.max(img_size.y) * self.white_border).floor();
         let framed_size = img_size + egui::Vec2::splat(2.0 * border);
         let fit_scale = (avail.x / framed_size.x)
             .min(avail.y / framed_size.y)
             .min(1.0);
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let fit_zoom = fit_scale * pixels_per_point;
 
         let response = ui.allocate_response(avail, egui::Sense::click_and_drag());
         let rect = response.rect;
@@ -1015,13 +1053,14 @@ impl App {
         let factor = pinch * scroll_factor;
         if (factor - 1.0).abs() > 1e-4 {
             let cursor = ui.input(|i| i.pointer.hover_pos());
-            let old_zoom = self.zoom;
-            self.zoom = (self.zoom * factor).clamp(0.1, 32.0);
+            let old_zoom = self.zoom.unwrap_or(fit_zoom).max(f32::EPSILON);
+            let zoom = (old_zoom * factor).clamp(0.1 * fit_zoom, (32.0 * fit_zoom).max(4.0));
+            self.zoom = Some(zoom);
             if let Some(cur) = cursor {
                 // Keep the image point under the cursor anchored.
                 let centre = rect.center() + self.pan;
                 let offset_from_centre = cur - centre;
-                let scale_ratio = self.zoom / old_zoom;
+                let scale_ratio = zoom / old_zoom;
                 self.pan += offset_from_centre * (1.0 - scale_ratio);
             }
         }
@@ -1030,12 +1069,11 @@ impl App {
             self.pan += response.drag_delta();
         }
         if response.double_clicked() {
-            self.zoom = 1.0;
-            self.pan = egui::Vec2::ZERO;
+            self.reset_preview_view();
         }
 
         let centre = rect.center() + self.pan;
-        let scale = fit_scale * self.zoom;
+        let scale = self.zoom.unwrap_or(fit_zoom) / pixels_per_point;
         let draw_rect = egui::Rect::from_center_size(centre, img_size * scale);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         // Clip to the central panel so panned-off pixels don't leak.
@@ -1057,12 +1095,10 @@ impl App {
         }
 
         // Zoom indicator + reset chip in the corner.
-        let pct = (self.zoom * fit_scale * 100.0).round() as i32;
-        let text = if (self.zoom - 1.0).abs() < 0.001 && self.pan.length_sq() < 1.0 {
-            "fit".to_string()
-        } else {
-            format!("{pct} %  (double-click to reset)")
-        };
+        let text = self.zoom.map_or_else(
+            || "Fit".to_owned(),
+            |zoom| format!("{:.0}%", 100.0 * zoom),
+        );
         let pos = rect.left_top() + egui::vec2(8.0, 8.0);
         painter.text(
             pos,
@@ -1071,6 +1107,11 @@ impl App {
             egui::FontId::monospace(12.0),
             egui::Color32::from_rgba_premultiplied(220, 220, 220, 200),
         );
+    }
+
+    fn reset_preview_view(&mut self) {
+        self.zoom = None;
+        self.pan = egui::Vec2::ZERO;
     }
 
     fn display_transform_active(&self) -> bool {
@@ -1498,6 +1539,14 @@ impl App {
                 self.set_auto_preview(auto_preview);
             }
         });
+        let mut scan_for_print = self.print_scan_restore.is_some();
+        if ui
+            .checkbox(&mut scan_for_print, "Scan for print")
+            .on_hover_text("Apply white and black scanner correction and turn off glare.")
+            .changed()
+        {
+            self.set_scan_for_print(scan_for_print);
+        }
         if let Some(source) = &self.source {
             ui.label(
                 egui::RichText::new(
@@ -2316,10 +2365,27 @@ impl eframe::App for App {
         self.viewer
             .advance_output(ctx, &mut self.output_tex, &self.preview_interpolation);
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.viewer
-                .layers(ui, self.image.is_some(), self.output_tex.is_some());
+            ui.horizontal(|ui| {
+                self.viewer.layers(ui, self.output_tex.is_some());
+                ui.separator();
+                for (label, zoom) in [("100%", 1.0), ("200%", 2.0), ("400%", 4.0)] {
+                    if ui.button(label).clicked() {
+                        self.zoom = Some(zoom);
+                    }
+                }
+                if ui.button("Reset view").clicked() {
+                    self.reset_preview_view();
+                }
+            });
+            let placeholder_size = self
+                .image
+                .is_none()
+                .then(|| Viewer::startup_size(self.params.settings.preview_max_size));
             let tex = match self.viewer.layer {
                 Layer::PaperBack => Some(self.viewer.paper_texture(ctx, self.image.as_deref())),
+                Layer::Input if placeholder_size.is_some() => {
+                    Some(self.viewer.startup_input_texture(ctx))
+                }
                 Layer::Input => self.image.as_ref().cloned().and_then(|image| {
                     let color = RasterColor::new(
                         &self.params.io.input_color_space,
@@ -2341,7 +2407,8 @@ impl eframe::App for App {
                 Layer::Output => self.output_tex.clone(),
             };
             if let Some(tex) = tex {
-                self.draw_preview_with_zoom(ui, &tex);
+                let size = placeholder_size.unwrap_or_else(|| tex.size_vec2());
+                self.draw_preview_with_zoom(ui, &tex, size);
             } else {
                 ui.centered_and_justified(|ui| {
                     let message = if self.image.is_some() {
@@ -3219,6 +3286,82 @@ fn tag_metal_layer_srgb<H: raw_window_handle::HasWindowHandle>(h: &H) -> Result<
 mod preview_tests {
     use super::*;
     use spektrafilm_gpu::cpu_backend::CpuBackend;
+
+    #[test]
+    fn print_scan_restores_the_three_effect_settings_and_resets_on_preset_load() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut app =
+            App::new_with_preferences(Arc::new(CpuBackend), None, Some(directory.path().into()));
+        app.params.scanner.white_correction = false;
+        app.params.scanner.black_correction = true;
+        app.params.print_render.glare.active = true;
+        let preset = app.current_preset();
+        let effects = |app: &App| {
+            [
+                app.params.scanner.white_correction,
+                app.params.scanner.black_correction,
+                app.params.print_render.glare.active,
+            ]
+        };
+
+        app.set_scan_for_print(true);
+        assert_eq!(effects(&app), [true, true, false]);
+        app.set_scan_for_print(true);
+        app.set_scan_for_print(false);
+        assert_eq!(effects(&app), [false, true, true]);
+
+        app.set_scan_for_print(true);
+        app.apply_preset(preset)?;
+        assert!(app.print_scan_restore.is_none());
+        assert_eq!(effects(&app), [false, true, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_presets_map_image_pixels_to_physical_screen_pixels() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut app =
+            App::new_with_preferences(Arc::new(CpuBackend), None, Some(directory.path().into()));
+        assert!(app.image.is_none());
+        assert_eq!(Viewer::startup_size(101), egui::vec2(67.0, 101.0));
+        let ctx = egui::Context::default();
+        app.white_border = 0.0;
+        for pixels_per_point in [1.0, 1.5, 2.0] {
+            for zoom in [1.0, 2.0, 4.0] {
+                app.zoom = Some(zoom);
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .native_pixels_per_point = Some(pixels_per_point);
+                let texture = app.viewer.startup_input_texture(&ctx);
+                let size = Viewer::startup_size(101);
+                let output = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.draw_preview_with_zoom(ui, &texture, size);
+                    });
+                });
+                let rect = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture.id() => {
+                        Some(mesh.calc_bounds())
+                    }
+                    _ => None,
+                });
+                let physical = rect.unwrap().size() * pixels_per_point;
+                assert!((physical - size * zoom).length() < 0.001);
+            }
+        }
+        app.reset_preview_view();
+        assert!(app.zoom.is_none());
+        Ok(())
+    }
 
     #[test]
     fn output_depths_are_independent_for_each_format() {
