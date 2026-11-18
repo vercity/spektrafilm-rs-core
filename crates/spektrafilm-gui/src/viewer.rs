@@ -189,10 +189,10 @@ impl Viewer {
         });
     }
 
-    pub fn startup_size(cap: u32) -> egui::Vec2 {
-        let height = f64::from(cap.max(1));
-        let width = (height * 2.0 / 3.0).round_ties_even().max(1.0);
-        egui::vec2(width as f32, height as f32)
+    pub fn startup_size(cap: u32) -> [u32; 2] {
+        let height = cap.max(1);
+        let width = (f64::from(height) * 2.0 / 3.0).round_ties_even().max(1.0);
+        [width as u32, height]
     }
 
     pub fn startup_input_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
@@ -207,12 +207,7 @@ impl Viewer {
             .clone()
     }
 
-    pub fn paper_texture(
-        &mut self,
-        ctx: &egui::Context,
-        image: Option<&ImageBuf>,
-    ) -> egui::TextureHandle {
-        let [w, h] = image.map_or([2, 3], |image| [image.width, image.height]);
+    pub fn paper_texture(&mut self, ctx: &egui::Context, [w, h]: [u32; 2]) -> egui::TextureHandle {
         let dimensions = paper_back::dimensions(w, h);
         if let Some((_, texture)) = self.paper.as_ref().filter(|(size, _)| *size == dimensions) {
             return texture.clone();

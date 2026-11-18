@@ -1095,10 +1095,9 @@ impl App {
         }
 
         // Zoom indicator + reset chip in the corner.
-        let text = self.zoom.map_or_else(
-            || "Fit".to_owned(),
-            |zoom| format!("{:.0}%", 100.0 * zoom),
-        );
+        let text = self
+            .zoom
+            .map_or_else(|| "Fit".to_owned(), |zoom| format!("{:.0}%", 100.0 * zoom));
         let pos = rect.left_top() + egui::vec2(8.0, 8.0);
         painter.text(
             pos,
@@ -2377,13 +2376,14 @@ impl eframe::App for App {
                     self.reset_preview_view();
                 }
             });
-            let placeholder_size = self
-                .image
-                .is_none()
-                .then(|| Viewer::startup_size(self.params.settings.preview_max_size));
+            let input_size = self.image.as_ref().map(|image| [image.width, image.height]);
+            let [paper_width, paper_height] = input_size
+                .unwrap_or_else(|| Viewer::startup_size(self.params.settings.preview_max_size));
             let tex = match self.viewer.layer {
-                Layer::PaperBack => Some(self.viewer.paper_texture(ctx, self.image.as_deref())),
-                Layer::Input if placeholder_size.is_some() => {
+                Layer::PaperBack => {
+                    Some(self.viewer.paper_texture(ctx, [paper_width, paper_height]))
+                }
+                Layer::Input if input_size.is_none() => {
                     Some(self.viewer.startup_input_texture(ctx))
                 }
                 Layer::Input => self.image.as_ref().cloned().and_then(|image| {
@@ -2407,7 +2407,11 @@ impl eframe::App for App {
                 Layer::Output => self.output_tex.clone(),
             };
             if let Some(tex) = tex {
-                let size = placeholder_size.unwrap_or_else(|| tex.size_vec2());
+                let size = if input_size.is_none() {
+                    egui::vec2(paper_width as f32, paper_height as f32)
+                } else {
+                    tex.size_vec2()
+                };
                 self.draw_preview_with_zoom(ui, &tex, size);
             } else {
                 ui.centered_and_justified(|ui| {
@@ -3323,7 +3327,7 @@ mod preview_tests {
         let mut app =
             App::new_with_preferences(Arc::new(CpuBackend), None, Some(directory.path().into()));
         assert!(app.image.is_none());
-        assert_eq!(Viewer::startup_size(101), egui::vec2(67.0, 101.0));
+        assert_eq!(Viewer::startup_size(101), [67, 101]);
         let ctx = egui::Context::default();
         app.white_border = 0.0;
         for pixels_per_point in [1.0, 1.5, 2.0] {
@@ -3342,7 +3346,8 @@ mod preview_tests {
                     .unwrap()
                     .native_pixels_per_point = Some(pixels_per_point);
                 let texture = app.viewer.startup_input_texture(&ctx);
-                let size = Viewer::startup_size(101);
+                let [w, h] = Viewer::startup_size(101);
+                let size = egui::vec2(w as f32, h as f32);
                 let output = ctx.run(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         app.draw_preview_with_zoom(ui, &texture, size);
