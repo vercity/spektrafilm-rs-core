@@ -1,6 +1,8 @@
 //! Shared RGB image input and output for the CLI and GUI.
 
 mod color;
+#[cfg(feature = "exiv2")]
+mod maker_note;
 mod metadata;
 mod transform;
 
@@ -63,6 +65,8 @@ fn read_raster_inner(path: &Path) -> Result<RasterImage> {
     reader.no_limits();
     let mut decoder = reader.into_decoder()?;
     let metadata = RasterMetadata::from_decoder(path, format, &mut decoder);
+    #[cfg(feature = "exiv2")]
+    let metadata = metadata.with_maker_note(path);
     let decoder_icc = decoder.icc_profile().ok().flatten();
     let color = decoder_icc
         .as_deref()
@@ -187,7 +191,10 @@ fn write_raster_inner(
         ImageFormat::Png => write_png(file, image, depth, icc, metadata, color),
         ImageFormat::Jpeg => write_jpeg(file, image, icc, metadata, color),
         _ => unreachable!("validated raster format"),
-    }
+    }?;
+    #[cfg(feature = "exiv2")]
+    metadata.write_maker_note(path)?;
+    Ok(())
 }
 
 fn quantize8(image: &ImageBuf) -> Vec<u8> {
@@ -438,6 +445,52 @@ mod tests {
             let decoded = decoded?;
             assert_eq!(decoded.image.data, [0.0, 1.0, midpoint].map(from_f64));
             assert_eq!(decoded.color, RasterColor::new("sRGB", true));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "exiv2")]
+    #[test]
+    fn exiv2_relocates_camera_metadata_after_the_source_is_gone() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let original = temp.path().join("source.tiff");
+        let mut encoder = TiffEncoder::new(File::create(&original)?)?;
+        let mut exif = encoder.extra_directory()?;
+        // Fujifilm IFD with a Quality tag whose ASCII value is relative to
+        // the start of the note.
+        let note = b"FUJIFILM\x0c\0\0\0\x01\0\0\x10\x02\0\x05\0\0\0\x1e\0\0\0\0\0\0\0FINE\0";
+        exif.write_tag(Tag::Unknown(0x927c), note.as_slice())?;
+        let exif_offset = exif.finish_with_offsets()?.offset;
+        let mut input = encoder.new_image::<colortype::RGB8>(2, 1)?;
+        input.encoder().write_tag(Tag::Make, "FUJIFILM")?;
+        input.encoder().write_tag(Tag::Model, "X-T2")?;
+        input.encoder().write_tag(Tag::ExifDirectory, exif_offset)?;
+        input.write_data(&[1, 2, 3, 4, 5, 6])?;
+        drop(encoder);
+
+        let source = read_raster(&original)?;
+        std::fs::remove_file(&original)?;
+        let image = ImageBuf::new(3, 2);
+        for extension in ["jpg", "png", "tiff"] {
+            let path = temp.path().join(format!("export.{extension}"));
+            write_raster(
+                &path,
+                &image,
+                &RasterWriteOptions {
+                    color_space: Some("sRGB"),
+                    cctf_encoding: true,
+                    source_metadata: Some(&source.metadata),
+                    ..Default::default()
+                },
+            )?;
+            let bytes = std::fs::read(&path)?;
+            assert!(
+                bytes.windows(5).any(|window| window == b"FINE\0"),
+                "{extension}"
+            );
+            let reopened = read_raster(&path)?;
+            assert_eq!((reopened.image.width, reopened.image.height), (3, 2));
+            assert_eq!(reopened.color, RasterColor::new("sRGB", true));
         }
         Ok(())
     }

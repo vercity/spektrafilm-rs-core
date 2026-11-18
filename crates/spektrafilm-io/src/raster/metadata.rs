@@ -22,6 +22,8 @@ use tiff::{
 };
 
 use super::RasterColor;
+#[cfg(feature = "exiv2")]
+use super::maker_note::MakerNote;
 
 const EXIF_IFD: u16 = 0x8769;
 const GPS_IFD: u16 = 0x8825;
@@ -45,6 +47,8 @@ pub struct RasterMetadata {
     pub(super) icc: Option<Vec<u8>>,
     // JPEG APP13 and TIFF tag 34377 both use Photoshop Image Resources.
     photoshop: Option<Vec<u8>>,
+    #[cfg(feature = "exiv2")]
+    maker_note: Option<std::sync::Arc<MakerNote>>,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +150,8 @@ impl RasterMetadata {
             xmp: packet(XMP_TAG),
             icc: packet(34675),
             photoshop,
+            #[cfg(feature = "exiv2")]
+            maker_note: None,
         })
     }
 
@@ -170,6 +176,20 @@ impl RasterMetadata {
         let mut output = Self::from_tiff(&mut bytes).unwrap_or_default();
         output.xmp = xmp;
         Ok(output)
+    }
+
+    #[cfg(feature = "exiv2")]
+    pub(super) fn with_maker_note(mut self, path: &Path) -> Self {
+        self.maker_note = MakerNote::read(path).map(std::sync::Arc::new);
+        self
+    }
+
+    #[cfg(feature = "exiv2")]
+    pub(super) fn write_maker_note(&self, path: &Path) -> Result<()> {
+        if let Some(note) = &self.maker_note {
+            note.write(path)?;
+        }
+        Ok(())
     }
 
     pub(super) fn write_subdirectories<W: Write + Seek>(
@@ -349,7 +369,10 @@ pub(super) fn read_source_metadata(path: &Path) -> RasterMetadata {
         let mut decoder = reader.into_decoder().ok()?;
         Some(RasterMetadata::from_decoder(path, format, &mut decoder))
     };
-    raw().or_else(raster).unwrap_or_default()
+    let metadata = raw().or_else(raster).unwrap_or_default();
+    #[cfg(feature = "exiv2")]
+    let metadata = metadata.with_maker_note(path);
+    metadata
 }
 
 fn update_xmp(xml: &str, description: &str) -> Option<String> {

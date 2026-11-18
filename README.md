@@ -68,6 +68,12 @@ For a custom installation, specify the include and library directories with
 Use `SPEKTRAFILM_LIBRAW_LIBRARY_NAME` if the library's link name differs
 from `raw_r`. The dynamic library must be available at runtime.
 
+The macOS app bundle also includes Exiv2 to carry camera MakerNote fields into
+JPEG, PNG, and TIFF exports. For source builds, enable the `exiv2` feature on
+the GUI and CLI with Exiv2 0.28 or later available to `pkg-config`. Custom
+installations can set `SPEKTRAFILM_EXIV2_INCLUDE_DIR` and
+`SPEKTRAFILM_EXIV2_LIBRARY_DIR`.
+
 ## Usage
 
 ### GUI

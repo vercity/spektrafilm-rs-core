@@ -20,12 +20,24 @@ if [[ -z "${SPEKTRAFILM_LIBRAW_INCLUDE_DIR:-}" && -z "${SPEKTRAFILM_LIBRAW_LIBRA
     export SPEKTRAFILM_LIBRAW_LIBRARY_DIR="$libraw_prefix/lib"
 fi
 
+if [[ -z "${SPEKTRAFILM_EXIV2_INCLUDE_DIR:-}" && -z "${SPEKTRAFILM_EXIV2_LIBRARY_DIR:-}" ]]; then
+    if ! command -v brew >/dev/null || ! exiv2_prefix="$(brew --prefix exiv2)" \
+        || [[ ! -f "$exiv2_prefix/lib/libexiv2.dylib" ]]; then
+        echo "Install Exiv2 0.28 or later for packaging: brew install exiv2" >&2
+        exit 1
+    fi
+    export SPEKTRAFILM_EXIV2_INCLUDE_DIR="$exiv2_prefix/include"
+    export SPEKTRAFILM_EXIV2_LIBRARY_DIR="$exiv2_prefix/lib"
+fi
+
+# Exiv2 can start with a shorter @rpath install name than its bundled path.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-headerpad_max_install_names"
 cargo build --locked --release --target-dir "$BUILD_TARGET_DIR" \
     -p spektrafilm-gui -p spektrafilm-cli \
-    --features spektrafilm-gui/libraw,spektrafilm-cli/libraw \
+    --features spektrafilm-gui/libraw,spektrafilm-gui/exiv2,spektrafilm-cli/libraw,spektrafilm-cli/exiv2 \
     --bin spektrafilm-gui --bin spektrafilm --bin spektrafilm-lut
 cargo build --locked --release --target-dir "$BUILD_TARGET_DIR" -p spektrafilm-cli \
-    --features libraw,precision-f64 --bin spektrafilm-f64
+    --features libraw,exiv2,precision-f64 --bin spektrafilm-f64
 
 rm -rf "$DIST_DIR"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/Notices"
@@ -35,7 +47,8 @@ for executable in spektrafilm-gui spektrafilm spektrafilm-f64 spektrafilm-lut; d
 done
 cp -R data "$APP_BUNDLE/Contents/Resources/data"
 cp LICENSE SPEKTRAFILM_LICENSE.txt "$APP_BUNDLE/Contents/Resources/Notices/"
-bash scripts/bundle_macos_dylibs.sh "$APP_BUNDLE" "$SPEKTRAFILM_LIBRAW_LIBRARY_DIR"
+bash scripts/bundle_macos_dylibs.sh "$APP_BUNDLE" \
+    "$SPEKTRAFILM_LIBRAW_LIBRARY_DIR" "$SPEKTRAFILM_EXIV2_LIBRARY_DIR"
 
 # The selected Homebrew bottle may require a newer macOS than the Rust app.
 minimum_macos="$(
@@ -109,6 +122,7 @@ Backends:
 - CUDA is not available on modern macOS builds.
 
 RAW development uses the bundled LibRaw; no separate install is required.
+JPEG, PNG, and TIFF exports preserve camera MakerNote data using the bundled Exiv2.
 
 Command-line tools in Spektrafilm.app/Contents/MacOS:
 - spektrafilm: image processing (f32) and single 3D CUBE LUT export.

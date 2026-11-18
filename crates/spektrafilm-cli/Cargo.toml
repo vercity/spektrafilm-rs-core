@@ -22,6 +22,7 @@ name = "decode_raw_gui"
 path = "src/bin/decode_raw_gui.rs"
 
 [features]
+exiv2 = ["spektrafilm-io/exiv2"]
 libraw = ["spektrafilm-io/libraw"]
 precision-f64 = [
     "spektrafilm-math/precision-f64",

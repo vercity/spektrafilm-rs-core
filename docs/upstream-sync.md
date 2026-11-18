@@ -306,7 +306,7 @@ Hanatos 与 Rust 扩展 `arctic2026alpha02` 均通过 CLI 验证。对两种上�
 | 运行时阶段接口 | 已验收。普通渲染公开 `process_with_taps`，包含 `rgb_pre`、`cmy_print` 等边界，返回工作像素尺寸供从中途继续。Portra 400／Portra Endura 与 Provia 直扫启用全图测光、裁切、1.5× 缩放、空间效果与黑白校正，从每个可达阶段续跑与 Rust 一次渲染逐位一致。Python f64 对照同为 14×9，六个阶段从 `rgb_pre` 到 `rgb_out` 的最大差依次为 `2.22e-15`、`4.34e-9`、`1.66e-7`、`1.05e-7`、`1.70e-7`、`1.59e-7`。 |
 | GUI 渲染默认 | 出厂和 Python 预设的 GUI 渲染采用 17³ 印相和扫描内部 LUT 与原版的快速颗粒统计，Preview、Scan 和 f64 Export 共享这组渲染设置。Ektar／Ultra Endura 的 64×32 f64 GUI Preview 对照 Python 最终 RGB 最大差 `9.72e-17`。Rust 独立库和 CLI 的默认参数保留。 |
 | 自定义 profile 保存 | 已验收。公共 `save_profile` 写回片纸 JSON，保留许可信息、波段空值和黑白片多显影时间，替换前先完整写入同目录暂存文件。Portra 400、Portra Endura 由 Python 原版读取并通过验证，光谱及密度数组形状、空值位置一致，有限数值的最大差为 `1.78e-15`。Rust 额外覆盖 Double-X 与保存失败后保留原件。 |
-| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。另验证 Rec.709、Display P3、DCI-P3 和 Adobe RGB 的线性／编码 ICC 往返与 EXR 标签，Adobe 图像传递指数按 colour-science 采用 563／256。新增可选原生 `libraw` 构建，使用 Python 的 16 位线性 ACES 解码参数。LibRaw 0.22.0 的实测样本为 Bayer DNG、4284×2844 Nikon NEF 和 6032×4028 Fuji X-Trans RAF。NEF／RAF 的机内、日光和钨丝灯白平衡逐位一致，自定义 5000 K／tint 1.15 最大差 `1.19e-7`／`5.96e-8`。无窗口 GUI 打开真实 RAF 后替换源路径，自定义白平衡重新开发和旋转继续使用源图快照，真实 f64 子进程按 0.02 比例导出 81×121 线性 ACES TIFF。macOS 发布包和非直线镜头校正已验收，Windows 打包暂缓，MakerNote 待处理。Python 对 EXR 跳过 Exiv2 元数据写入。 |
+| RAW 与其他文件细节 | EXIF 嵌入 JPEG 缩略图、导出日期与 XMP 色彩标签已验收。源图标注旧日期和 ProPhoto RGB，Rust 与 Python 导出的 JPEG、PNG、TIFF 均被 Exiv2 读为保存时日期、sRGB 及同一份 633 字节缩略图，新图主尺寸为 16×12。另验证 Rec.709、Display P3、DCI-P3 和 Adobe RGB 的线性／编码 ICC 往返与 EXR 标签，Adobe 图像传递指数按 colour-science 采用 563／256。新增可选原生 `libraw` 构建，使用 Python 的 16 位线性 ACES 解码参数。LibRaw 0.22.0 的实测样本为 Bayer DNG、4284×2844 Nikon NEF 和 6032×4028 Fuji X-Trans RAF。NEF／RAF 的机内、日光和钨丝灯白平衡逐位一致，自定义 5000 K／tint 1.15 最大差 `1.19e-7`／`5.96e-8`。无窗口 GUI 打开真实 RAF 后替换源路径，自定义白平衡重新开发和旋转继续使用源图快照，真实 f64 子进程按 0.02 比例导出 81×121 线性 ACES TIFF。macOS 发布包、非直线镜头校正和 MakerNote 已验收，Windows 打包暂缓。Python 对 EXR 跳过 Exiv2 元数据写入。 |
 | GPU 和发布验证 | Windows 原生跑器通过覆盖现有文件、编码失败、取消、目录目标及目标锁定的实测，运行 [Windows export verification #44118951320](https://github.com/vercity/spektrafilm-rs-core/actions/runs/44118951320)。Apple M4 上 12 个色域及传递组合均命中 Metal／wgpu 常驻路径，非 JzAzBz 的 GPU／Python 最大差 `5.67e-6`，JzAzBz 线性 sRGB／BT.2020／V-Gamut 最大差 `8.58e-5`／`6.32e-5`／`1.67e-5`，编码 sRGB 最大差 `1.39e-4`。CUDA 对应 kernel 已通过设备 LLVM IR 编译与 host C++ 对照，含负亮度的 11 个模式／空间中 CAM16 最大差 `1.28e-6`，JzAzBz 最大差 `5.46e-5`。GPU 散射和光晕已验收。GPU 分层颗粒已在 Apple M4 上对照，CUDA 真机执行和 Lumix 相机加载待验收。 |
 
 ### 高阶插值、镜头投影与 GPU 光学验收
@@ -343,6 +343,16 @@ Python 快速统计在一组近饱和 Velvia 绿色分层上因二项分布起�
 CUDA 已通过 Rust feature 检查、NVPTX 设备代码编译及同一 kernel 的宿主 C++ 数值对照。宿主 C++ 结果的最大平均密度差为 `0.00260`，最大方差相对差为 `7.04%`。NVIDIA 实机仍待验收。
 
 集成分支通过 182 项工作区测试、31 项 f64 GUI 测试，另在 Apple M4 上执行了三项常驻回归。分层颗粒可用 `cargo test --locked --offline -p spektrafilm-core resident_profiled_grain_preserves_moments_and_aggregate_fallback -- --ignored` 复跑，CUDA 编译使用 `cargo check --locked --offline -p spektrafilm-cli --features precision-f64,spektrafilm-gpu/cuda-backend`。
+
+### GUI 工作流与 MakerNote
+
+- **Scan for print。** 开启时将扫描器的白场和黑场校正设为开启，并关闭眩光。关闭时恢复原来的三个值。导入预设或恢复出厂设置会清除临时切换状态。新增测试覆盖重复开启、关闭恢复及预设切换。
+- **像素缩放与启动画面。** 100%／200%／400% 按物理屏幕像素计算。以 1×、1.5×、2× 屏幕缩放验证绘制矩形，九组映射均一致。启动默认显示带白边和水印的竖幅相纸，黑色输入占位随预览尺寸更新。占位图仅用于显示。打开照片或旋转后回到适应窗口。
+- **MakerNote。** 通过 Exiv2 保存源文件的厂商字段，在 JPEG／PNG／TIFF 编码完成后重写这些字段及其内部偏移。方向、像素尺寸、输出色彩和保存日期仍根据当前成品生成。测试覆盖源文件移除后的元数据转存。macOS 发布包默认启用此功能，源代码编译可用 `exiv2` feature，Windows 打包暂缓。
+
+使用 [Nikon NEF](https://github.com/letmaik/rawpy/blob/v0.26.1/test/iss030e122639.NEF) 和 [Fujifilm X-T2 RAF](https://raw.pixls.us/getfile.php/865/nice/Fujifilm%20-%20X-T2%20-%2014bit%2014bit%20compressed%20%283%3A2%29.RAF) 实拍 RAW，通过 Rust f64 渲染并与下载版 Python 0.3.4 的 `io.py` 写入结果对照。Nikon JPEG、PNG 各读回 159 个厂商字段，TIFF 读回 168 个。Fuji 三种格式各读回 73 个。六份输出的厂商字段名、类型和值均与 Python 一致，方向、尺寸、日期、软件名及 sRGB EXIF／XMP 标签也通过检查。
+
+默认工作区通过 184 项测试。启用 Exiv2、LibRaw 和 f64 后，GUI 与图像读写分别通过 33 项和 19 项。含两种原生库的本机 macOS 包通过签名和解包冒烟测试，覆盖 DNG、TIFF32 导出与 CUBE 构建。从解压包的 f64 程序导出实拍 RAW 的 TIFF，Nikon 和 Fuji 的厂商字段分别为 168 个和 73 个，与 Python 对照一致。GitHub 托管发布仍待实际执行。
 
 ### 审阅验证范围
 

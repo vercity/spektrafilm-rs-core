@@ -3,7 +3,8 @@
 set -euo pipefail
 
 app="$1"
-library_dir="$2"
+shift
+library_dirs=("$@")
 frameworks="$app/Contents/Frameworks"
 notices="$app/Contents/Resources/Notices"
 mkdir -p "$frameworks" "$notices"
@@ -12,7 +13,7 @@ shopt -s nullglob
 copy_notices() {
     local source="$1" cellar relative keg notice destination
     if [[ -n "${SPEKTRAFILM_MACOS_NOTICES_DIR:-}" ]]; then
-        # For a custom LibRaw installation, the caller supplies all runtime notices.
+        # For custom native libraries, the caller supplies all runtime notices.
         return
     fi
 
@@ -49,7 +50,7 @@ names=()
 sources=()
 relocate() {
     local original="$1" target="$2" loader="$3"
-    local dylib_id="" deps dep name source bundled i
+    local dylib_id="" deps dep name source bundled library_dir i
     if [[ "$target" == "$frameworks/"* ]]; then
         dylib_id="$(otool -DX "$original")"
     fi
@@ -57,8 +58,7 @@ relocate() {
     while IFS= read -r dep; do
         case "$dep" in
             ""|"$dylib_id"|/usr/lib/*|/System/Library/*) continue ;;
-            @loader_path/*) source="${original%/*}/${dep#@loader_path/}" ;;
-            @rpath/*) source="$library_dir/${dep#@rpath/}" ;;
+            @loader_path/*|@rpath/*) source="${original%/*}/${dep#*/}" ;;
             /*) source="$dep" ;;
             *) source="" ;;
         esac
@@ -66,7 +66,12 @@ relocate() {
         if [[ ! -f "$source" ]]; then
             # Custom distributions can retain an absolute install name from
             # their build machine even though the dylib itself has moved.
-            source="$library_dir/$name"
+            for library_dir in "${library_dirs[@]}"; do
+                if [[ -f "$library_dir/$name" ]]; then
+                    source="$library_dir/$name"
+                    break
+                fi
+            done
         fi
         if [[ ! -f "$source" ]]; then
             echo "Cannot locate $dep, required by $original" >&2
@@ -100,10 +105,12 @@ if [[ -n "${SPEKTRAFILM_MACOS_NOTICES_DIR:-}" ]]; then
 fi
 for executable in "$app/Contents/MacOS/"*; do
     relocate "$executable" "$executable" '@loader_path/../Frameworks'
-    # LUT generation has no RAW input and may omit LibRaw when linking.
-    if [[ "${executable##*/}" != spektrafilm-lut ]] \
-        && ! otool -LX "$executable" | grep -q '@loader_path/../Frameworks/libraw'; then
-        echo "Bundled LibRaw dependency missing from $executable" >&2
-        exit 1
+    if [[ "${executable##*/}" != spektrafilm-lut ]]; then
+        for native_library in libraw libexiv2; do
+            if ! otool -LX "$executable" | grep -q "@loader_path/../Frameworks/$native_library"; then
+                echo "Bundled $native_library dependency missing from $executable" >&2
+                exit 1
+            fi
+        done
     fi
 done

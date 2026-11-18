@@ -79,10 +79,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install LibRaw
+      - name: Install LibRaw and Exiv2
         run: |
-          brew install libraw
-          brew list --versions libraw
+          brew install libraw exiv2
+          brew list --versions libraw exiv2
 
       - name: Package app bundle
         shell: bash
